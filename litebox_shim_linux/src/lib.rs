@@ -984,8 +984,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
-                        drm: syscalls::drm::DrmSubsystem::new(),
-                        evdev: syscalls::evdev::EvdevSubsystem::new(),
+                        drm: syscalls::drm::SharedDrmTable::new(&platform),
+                        evdev: syscalls::evdev::SharedEvdevTable::new(&platform),
                         shared_futex_wake: syscalls::process::SharedFutexWake::new(),
                     },
                 )
@@ -1046,6 +1046,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             record_locks_local: Arc::new(litebox::sync::Mutex::new(alloc::vec::Vec::new())),
             record_lock_pollee_local: Arc::new(litebox::event::polling::Pollee::new()),
             flock_registry: my_flock_registry,
+            drm_flip_local: Arc::new(syscalls::drm::DrmFlipLocal::new()),
+            evdev_pollee_local: Arc::new(litebox::event::polling::Pollee::new()),
             bootstrap_process: Arc::new(once_cell::race::OnceBox::new()),
         })
     }
@@ -1118,22 +1120,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Install (or replace) the host-side callback invoked on every real DRM page-flip (see
-    /// [`syscalls::drm::DrmSubsystem::add_flip_callback`]'s doc comment for the exact contract and
+    /// [`syscalls::drm::DrmFlipLocal::add_flip_callback`]'s doc comment for the exact contract and
     /// why it deliberately takes plain pixel bytes rather than a platform-specific handle) -- the
     /// sole public entry point into the shim's own `/dev/dri/card0` emulation, since
-    /// `DrmSubsystem` itself stays a private implementation detail. A runner binary that depends
+    /// `syscalls::drm::SharedDrmTable` itself stays a private implementation detail. A runner binary that depends
     /// on a concrete presentation layer (e.g. `litebox_platform_windows_userland`'s wgpu-backed
     /// `Presenter`) calls this once, right after [`LinuxShimBuilder::build`], to make flipped
     /// frames actually visible; a runner target with no GUI story simply never calls it.
     ///
     /// ADDITIVE: each call installs an ADDITIONAL observer rather than replacing the previous
     /// one, so a `--gui` window and a `LITEBOX_DUMP_FRAMES` capture can both watch the same
-    /// frames. See [`syscalls::drm::DrmSubsystem::flip_callbacks`] for why that matters.
+    /// frames. See [`syscalls::drm::DrmFlipLocal::callbacks`] for why that matters.
     pub fn add_drm_flip_callback(
         &self,
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
     ) {
-        self.0.drm.add_flip_callback(callback);
+        self.0.drm_flip_local.add_flip_callback(callback);
     }
 
     /// The current front buffer's identity (platform shared-memory handle plus geometry and
@@ -1150,29 +1152,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     }
 
     /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --
-    /// see [`syscalls::evdev::EvdevSubsystem::push_key`]'s doc comment for the `code`/`value`
+    /// see [`syscalls::evdev::SharedEvdevTable::push_key`]'s doc comment for the `code`/`value`
     /// contract. The sole public entry point into the shim's own evdev emulation, mirroring
     /// [`Self::add_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
     /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
     /// calls this from its own keyboard/mouse-button event handler.
     pub fn push_input_key(&self, code: u16, value: i32) {
-        self.0.evdev.push_key(code, value);
+        self.0.evdev.push_key(code, value, &self.0.evdev_pollee_local);
     }
 
     /// Push a real relative mouse-motion or wheel event into the shim's `/dev/input/event0`
-    /// queue -- see [`syscalls::evdev::EvdevSubsystem::push_rel`]'s doc comment for the
+    /// queue -- see [`syscalls::evdev::SharedEvdevTable::push_rel`]'s doc comment for the
     /// `code`/`value` contract.
     pub fn push_input_rel(&self, code: u16, value: i32) {
-        self.0.evdev.push_rel(code, value);
+        self.0.evdev.push_rel(code, value, &self.0.evdev_pollee_local);
     }
 
     /// Push one 2D mouse movement as a SINGLE evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`),
     /// which is what real hardware emits for one physical motion -- see
-    /// [`syscalls::evdev::EvdevSubsystem::push_rel_motion`]. Prefer this over two `push_input_rel`
-    /// calls for cursor movement: those produce two separately-synced reports, making a client
-    /// process the motion twice.
+    /// [`syscalls::evdev::SharedEvdevTable::push_rel_motion`]. Prefer this over two
+    /// `push_input_rel` calls for cursor movement: those produce two separately-synced reports,
+    /// making a client process the motion twice.
     pub fn push_input_rel_motion(&self, dx: i32, dy: i32) {
-        self.0.evdev.push_rel_motion(dx, dy);
+        self.0
+            .evdev
+            .push_rel_motion(dx, dy, &self.0.evdev_pollee_local);
     }
 
     /// Loads the program at `path` as the shim's initial task, returning the
@@ -4149,6 +4153,20 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// Rust resolves the field on this concrete type before auto-`Deref`ing to `GlobalState`, so
     /// every existing `xxx.flock_registry` call site keeps compiling unchanged.
     flock_registry: Arc<litebox::sync::Mutex<Platform, syscalls::file::FlockRegistry<Platform>>>,
+    /// The per-process half of the one virtual DRM/KMS device's state -- see
+    /// `syscalls::drm::DrmFlipLocal`. Thirteenth instance of the defect class this struct's own
+    /// doc comment documents twelve times over: BOTH of its fields are host-process-private (a
+    /// `Vec<Box<dyn Fn>>` of host-side frame observers and a `Pollee`'s `Weak<dyn Observer>`
+    /// map), so a byte-shared copy of either is garbage in a fork child. The device's real
+    /// state -- buffers, framebuffers, the flip-event ring -- moved to `GlobalState::drm` as a
+    /// pointer-free arena-resident table (`syscalls::drm::SharedDrmTable`), which is what
+    /// actually delivers the cross-process visibility this device genuinely needs.
+    drm_flip_local: Arc<syscalls::drm::DrmFlipLocal<Platform>>,
+    /// The per-process half of the one virtual evdev device's state: its `Pollee`, for exactly
+    /// the reason `record_lock_pollee_local` and [`Self::drm_flip_local`] exist. The event ring
+    /// itself moved to `GlobalState::evdev` (`syscalls::evdev::SharedEvdevTable`), so a fork
+    /// child still `read()`s the same real input events this process does.
+    evdev_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
     bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
 
@@ -4175,6 +4193,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, F
             record_locks_local: self.record_locks_local.clone(),
             record_lock_pollee_local: self.record_lock_pollee_local.clone(),
             flock_registry: self.flock_registry.clone(),
+            drm_flip_local: self.drm_flip_local.clone(),
+            evdev_pollee_local: self.evdev_pollee_local.clone(),
             bootstrap_process: self.bootstrap_process.clone(),
         }
     }
@@ -4771,12 +4791,18 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     /// global -- any process holding a fd to the card sees the same connector/CRTC/buffers, just
     /// like real Linux's `struct drm_device` is one kernel-wide object regardless of how many
     /// processes have it open.
-    drm: syscalls::drm::DrmSubsystem<Platform>,
+    ///
+    /// Now the pointer-free, arena-resident half only -- see `syscalls::drm::SharedDrmTable`.
+    /// The per-process half (`DrmFlipLocal`) is on `GlobalStateHandle`.
+    drm: syscalls::drm::SharedDrmTable<Platform>,
     /// The one virtual evdev keyboard+mouse device's state (`/dev/input/event0`). Shim-wide for
     /// the same reason `drm` is: real input-device state (queued events) is genuinely global,
     /// matching how a real kernel input device is one object regardless of how many processes
     /// have it open.
-    evdev: syscalls::evdev::EvdevSubsystem<Platform>,
+    ///
+    /// Now the pointer-free, arena-resident half only -- see `syscalls::evdev::SharedEvdevTable`.
+    /// The per-process half (its `Pollee`) is on `GlobalStateHandle`.
+    evdev: syscalls::evdev::SharedEvdevTable<Platform>,
     // NOTE: this struct deliberately has NO `memfds`/`shared_files` fields -- SEVENTH and EIGHTH
     // instances of the SAME cross-process-garbage-pointer defect class documented on
     // `GlobalStateHandle`'s own doc comment (`litebox`/`proc_self_info`/`pts_registry`/

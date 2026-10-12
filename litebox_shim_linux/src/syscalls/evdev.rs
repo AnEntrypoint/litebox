@@ -6,8 +6,8 @@
 //! Implements the minimal surface a real Linux input client (a raw `open`+`read` loop, or a
 //! toolkit's evdev backend, e.g. SDL2's `evdev`/`KMSDRM` input path) needs to receive real
 //! keyboard/mouse events: a queue of real `struct input_event` records the host side pushes in
-//! (see [`EvdevSubsystem::push_key`]/[`EvdevSubsystem::push_rel`]), drained by the guest's own
-//! `read()` on the device fd, exactly mirroring `drm.rs`'s `DrmSubsystem` but with the data flow
+//! (see [`SharedEvdevTable::push_key`]/[`SharedEvdevTable::push_rel`]), drained by the guest's own
+//! `read()` on the device fd, exactly mirroring `drm.rs`'s `SharedDrmTable` but with the data flow
 //! reversed: DRM's page-flip callback pushes pixel bytes OUT to the host; this subsystem's push
 //! methods bring host input events IN to the guest.
 //!
@@ -30,7 +30,7 @@
 //! - **Multiple event devices**: exactly one combined keyboard+mouse node (`event0`), matching
 //!   `litebox::fs::devices::InputDevice`'s current single-variant enum.
 
-use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use litebox::event::Events;
 use litebox::event::polling::Pollee;
@@ -62,48 +62,138 @@ static INPUT_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// currently 64 in the real kernel); this exists so a guest that never reads input (e.g. a
 /// non-interactive program that merely opened the device) can't grow this queue unboundedly from
 /// host-side input the guest never asked to receive.
+///
+/// Kept at 256 for the shared-table rewrite: the ring now lives in the 128MiB shared kernel arena
+/// (see [`SharedEvdevTable`]), which hands out power-of-two blocks with an 8KiB floor, so
+/// `256 * INPUT_EVENT_BYTES` (6144B) plus the ~1568B guard is ~7.7KiB and takes the SAME single
+/// 8KiB block that 128 (~4.6KiB) would have taken -- restoring 256 costs zero extra arena bytes,
+/// which is the only budget that matters here because AGENTS.md Open 3 has that arena nearly full
+/// from ~6 concurrent `GlobalState`s. The runtime `debug!` in `SharedEvdevTable::new` prints the
+/// real `region_bytes` if this arithmetic ever needs re-checking.
 const MAX_QUEUED_EVENTS: usize = 256;
+/// Width of one entry of [`SharedEvdevRegion::events`]: the exact byte image of one `InputEvent`,
+/// so what the guest `read()`s is bit-identical to the `VecDeque<InputEvent>` this replaced.
+const INPUT_EVENT_BYTES: usize = size_of::<InputEvent>();
 
-/// State for the one virtual evdev device this shim exposes. See the module doc comment for what
-/// is and is not implemented in this pass.
-pub(crate) struct EvdevSubsystem<Platform: ShimPlatform> {
-    pending_events: litebox::sync::Mutex<Platform, VecDeque<InputEvent>>,
-    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the evdev
-    /// fd waiting for input -- see `DrmSubsystem::flip_pollee`'s doc comment for the identical
-    /// bug shape this fixes: `EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch previously
-    /// computed on-demand readiness via `has_pending()` but never registered an observer here,
-    /// so a client that registers this fd once via `epoll_ctl` and blocks in `epoll_wait` across
-    /// many iterations (rather than re-polling synchronously after every event) would never wake
-    /// for the second and later queued input events.
-    pollee: Pollee<Platform>,
+/// The arena-resident, pointer-free half of the one virtual evdev device's state.
+///
+/// Same defect class and same fix as `syscalls::drm::SharedDrmRegion` (see that type's doc comment
+/// for the full argument): this used to be a `litebox::sync::Mutex<VecDeque<InputEvent>>` on
+/// byte-shared `GlobalState`, so a cross-process fork child inherited the creating process's heap
+/// pointer -- the `btree/node.rs:1232` panic shape `f5d73ff` fixed for `flock_registry`. And it is
+/// NOT moved per-process, because `/dev/input/event0` is a real fs device node
+/// (`litebox::fs::devices::INPUT_EVENT0_NODE_INFO`) a fork child both inherits as a carried
+/// `"file"` fd and can reopen by path, so input really is device-global, not process-global.
+///
+/// What stays per-process is the `Pollee` (a `BTreeMap` of `Weak<dyn Observer>` -- no pointer-free
+/// arena form exists), so it moved to `GlobalStateHandle::evdev_pollee_local`. Consequence,
+/// disclosed: a cross-process fork child polling `/dev/input/event0` itself still gets correct
+/// `read()` results and correct `has_pending()` readiness from this shared ring, but no poll
+/// wakeup. Input is pushed by the host process that owns the window, whose guest tasks are the
+/// ones that consume it, so that is the narrow case.
+struct SharedEvdevRegion<Platform: ShimPlatform> {
+    /// Whether these bytes really are in the cross-process shared kernel arena. `false` means the
+    /// arena was exhausted at construction and this queue is this host process's own. Carried in
+    /// the region rather than on [`SharedEvdevTable`] for the same reason
+    /// `SharedFlockRegion::excludes` is: `GlobalState`'s bytes are shared with every fork child,
+    /// so a flag on the table would tell an attaching child "shared" even for a private fallback.
+    cross_process: AtomicBool,
+    /// Serializes the whole ring; see `SharedDrmRegion::guard`.
+    guard: litebox::sync::Mutex<Platform, ()>,
+    /// Index of the oldest live entry in [`Self::events`].
+    head: AtomicU32,
+    /// How many entries of [`Self::events`] are live.
+    count: AtomicU32,
+    /// The ring proper: `MAX_QUEUED_EVENTS` whole-event byte images, allocated once from the arena
+    /// (so this is a compile-time bound, not a growable `VecDeque`).
+    events: [[AtomicU8; INPUT_EVENT_BYTES]; MAX_QUEUED_EVENTS],
 }
 
-impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
-    pub(crate) fn new() -> Self {
-        Self {
-            pending_events: litebox::sync::Mutex::new(VecDeque::new()),
-            pollee: Pollee::new(),
+/// The shared half of the one virtual evdev device's state, as a `GlobalState` field. See
+/// `syscalls::drm::SharedDrmTable` for the identical shape and why it is pointer-free.
+pub(crate) struct SharedEvdevTable<Platform: ShimPlatform> {
+    region: &'static SharedEvdevRegion<Platform>,
+}
+
+impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
+    /// Allocates the region in the cross-process SHARED kernel arena and initializes it -- once
+    /// per fork family, from `LinuxShimBuilder::build`'s create branch.
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout = core::alloc::Layout::new::<SharedEvdevRegion<Platform>>();
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let (ptr, shared) = match arena {
+            Some(ptr) => (ptr.cast::<SharedEvdevRegion<Platform>>(), true),
+            None => {
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared evdev table: shared kernel arena exhausted; /dev/input/event0 queue is \
+                     this host process's own"
+                );
+                (
+                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                        .expect("shared evdev table: fallback allocation failed")
+                        .cast::<SharedEvdevRegion<Platform>>(),
+                    false,
+                )
+            }
+        };
+        // SAFETY: `ptr` names one contiguous, uninitialized `SharedEvdevRegion` sized by `layout`;
+        // initializing it one field at a time keeps the several-KiB value off the stack.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).cross_process).write(AtomicBool::new(shared));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).guard).write(litebox::sync::Mutex::new(()));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).head).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).count).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).events).write(core::array::from_fn(|_| {
+                core::array::from_fn(|_| AtomicU8::new(0))
+            }));
+        }
+        // SAFETY: `ptr` is non-null, suitably aligned and just initialized above; `'static` is
+        // sound because the allocation is arena-backed or deliberately leaked.
+        let table = Self {
+            region: unsafe { &*ptr.as_ptr() },
+        };
+        litebox_util_log::debug!(
+            region_bytes:% = layout.size(), shared:% = table.is_shared();
+            "shared evdev table: region initialized"
+        );
+        table
+    }
+
+    /// Whether this table's queue is visible to every process of the fork family -- see
+    /// [`SharedEvdevRegion::cross_process`].
+    pub(crate) fn is_shared(&self) -> bool {
+        self.region.cross_process.load(Ordering::Acquire)
+    }
+
+    /// Appends one event, dropping the OLDEST if the ring is already full (a real evdev ring
+    /// buffer's overflow behavior: newest events win, not silently refused). Callers hold `guard`.
+    fn push_locked(&self, event: &InputEvent) {
+        let count = self.region.count.load(Ordering::Acquire) as usize;
+        let head = self.region.head.load(Ordering::Acquire) as usize;
+        let idx = if count == MAX_QUEUED_EVENTS {
+            self.region
+                .head
+                .store(((head + 1) % MAX_QUEUED_EVENTS) as u32, Ordering::Release);
+            head
+        } else {
+            self.region
+                .count
+                .store((count + 1) as u32, Ordering::Release);
+            (head + count) % MAX_QUEUED_EVENTS
+        };
+        for (i, b) in event.as_bytes().iter().enumerate() {
+            self.region.events[idx][i].store(*b, Ordering::Release);
         }
     }
-
-    /// Register an observer for evdev fd readiness -- see [`Self::pollee`]'s doc comment. Called
-    /// from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `EvdevFd` branch, exactly
-    /// where every other pollable fd kind (e.g. eventfd) registers its own observer.
-    pub(crate) fn register_observer(
-        &self,
-        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
-    ) {
-        self.pollee.register_observer(observer, Events::IN);
-    }
-
-    /// Push one real event into the queue, followed by a `SYN_REPORT` (real evdev clients expect
+    /// Queue one real event, terminated by an `EV_SYN`/`SYN_REPORT` marker (real evdev requires
     /// every logically-grouped batch of events -- here, always a single event -- to be terminated
     /// by an `EV_SYN`/`SYN_REPORT` marker; without it, a client buffering events until it sees a
     /// sync marker would never see this one). Drops the oldest queued event first if already at
     /// [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer's overflow behavior (newest
     /// events win, not silently refused).
-    fn push(&self, event: InputEvent) {
-        self.push_batch(&[event]);
+    fn push(&self, event: InputEvent, pollee: &Pollee<Platform>) {
+        self.push_batch(&[event], pollee);
     }
 
     /// Queue N real events terminated by a SINGLE `SYN_REPORT`.
@@ -117,7 +207,7 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     ///
     /// Drops oldest-first at [`MAX_QUEUED_EVENTS`], matching a real kernel ring buffer (newest
     /// events win rather than being refused).
-    fn push_batch(&self, batch: &[InputEvent]) {
+    fn push_batch(&self, batch: &[InputEvent], pollee: &Pollee<Platform>) {
         if batch.is_empty() {
             return;
         }
@@ -127,51 +217,51 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
                 "evdev-input-trace: push_batch emitting one SYN_REPORT"
             );
         }
-        let mut events = self.pending_events.lock();
+        let _guard = self.region.guard.lock();
         for event in batch {
-            if events.len() >= MAX_QUEUED_EVENTS {
-                events.pop_front();
-            }
-            events.push_back(*event);
+            self.push_locked(event);
         }
-        if events.len() >= MAX_QUEUED_EVENTS {
-            events.pop_front();
-        }
-        events.push_back(InputEvent {
+        self.push_locked(&InputEvent {
             tv_sec: 0,
             tv_usec: 0,
             r#type: EV_SYN,
             code: SYN_REPORT,
             value: 0,
         });
-        drop(events);
-        self.pollee.notify_observers(Events::IN);
+        drop(_guard);
+        pollee.notify_observers(Events::IN);
     }
 
     /// Queue an `EV_KEY` event -- a keyboard key or mouse button transition. `value` is `1`
     /// (pressed), `0` (released), or `2` (auto-repeat, real Linux's own third state for a held
     /// key) matching real evdev semantics exactly; the caller (the host-side window's own
     /// keyboard/mouse-button event handler) is responsible for passing the correct value.
-    pub(crate) fn push_key(&self, code: u16, value: i32) {
-        self.push(InputEvent {
-            tv_sec: 0,
-            tv_usec: 0,
-            r#type: litebox_common_linux::EV_KEY,
-            code,
-            value,
-        });
+    pub(crate) fn push_key(&self, code: u16, value: i32, pollee: &Pollee<Platform>) {
+        self.push(
+            InputEvent {
+                tv_sec: 0,
+                tv_usec: 0,
+                r#type: litebox_common_linux::EV_KEY,
+                code,
+                value,
+            },
+            pollee,
+        );
     }
 
     /// Queue an `EV_REL` event -- relative mouse motion (`REL_X`/`REL_Y`) or wheel movement
     /// (`REL_WHEEL`). `value` is the signed delta, matching real evdev semantics.
-    pub(crate) fn push_rel(&self, code: u16, value: i32) {
-        self.push(InputEvent {
-            tv_sec: 0,
-            tv_usec: 0,
-            r#type: litebox_common_linux::EV_REL,
-            code,
-            value,
-        });
+    pub(crate) fn push_rel(&self, code: u16, value: i32, pollee: &Pollee<Platform>) {
+        self.push(
+            InputEvent {
+                tv_sec: 0,
+                tv_usec: 0,
+                r#type: litebox_common_linux::EV_REL,
+                code,
+                value,
+            },
+            pollee,
+        );
     }
 
     /// Queue one 2D relative motion as a SINGLE evdev report: `REL_X`, `REL_Y`, `SYN_REPORT`.
@@ -182,7 +272,7 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     ///
     /// A zero delta on an axis is omitted, matching real hardware, which does not report an axis
     /// that did not move. If BOTH are zero nothing is queued at all -- no event, no sync.
-    pub(crate) fn push_rel_motion(&self, dx: i32, dy: i32) {
+    pub(crate) fn push_rel_motion(&self, dx: i32, dy: i32, pollee: &Pollee<Platform>) {
         let mut batch: [InputEvent; 2] = [InputEvent {
             tv_sec: 0,
             tv_usec: 0,
@@ -201,7 +291,7 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
             batch[n].value = dy;
             n += 1;
         }
-        self.push_batch(&batch[..n]);
+        self.push_batch(&batch[..n], pollee);
     }
 
     /// Pop the oldest pending event, if any, encoded as the exact bytes a real `read()` on an
@@ -210,9 +300,20 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     /// `syscalls::file::do_read`'s input-fd branch) is responsible for real Linux's actual
     /// `read()`-with-nothing-pending behavior (blocks, or `EAGAIN` if the fd is non-blocking).
     pub(crate) fn pop_event_bytes(&self) -> Option<alloc::vec::Vec<u8>> {
-        let event = self.pending_events.lock().pop_front()?;
-        let mut bytes = alloc::vec::Vec::with_capacity(size_of::<InputEvent>());
-        bytes.extend_from_slice(event.as_bytes());
+        let _guard = self.region.guard.lock();
+        let count = self.region.count.load(Ordering::Acquire);
+        if count == 0 {
+            return None;
+        }
+        let head = self.region.head.load(Ordering::Acquire) as usize;
+        let mut bytes = alloc::vec::Vec::with_capacity(INPUT_EVENT_BYTES);
+        for byte in &self.region.events[head] {
+            bytes.push(byte.load(Ordering::Acquire));
+        }
+        self.region
+            .head
+            .store(((head + 1) % MAX_QUEUED_EVENTS) as u32, Ordering::Release);
+        self.region.count.store(count - 1, Ordering::Release);
         Some(bytes)
     }
 
@@ -221,6 +322,6 @@ impl<Platform: ShimPlatform> EvdevSubsystem<Platform> {
     /// input arrives) and available for a future `read()` non-blocking-fd branch that wants to
     /// choose the right error without popping speculatively.
     pub(crate) fn has_pending(&self) -> bool {
-        !self.pending_events.lock().is_empty()
+        self.region.count.load(Ordering::Acquire) != 0
     }
 }

@@ -32,8 +32,8 @@
 //! - **Page-flip Events**: `DRM_MODE_PAGE_FLIP_EVENT` pushes `DrmEventVblank` into the pending queue,
 //!   which is read via `pop_flip_event_bytes()` on the DRM device file descriptor.
 
-use alloc::collections::{BTreeMap, VecDeque};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use litebox::event::Events;
 use litebox::event::polling::Pollee;
@@ -80,7 +80,7 @@ pub fn set_drm_trace(enabled: bool) {
 
 static DRM_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Whether `DRM_IOCTL_MODE_DIRTYFB` actually presents. See `DrmSubsystem::dirty_fb`.
+/// Whether `DRM_IOCTL_MODE_DIRTYFB` actually presents. See `SharedDrmTable::dirty_fb`.
 pub(crate) fn dirty_fb_enabled() -> bool {
     DIRTY_FB_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -114,8 +114,8 @@ const VIRTUAL_ENCODER_ID: u32 = 2;
 const VIRTUAL_CRTC_ID: u32 = 3;
 /// The one virtual primary plane this device exposes, tied to [`VIRTUAL_CRTC_ID`] -- matching
 /// how the kernel's own `drm/vkms` software driver exposes exactly one primary plane per CRTC.
-/// Added alongside [`DrmSubsystem::get_plane_resources`]/[`DrmSubsystem::get_plane`]/
-/// [`DrmSubsystem::set_plane`]; some real KMS-using toolkits query the plane API even for a
+/// Added alongside [`SharedDrmTable::get_plane_resources`]/[`SharedDrmTable::get_plane`]/
+/// [`SharedDrmTable::set_plane`]; some real KMS-using toolkits query the plane API even for a
 /// single-plane use case (checking plane capabilities before deciding how to render).
 const VIRTUAL_PLANE_ID: u32 = 4;
 
@@ -127,7 +127,7 @@ const VIRTUAL_PLANE_ID: u32 = 4;
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 
 /// A minimal, spec-valid EDID 1.3 block for the virtual connector -- see
-/// [`DrmSubsystem::get_prop_blob`]'s own doc comment for why these exact bytes were chosen and
+/// [`SharedDrmTable::get_prop_blob`]'s own doc comment for why these exact bytes were chosen and
 /// how the checksum (byte 127) was derived. No display-timing descriptor blocks are populated;
 /// this device's one fixed mode is reported directly via `GETCONNECTOR`, not re-derived from
 /// EDID by any client this device has been tested against.
@@ -170,6 +170,32 @@ fn virtual_mode() -> DrmModeModeinfo {
     }
 }
 
+/// Occupancy words for a [`SharedDumbBufferSlot`]/[`SharedFbSlot`]. Plain `u32`s, not a `bool`, so
+/// a slot's state is a single atomic store every process in the fork family reads identically.
+const DRM_SLOT_FREE: u32 = 0;
+const DRM_SLOT_USED: u32 = 1;
+
+/// How many live dumb buffers the shared table can name. Sized against what a real KMS client
+/// actually allocates (Xorg's `modesetting` driver and weston's DRM backend each hold a shadow
+/// buffer plus at most one or two scanout buffers), NOT against what a guest could ask for: the
+/// region is one power-of-two allocation out of a 128MiB arena that ~6 concurrent `GlobalState`s
+/// already crowd (AGENTS.md Open 3), so every slot here is paid for by every fork family.
+const SHARED_DRM_BUFFERS: usize = 32;
+/// How many live framebuffers the shared table can name. Higher than the buffer count on purpose:
+/// this device has no `DRM_IOCTL_MODE_RMFB`, so a framebuffer is never explicitly removed and its
+/// slot is only ever reclaimed by [`SharedDrmTable::reclaim_dead`] once its creator's host process
+/// is gone -- matching real Linux, where destroying a buffer leaves any framebuffer referencing it
+/// dangling until userspace removes it.
+const SHARED_DRM_FRAMEBUFFERS: usize = 48;
+/// How many completed-but-unread `DRM_MODE_PAGE_FLIP_EVENT` events the shared ring holds. A client
+/// that never reads its flip events loses the oldest first (a real kernel's `drm_event` ring does
+/// the same) rather than being failed at `PAGE_FLIP` time.
+const SHARED_DRM_FLIP_EVENTS: usize = 32;
+/// Width of one entry of [`SharedDrmRegion::flip_events`]: the exact byte image of one
+/// `DrmEventVblank`, so what the guest `read()`s is bit-identical to the `VecDeque<DrmEventVblank>`
+/// this replaced.
+const FLIP_EVENT_BYTES: usize = size_of::<DrmEventVblank>();
+
 /// A single allocated dumb buffer's state.
 ///
 /// Backed by a real platform shared-memory object (the same primitive `MAP_ANONYMOUS|MAP_SHARED`
@@ -179,27 +205,86 @@ fn virtual_mode() -> DrmModeModeinfo {
 /// the guest's own later `mmap()` of the `MAP_DUMB` offset (see `sys_mmap`'s DRI-fd branch), and
 /// (in a later pass) the host-side wgpu presentation code reading the flipped framebuffer's
 /// content directly, with no explicit copy between guest writes and host reads.
-struct DumbBuffer<Platform: ShimPlatform> {
+///
+/// POINTER-FREE, because this slot lives in [`SharedDrmRegion`], which is allocated from the
+/// cross-process shared kernel arena: `GlobalState`'s bytes are mapped at one fixed address in
+/// every host process of a fork family, but only its INLINE bytes travel -- a `BTreeMap` root
+/// pointer here is a heap address of whichever process created it and is meaningless in a child
+/// (the `btree/node.rs:1232` panic `f5d73ff` fixed for `flock_registry`). Hence a fixed slot index
+/// instead of a map, the same shape `SharedUnixConnTable`/`SharedFlockTable` already use.
+struct SharedDumbBufferSlot<Platform: ShimPlatform> {
+    state: AtomicU32,
+    /// The GEM handle `CREATE_DUMB` handed out for this buffer -- stored because a fixed slot
+    /// index is not the handle, and every ioctl addresses buffers by handle.
+    gem_handle: AtomicU32,
     // Stored for the buffer's own record-keeping (e.g. a future `DESTROY_DUMB`/`MAP_DUMB` bounds
     // or format-consistency check) even though nothing reads them back yet -- `pitch`/`size` are
     // the derived values everything downstream actually uses.
     #[allow(dead_code)]
-    width: u32,
+    width: AtomicU32,
     #[allow(dead_code)]
-    height: u32,
+    height: AtomicU32,
     #[allow(dead_code)]
-    bpp: u32,
-    pitch: u32,
-    size: usize,
-    handle: Platform::SharedMemoryHandle,
-    /// The fake `mmap` offset handed out by `DRM_IOCTL_MODE_MAP_DUMB`, if this buffer has been
-    /// mapped at least once. Real DRM hands out a fresh, unique fake offset per `MAP_DUMB` call
-    /// on the same handle; this device reuses the first one issued, which every real client
+    bpp: AtomicU32,
+    pitch: AtomicU32,
+    size: AtomicUsize,
+    /// `None` doubles as "this slot is free" -- there is no generic way to fabricate a
+    /// `Platform::SharedMemoryHandle` for an empty slot.
+    ///
+    /// `UnsafeCell` because `Platform::SharedMemoryHandle` is an associated type with no atomic
+    /// form (it is `usize` on the real platform, but this crate is platform-generic). See this
+    /// type's `Sync` impl for why that is sound here.
+    handle: UnsafeCell<Option<Platform::SharedMemoryHandle>>,
+    /// The fake `mmap` offset handed out by `DRM_IOCTL_MODE_MAP_DUMB`, `0` until this buffer has
+    /// been mapped at least once (real fake offsets are page-aligned and start at 1, so 0 is
+    /// unrepresentable as a real one). Real DRM hands out a fresh, unique fake offset per `MAP_DUMB`
+    /// call on the same handle; this device reuses the first one issued, which every real client
     /// tolerates (they don't rely on the offset changing across repeated `MAP_DUMB` calls).
-    map_offset: Option<u64>,
+    map_offset: AtomicU64,
+    /// Host pid that created this buffer, so [`SharedDrmTable::reclaim_dead`] can recover slots
+    /// whose creator died without issuing `DESTROY_DUMB`.
+    owner_host: AtomicU32,
 }
 
-/// Returned by [`DrmSubsystem::scanout_snapshot`] -- the current front buffer's identity, for a
+// SAFETY: `handle` is the one field that is not already atomic, and every read and write of it
+// happens inside `SharedDrmRegion::guard`'s critical section -- the SAME cross-process mutex that
+// serializes every other field of the region -- so no two threads, in one host process or across a
+// whole fork family, ever touch it unsynchronized. `UnsafeCell` is otherwise `!Sync` unconditionally,
+// which would make `GlobalState` `!Sync` too; this is the standard shared-memory state behind an
+// arena-resident mutex, and `SharedFlockTable` avoids needing it only because every field it
+// mutates happens to have an atomic form.
+unsafe impl<Platform: ShimPlatform> Sync for SharedDumbBufferSlot<Platform> {}
+
+impl<Platform: ShimPlatform> SharedDumbBufferSlot<Platform> {
+    fn new() -> Self {
+        Self {
+            state: AtomicU32::new(DRM_SLOT_FREE),
+            gem_handle: AtomicU32::new(0),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            bpp: AtomicU32::new(0),
+            pitch: AtomicU32::new(0),
+            size: AtomicUsize::new(0),
+            handle: UnsafeCell::new(None),
+            map_offset: AtomicU64::new(0),
+            owner_host: AtomicU32::new(0),
+        }
+    }
+
+    /// Reads this slot's shared-memory handle. Callers hold `SharedDrmRegion::guard`.
+    fn get_handle(&self) -> Option<Platform::SharedMemoryHandle> {
+        // SAFETY: the caller holds the region guard, so no other thread is writing it.
+        unsafe { *self.handle.get() }
+    }
+
+    /// Writes this slot's shared-memory handle. Callers hold `SharedDrmRegion::guard`.
+    fn set_handle(&self, handle: Option<Platform::SharedMemoryHandle>) {
+        // SAFETY: as above.
+        unsafe { *self.handle.get() = handle };
+    }
+}
+
+/// Returned by [`SharedDrmTable::scanout_snapshot`] -- the current front buffer's identity, for a
 /// host-side control channel (`docs/presenter-process-design.md` section 2) to duplicate the
 /// handle into an external presenter process. `pub`, not `pub(crate)`, so it can be re-exported
 /// at this crate's root and named by a runner crate outside `litebox_shim_linux`.
@@ -214,27 +299,91 @@ pub struct ScanoutSnapshot<Platform: ShimPlatform> {
     pub seq: u64,
 }
 
-/// A framebuffer object: an attached (buffer handle, format, geometry) tuple, referenced by
-/// `fb_id` from `DRM_IOCTL_MODE_SETCRTC`/`PAGE_FLIP`.
-struct Framebuffer {
-    width: u32,
-    height: u32,
-    pixel_format: u32,
+/// One slot of [`SharedDrmRegion::framebuffers`]: an attached (buffer handle, format, geometry)
+/// tuple, referenced by `fb_id` from `DRM_IOCTL_MODE_SETCRTC`/`PAGE_FLIP`/`DIRTYFB`.
+///
+/// See [`SharedDumbBufferSlot`] for why every field is inline POD.
+struct SharedFbSlot {
+    state: AtomicU32,
+    /// The `fb_id` this slot answers to -- framebuffers are named by id, not by slot index.
+    fb_id: AtomicU32,
+    #[allow(dead_code)]
+    width: AtomicU32,
+    height: AtomicU32,
+    pixel_format: AtomicU32,
     /// The dumb-buffer handle backing plane 0 (the only plane a dumb buffer ever populates).
-    handle: u32,
+    handle: AtomicU32,
+    owner_host: AtomicU32,
 }
 
-/// State for the one virtual DRM/KMS device this shim exposes. See the module doc comment for
-/// what is and is not implemented in this pass.
-pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
+impl SharedFbSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicU32::new(DRM_SLOT_FREE),
+            fb_id: AtomicU32::new(0),
+            width: AtomicU32::new(0),
+            height: AtomicU32::new(0),
+            pixel_format: AtomicU32::new(0),
+            handle: AtomicU32::new(0),
+            owner_host: AtomicU32::new(0),
+        }
+    }
+}
+
+/// The arena-resident, pointer-free half of the one virtual DRM/KMS device's shared state. See the
+/// module doc comment for what is and is not implemented in this pass.
+///
+/// # Why this is fixed slots and not a `BTreeMap`
+///
+/// `GlobalState` (which holds [`SharedDrmTable`]) is byte-shared with every cross-process fork
+/// child at one fixed address, and `SharedArc<T>` shares only `T`'s INLINE BYTES -- so a
+/// `BTreeMap` here hands a child the creating process's heap root pointer, meaningless in the
+/// child's own address space. That is exactly the `btree/node.rs:1232` panic `f5d73ff` fixed by
+/// moving `flock_registry` per-process, and it is why this device's state could not stay as it
+/// was.
+///
+/// # Why it is NOT per-process (unlike `flock_registry`)
+///
+/// `/dev/dri/card0` is a real fs device node (`litebox::fs::devices::DRI_CARD0_NODE_INFO`) that a
+/// fork child both inherits as a carried `"file"` fd (`raw_fd_subsystem_name` classifies a DRI fd
+/// as `"file"`, so `try_cross_process_fork` carries it) and can reopen by path, so a child
+/// genuinely reaches this device's buffers and framebuffers -- real DRM device state is per-DEVICE,
+/// not per-process. `docs/AGENTS_ARCHIVE_2026-09-18.md:765` records the same conclusion;
+/// re-confirmed for this pass before changing anything.
+///
+/// # What stays per-process
+///
+/// [`DrmFlipLocal`]: the host-side flip callbacks (`Box<dyn Fn>`) and the flip `Pollee` (a
+/// `BTreeMap` of `Weak<dyn Observer>`). Both are process-private by nature -- a closure or an
+/// observer registered in one host process cannot run in another -- so they moved to
+/// `GlobalStateHandle` rather than being forced in here.
+///
+/// Every mutable field below is guarded by [`Self::guard`]; the atomics are bumped under it too,
+/// so one critical section is the whole concurrency argument.
+struct SharedDrmRegion<Platform: ShimPlatform> {
+    /// Whether these bytes really are in memory EVERY process of the fork family maps -- the
+    /// cross-process shared kernel arena. `false` means the arena was exhausted at construction
+    /// and this region is a process-private fallback, so buffers and framebuffers created here
+    /// are this host process's own: the device keeps working, it simply is not the one device
+    /// real DRM's per-DEVICE semantics describe. Carried in the region (not on
+    /// [`SharedDrmTable`]) for exactly the reason `SharedFlockRegion::excludes` is.
+    cross_process: AtomicBool,
+    /// Serializes every lookup, claim and transition in the whole fork family, so no two processes
+    /// can disagree about which slot owns which object. Held for a handful of stores; a holder
+    /// killed mid-section is recovered by `RawMutex`'s `holder_pid` dead-holder path.
+    guard: litebox::sync::Mutex<Platform, ()>,
+    // Handles/IDs start at 1: real DRM never hands out handle/id 0 for an actual object
+    // (0 is reserved to mean "none"/"invalid" in these ioctls, e.g. `drm_mode_crtc.fb_id
+    // == 0` means "no framebuffer attached").
     next_buffer_handle: AtomicU32,
     next_fb_id: AtomicU32,
     next_map_offset: AtomicU32,
-    buffers: litebox::sync::Mutex<Platform, BTreeMap<u32, DumbBuffer<Platform>>>,
-    framebuffers: litebox::sync::Mutex<Platform, BTreeMap<u32, Framebuffer>>,
+    buffers: [SharedDumbBufferSlot<Platform>; SHARED_DRM_BUFFERS],
+    framebuffers: [SharedFbSlot; SHARED_DRM_FRAMEBUFFERS],
     /// The framebuffer currently attached to the virtual CRTC (via `SETCRTC` or `PAGE_FLIP`),
     /// `None` until the guest sets one.
-    crtc_fb: litebox::sync::Mutex<Platform, Option<u32>>,
+    /// `0` means "no framebuffer attached" (real DRM reserves `fb_id == 0` the same way).
+    crtc_fb: AtomicU32,
     /// Whether the virtual CRTC currently has a MODE configured, independent of whether a
     /// framebuffer is currently attached to it. Real DRM's `drmModeGetCrtc` reports the CRTC's
     /// current mode (`mode_valid = 1`) as long as a mode has been set, even mid-modeset when no
@@ -245,37 +394,35 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     /// that exact empty-buffer modeset transition made a subsequent `GETCRTC` incorrectly report
     /// `mode_valid = 0` -- a real KMS driver never does this, and a client that re-derives its
     /// output dimensions from `GETCRTC`'s reported mode during a modeset would see a bogus "no
-    /// mode" answer instead of the mode it just set. Set by [`Self::set_crtc`] whenever the guest
+    /// mode" answer instead of the mode it just set. Set by [`SharedDrmTable::set_crtc`] whenever
+    /// the guest
     /// supplies a mode (`req.mode_valid != 0`), left in whatever state it already had if the
     /// guest calls `SETCRTC` with `mode_valid == 0` purely to change/detach the framebuffer (real
     /// DRM only clears the configured mode via an explicit "set to no mode" `SETCRTC`, i.e.
     /// `mode_valid == 0` in that same call), and cleared only when `mode_valid == 0`.
-    crtc_mode_set: litebox::sync::Mutex<Platform, bool>,
+    crtc_mode_set: AtomicBool,
     /// The framebuffer currently attached to [`VIRTUAL_PLANE_ID`] via `SETPLANE`, `None` until
     /// the guest sets one. Deliberately independent of `crtc_fb` (a real primary plane's `fb_id`
     /// and its CRTC's own `fb_id` are two separate pieces of driver state that a real client can
     /// observe diverge, e.g. right after a `SETPLANE` before any `PAGE_FLIP`/`SETCRTC` call) --
     /// this device does not attempt to keep them synchronized, matching real KMS semantics rather
     /// than inventing a coupling the UAPI doesn't promise.
-    plane_fb: litebox::sync::Mutex<Platform, Option<u32>>,
-    /// Completed-but-not-yet-`read()` page-flip events, in completion order -- popped one at a
-    /// time by `read()` on the DRM device fd (see `litebox_shim_linux::syscalls::file::do_read`'s
-    /// DRI-fd branch). Only ever grows from [`Self::page_flip`] when the guest requested
+    /// `0` means the plane is disabled, the real-DRM `SETPLANE` way of detaching.
+    plane_fb: AtomicU32,
+    /// Completed-but-not-yet-`read()` page-flip events as a fixed ring of RAW EVENT BYTES, in
+    /// completion order -- popped one at a time by `read()` on the DRM device fd (see
+    /// `litebox_shim_linux::syscalls::file::do_read`'s DRI-fd branch). One slot holds exactly the
+    /// byte image a real `read()` must return, so what the guest sees is bit-identical to the
+    /// `VecDeque<DrmEventVblank>` this replaced. Only ever appended when the guest requested
     /// `DRM_MODE_PAGE_FLIP_EVENT`; this device completes every flip immediately (no real vsync
     /// timing -- see this module's doc comment), so an event is always ready by the time a client
-    /// gets around to reading for it.
-    pending_flip_events: litebox::sync::Mutex<Platform, VecDeque<DrmEventVblank>>,
-    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the DRM
-    /// device fd waiting for a page-flip completion event. `page_flip` notifies this whenever it
-    /// pushes into [`Self::pending_flip_events`]; `syscalls::epoll::EpollDescriptor::poll`'s `File`
-    /// arm registers an observer here (mirroring every other pollable fd kind, e.g. eventfd) so a
-    /// compositor's own event loop -- which registers the DRM fd once via `epoll_ctl` and then
-    /// blocks in `epoll_wait` across many frames, rather than re-polling synchronously after every
-    /// flip -- actually wakes for the second and subsequent flips. Without this, the fd's readiness
-    /// was only ever computed on-demand (see [`Self::has_pending_flip_events`]'s doc comment for
-    /// the confirmed-live symptom this produced: exactly one `SETCRTC`+`PAGE_FLIP` pair at startup,
-    /// then no repaint ever again for the rest of the run).
-    flip_pollee: Pollee<Platform>,
+    /// gets around to reading for it. At capacity the OLDEST is dropped, matching a real kernel's
+    /// own event ring (and never failing the guest's `PAGE_FLIP` for a queue it has not drained).
+    flip_events: [[AtomicU8; FLIP_EVENT_BYTES]; SHARED_DRM_FLIP_EVENTS],
+    /// Index of the oldest live entry in [`Self::flip_events`].
+    flip_head: AtomicU32,
+    /// How many entries of [`Self::flip_events`] are live.
+    flip_count: AtomicU32,
     /// Monotonically increasing vblank sequence number, echoed into each flip-completion event's
     /// `sequence` field -- real clients that track it purely to detect drops/reordering see a
     /// plain incrementing counter, matching real Linux's own semantics closely enough for that
@@ -283,75 +430,324 @@ pub(crate) struct DrmSubsystem<Platform: ShimPlatform> {
     next_vblank_sequence: AtomicU32,
     /// Whether this device fd currently holds "DRM master" status (`DRM_IOCTL_SET_MASTER`
     /// granted, not yet released by `DRM_IOCTL_DROP_MASTER`). This virtual device has exactly one
-    /// possible client and no real multi-master contention to arbitrate (see [`Self::set_master`]/
-    /// [`Self::drop_master`]'s own doc comments), so this is bookkeeping only -- nothing currently
+    /// possible client and no real multi-master contention to arbitrate (see
+    /// [`SharedDrmTable::set_master`]/[`SharedDrmTable::drop_master`]'s own doc comments), so this
+    /// is bookkeeping only -- nothing currently
     /// consults it to gate another ioctl, matching how mode-setting here already succeeds
     /// regardless of master status.
-    is_master: core::sync::atomic::AtomicBool,
-    /// Host-side hook, invoked synchronously at the end of every successful [`Self::page_flip`]
+    is_master: AtomicBool,
+    /// Bumped on every successful present (`SETCRTC`/`PAGE_FLIP`/`DIRTYFB`), unconditionally --
+    /// registered no matter whether any [`DrmFlipLocal::callbacks`] observer exists, per
+    /// `docs/presenter-process-design.md` section 2.2's `ScanoutDescriptor::frame_seq` and section
+    /// 4.3/4.4 ("something must always maintain it for `screenshot`/`scanout` to have current data
+    /// regardless of whether a presenter is attached"). A plain incrementing counter, not a real
+    /// vblank timestamp -- a presenter or control-channel caller
+    /// ([`SharedDrmTable::scanout_snapshot`]) polls this to know a new frame exists, exactly like
+    /// [`Self::next_vblank_sequence`] but host-readable outside this crate (mirrored into a shared
+    /// section by the runner, see the design doc's section 2.4).
+    frame_seq: AtomicU64,
+}
+
+/// The shared half of the one virtual DRM/KMS device's state, as a `GlobalState` field: a pointer
+/// to the arena-resident [`SharedDrmRegion`] (a FIXED address, so valid in every process of the
+/// fork family) plus the one flag that says whether that region really is cross-process visible.
+/// Nothing here is a heap pointer, which is the entire point -- see that region's doc comment.
+pub(crate) struct SharedDrmTable<Platform: ShimPlatform> {
+    region: &'static SharedDrmRegion<Platform>,
+}
+
+/// The per-process half of the one virtual DRM/KMS device's state -- see [`SharedDrmRegion`]'s
+/// "what stays per-process". Lives on `GlobalStateHandle`, NOT on `GlobalState`: both fields are
+/// process-private by construction, so a byte-shared copy of them is meaningless in a fork child
+/// (the same defect class `f5d73ff` moved `flock_registry` out of).
+pub(crate) struct DrmFlipLocal<Platform: ShimPlatform> {
+    /// Host-side frame observers, invoked synchronously at the end of every successful present
     /// with the now-scanned-out framebuffer's own pixel bytes (a plain, already-copied-out `&[u8]`
     /// -- not the platform-specific shared-memory handle, deliberately: a `Box<dyn Fn(...)>`
-    /// capturing `Platform::SharedMemoryHandle` (an associated type projected off
-    /// `PageManagementProvider<{PAGE_SIZE}>`) hits a real rustc limitation resolving that
-    /// associated type's well-formedness behind a trait object even though `ShimPlatform` already
-    /// implies the bound for every concrete use of this struct -- confirmed live, `cargo build`
+    /// capturing `Platform::SharedMemoryHandle` hits a real rustc limitation resolving that
+    /// associated type's well-formedness behind a trait object -- confirmed live, `cargo build`
     /// error `E0277` naming the bound as unsatisfied even on this `impl` block's own untouched
     /// existing methods. Staying byte-based sidesteps that entirely and is also the more honest
     /// interface: a presentation layer only ever needed the pixels, never the handle) plus
     /// `(width, height, pitch, pixel_format)`. `litebox_shim_linux` is platform-agnostic and
     /// cannot depend on a concrete presentation layer (e.g.
-    /// `litebox_platform_windows_userland`'s wgpu-backed `Presenter`), so this stays a generic
-    /// callbacks set post-construction (see [`Self::add_flip_callback`]) by whichever runner
-    /// binary DOES depend on both crates and wants to actually display flipped frames -- a runner
-    /// that never calls the setter (or a non-GUI runner target) simply never invokes it, at zero
-    /// cost beyond one extra `Option` check per flip.
-    /// A LIST, not a single slot. Frame observers are genuinely independent subsystems and
-    /// more than one is routinely wanted at once: a `--gui` window presenting to the user AND a
-    /// `LITEBOX_DUMP_FRAMES` capture recording the exact same frames for verification. When this
-    /// was a single `Option`, installing either one silently REPLACED the other, so the runner
-    /// had to gate them against each other (`if gui_presenter_thread.is_none()`) and the two
-    /// modes were mutually exclusive by construction -- you could watch the display or capture
-    /// it, never both, which is precisely when capture matters most (proving what the window is
-    /// showing). Appending keeps each observer independent: one that hangs or panics cannot
-    /// deprive the others of frames, matching the runner's own established reasoning that frame
-    /// verification must never be hostage to the flakier windowing/wgpu path.
-    flip_callbacks: litebox::sync::Mutex<
-        Platform,
-        alloc::vec::Vec<alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>>,
-    >,
-    /// Bumped on every successful [`Self::notify_flip_callback`] call (i.e. every `SETCRTC`,
-    /// `PAGE_FLIP`, and `DIRTYFB`), unconditionally -- registered no matter whether any
-    /// `flip_callbacks` observer exists, per `docs/presenter-process-design.md` section 2.2's
-    /// `ScanoutDescriptor::frame_seq` and section 4.3/4.4 ("something must always maintain it for
-    /// `screenshot`/`scanout` to have current data regardless of whether a presenter is
-    /// attached"). A plain incrementing counter, not a real vblank timestamp -- a presenter or
-    /// control-channel caller ([`Self::scanout_snapshot`]) polls this to know a new frame exists,
-    /// exactly like [`Self::next_vblank_sequence`] but host-readable outside this crate (mirrored
-    /// into a shared section by the runner, see the design doc's section 2.4).
-    frame_seq: core::sync::atomic::AtomicU64,
+    /// `litebox_platform_windows_userland`'s wgpu-backed `Presenter`), so this stays an empty list
+    /// until whichever runner binary DOES depend on both crates installs one (see
+    /// [`Self::add_flip_callback`]) -- a runner with no GUI story simply never installs any, at
+    /// zero cost beyond one length check per flip.
+    ///
+    /// A LIST, not a single slot: frame observers are genuinely independent subsystems and more
+    /// than one is routinely wanted at once (a `--gui` window presenting to the user AND a
+    /// `LITEBOX_DUMP_FRAMES` capture recording the exact same frames). When this was a single
+    /// `Option`, installing either one silently REPLACED the other, so the two modes were mutually
+    /// exclusive by construction -- you could watch the display or capture it, never both, which
+    /// is precisely when capture matters most. Appending keeps each observer independent: one that
+    /// hangs cannot deprive the others of frames.
+    callbacks: litebox::sync::Mutex<Platform, alloc::vec::Vec<DrmFlipCallback>>,
+    /// Wakeup mechanism for a guest thread blocked in `poll`/`epoll_wait`/`select` on the DRM
+    /// device fd waiting for a page-flip completion event. `page_flip` notifies this whenever it
+    /// appends to the shared ring; `syscalls::epoll::EpollDescriptor::poll`'s `File` arm registers
+    /// an observer here (mirroring every other pollable fd kind, e.g. eventfd) so a compositor's
+    /// own event loop -- which registers the DRM fd once via `epoll_ctl` and then blocks in
+    /// `epoll_wait` across many frames, rather than re-polling synchronously after every flip --
+    /// actually wakes for the second and subsequent flips (confirmed-live symptom when it did not:
+    /// exactly one `SETCRTC`+`PAGE_FLIP` pair at startup, then no repaint ever again for the rest
+    /// of the run).
+    ///
+    /// PER-PROCESS, and that is a real, disclosed narrowing: a `Pollee` is a `BTreeMap` of
+    /// `Weak<dyn Observer>`, there is no pointer-free arena form of it, and inventing one is a
+    /// separate piece of work. Presents are pushed by the host process that owns the presenter and
+    /// consumed by that same process's guest tasks, so the narrowed case is a cross-process fork
+    /// child polling `/dev/dri/card0` itself: it still gets correct `read()` results and correct
+    /// readiness from the shared ring, just no cross-process poll wakeup.
+    pollee: Pollee<Platform>,
 }
 
-impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
-    pub(crate) fn new() -> Self {
-        Self {
-            // Handles/IDs start at 1: real DRM never hands out handle/id 0 for an actual object
-            // (0 is reserved to mean "none"/"invalid" in these ioctls, e.g. `drm_mode_crtc.fb_id
-            // == 0` means "no framebuffer attached").
-            next_buffer_handle: AtomicU32::new(1),
-            next_fb_id: AtomicU32::new(1),
-            next_map_offset: AtomicU32::new(1),
-            buffers: litebox::sync::Mutex::new(BTreeMap::new()),
-            framebuffers: litebox::sync::Mutex::new(BTreeMap::new()),
-            crtc_fb: litebox::sync::Mutex::new(None),
-            crtc_mode_set: litebox::sync::Mutex::new(false),
-            plane_fb: litebox::sync::Mutex::new(None),
-            pending_flip_events: litebox::sync::Mutex::new(VecDeque::new()),
-            flip_pollee: Pollee::new(),
-            next_vblank_sequence: AtomicU32::new(0),
-            is_master: core::sync::atomic::AtomicBool::new(false),
-            flip_callbacks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
-            frame_seq: core::sync::atomic::AtomicU64::new(0),
+/// One host-side frame observer -- see [`DrmFlipLocal::callbacks`].
+type DrmFlipCallback = alloc::boxed::Box<dyn Fn(&[u8], u32, u32, u32, u32) + Send + Sync>;
+
+impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
+    /// Allocates the region in the cross-process SHARED kernel arena and initializes it.
+    ///
+    /// Runs exactly once per fork family, from `LinuxShimBuilder::build`'s create branch: every
+    /// other process in the family attaches to the already-built `GlobalState` and never calls this
+    /// (the same create-vs-attach split `SharedUnixConnTable::new` and `SharedFlockTable::new`
+    /// rely on). Byte cost: one `shared_kernel_arena_alloc_bytes` of
+    /// `size_of::<SharedDrmRegion<Platform>>()`, which that allocator rounds up to a power of two
+    /// with an 8KiB floor -- see [`Self::new_in`] for the debug log that reports the exact figure.
+    pub(crate) fn new(platform: &Platform) -> Self {
+        let layout = core::alloc::Layout::new::<SharedDrmRegion<Platform>>();
+        let arena = platform.shared_kernel_arena_alloc_bytes(layout);
+        let (ptr, shared) = match arena {
+            Some(ptr) => (ptr.cast::<SharedDrmRegion<Platform>>(), true),
+            None => {
+                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+                // process IS the whole guest session). Leak a process-private allocation so every
+                // later access stays memory-safe, and let `shared` say so.
+                litebox_util_log::error!(
+                    bytes:% = layout.size();
+                    "shared drm table: shared kernel arena exhausted; /dev/dri/card0 objects are \
+                     visible to this host process only"
+                );
+                (
+                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                        .expect("shared drm table: fallback allocation failed")
+                        .cast::<SharedDrmRegion<Platform>>(),
+                    false,
+                )
+            }
+        };
+        Self::new_in(ptr, shared)
+    }
+
+    /// Builds the table over caller-owned memory, which [`Self::new`] takes from the shared arena.
+    fn new_in(ptr: core::ptr::NonNull<SharedDrmRegion<Platform>>, shared: bool) -> Self {
+        // SAFETY (every write): `ptr` names one contiguous, uninitialized `SharedDrmRegion` sized
+        // by [`Self::new`]'s `layout`, and writing a freshly built value into uninitialized memory
+        // is what `write` is for. Initializing through the pointer ONE FIELD AT A TIME is also the
+        // whole point: a `SharedDrmRegion` value is several KiB of stack at once, and `GlobalState`
+        // is built by value on a stack that is already near its documented limit.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).cross_process).write(AtomicBool::new(shared));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).guard).write(litebox::sync::Mutex::new(()));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).next_buffer_handle).write(AtomicU32::new(1));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).next_fb_id).write(AtomicU32::new(1));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).next_map_offset).write(AtomicU32::new(1));
+            for i in 0..SHARED_DRM_BUFFERS {
+                core::ptr::addr_of_mut!((*ptr.as_ptr()).buffers[i])
+                    .write(SharedDumbBufferSlot::new());
+            }
+            for i in 0..SHARED_DRM_FRAMEBUFFERS {
+                core::ptr::addr_of_mut!((*ptr.as_ptr()).framebuffers[i]).write(SharedFbSlot::new());
+            }
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).crtc_fb).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).crtc_mode_set).write(AtomicBool::new(false));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).plane_fb).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_events).write(core::array::from_fn(|_| {
+                core::array::from_fn(|_| AtomicU8::new(0))
+            }));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_head).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_count).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).next_vblank_sequence).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).is_master).write(AtomicBool::new(false));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).frame_seq).write(AtomicU64::new(0));
         }
+        litebox_util_log::debug!(
+            region_bytes:% = core::alloc::Layout::new::<SharedDrmRegion<Platform>>().size(),
+            shared:% = shared;
+            "shared drm table: region initialized"
+        );
+        Self {
+            // SAFETY: `ptr` is non-null and suitably aligned, and the region at it was just
+            // initialized field-by-field above. `'static` is sound because this allocation is
+            // arena-backed (or a deliberately leaked one) and never reclaimed, and nothing else
+            // holds a reference to it.
+            region: unsafe { &*ptr.as_ptr() },
+        }
+    }
+
+    /// Whether this table's objects are visible to every process of the fork family -- see
+    /// [`SharedDrmRegion::cross_process`].
+    pub(crate) fn is_shared(&self) -> bool {
+        self.region.cross_process.load(Ordering::Acquire)
+    }
+
+    /// Index of the slot holding dumb buffer `gem_handle`. Callers hold `guard`.
+    fn buffer_slot(&self, gem_handle: u32) -> Option<usize> {
+        (0..SHARED_DRM_BUFFERS).find(|i| {
+            let slot = &self.region.buffers[*i];
+            slot.state.load(Ordering::Acquire) == DRM_SLOT_USED
+                && slot.gem_handle.load(Ordering::Acquire) == gem_handle
+        })
+    }
+
+    /// Index of the slot holding the dumb buffer a prior `MAP_DUMB` handed out `offset` for.
+    /// Callers hold `guard`.
+    fn buffer_slot_by_map_offset(&self, offset: u64) -> Option<usize> {
+        (0..SHARED_DRM_BUFFERS).find(|i| {
+            let slot = &self.region.buffers[*i];
+            slot.state.load(Ordering::Acquire) == DRM_SLOT_USED
+                && slot.map_offset.load(Ordering::Acquire) == offset
+        })
+    }
+
+    /// Index of the slot holding framebuffer `fb_id`. Callers hold `guard`.
+    fn fb_slot(&self, fb_id: u32) -> Option<usize> {
+        (0..SHARED_DRM_FRAMEBUFFERS).find(|i| {
+            let slot = &self.region.framebuffers[*i];
+            slot.state.load(Ordering::Acquire) == DRM_SLOT_USED
+                && slot.fb_id.load(Ordering::Acquire) == fb_id
+        })
+    }
+
+    /// How many framebuffers currently exist, for `GETRESOURCES`' `count_fbs`. Callers hold
+    /// `guard`.
+    fn fb_count(&self) -> usize {
+        self.region
+            .framebuffers
+            .iter()
+            .filter(|s| s.state.load(Ordering::Acquire) == DRM_SLOT_USED)
+            .count()
+    }
+
+    /// Reclaims every slot whose owning host process is gone, so a fork family that outlived the
+    /// process which created the objects does not leak their capacity for the rest of the session.
+    /// Callers hold `guard`. This is the same dead-pid reclamation `SharedFlockTable` already does.
+    fn reclaim_dead(&self, platform: &Platform) {
+        for i in 0..SHARED_DRM_BUFFERS {
+            let slot = &self.region.buffers[i];
+            let owner = slot.owner_host.load(Ordering::Acquire);
+            if owner != 0 && !platform.is_process_alive(owner) {
+                slot.state.store(DRM_SLOT_FREE, Ordering::Release);
+                slot.set_handle(None);
+                slot.map_offset.store(0, Ordering::Release);
+                slot.owner_host.store(0, Ordering::Release);
+            }
+        }
+        for i in 0..SHARED_DRM_FRAMEBUFFERS {
+            let slot = &self.region.framebuffers[i];
+            let owner = slot.owner_host.load(Ordering::Acquire);
+            if owner != 0 && !platform.is_process_alive(owner) {
+                slot.state.store(DRM_SLOT_FREE, Ordering::Release);
+                slot.fb_id.store(0, Ordering::Release);
+                slot.owner_host.store(0, Ordering::Release);
+            }
+        }
+    }
+
+    /// Claims a free buffer slot for `gem_handle`, reclaiming dead owners first if the table is
+    /// full. `None` means the table genuinely cannot represent another buffer. Callers hold
+    /// `guard`.
+    fn claim_buffer(&self, platform: &Platform) -> Option<usize> {
+        if let Some(i) = (0..SHARED_DRM_BUFFERS)
+            .find(|i| self.region.buffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE)
+        {
+            return Some(i);
+        }
+        self.reclaim_dead(platform);
+        let i = (0..SHARED_DRM_BUFFERS)
+            .find(|i| self.region.buffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE)?;
+        Some(i)
+    }
+
+    /// Claims a free framebuffer slot for `fb_id`. See [`Self::claim_buffer`]. Callers hold `guard`.
+    fn claim_fb(&self, platform: &Platform) -> Option<usize> {
+        if let Some(i) = (0..SHARED_DRM_FRAMEBUFFERS)
+            .find(|i| self.region.framebuffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE)
+        {
+            return Some(i);
+        }
+        self.reclaim_dead(platform);
+        let i = (0..SHARED_DRM_FRAMEBUFFERS)
+            .find(|i| self.region.framebuffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE)?;
+        Some(i)
+    }
+
+    /// Returns `gem_handle`'s fake `mmap` offset, allocating one the first time -- the lazy
+    /// allocation both `map_dumb` and `prime_export_offset` want (a real client always maps a dumb
+    /// buffer before/around exporting it, but nothing in the UAPI requires that ordering, so the
+    /// export-first case has to work too). `None` = no such buffer.
+    fn map_offset_for(&self, gem_handle: u32) -> Option<u64> {
+        let _guard = self.region.guard.lock();
+        let i = self.buffer_slot(gem_handle)?;
+        let slot = &self.region.buffers[i];
+        let existing = slot.map_offset.load(Ordering::Acquire);
+        if existing != 0 {
+            return Some(existing);
+        }
+        // Real DRM fake offsets are page-aligned, opaque `mmap()` targets in a reserved range
+        // distinct from any real memory address. `<< 12` (page-align) keeps this device's offsets
+        // shaped the same way without claiming to match the kernel's exact internal allocation
+        // scheme (which is driver-private and not part of the UAPI contract clients rely on).
+        let fresh = u64::from(self.region.next_map_offset.fetch_add(1, Ordering::Relaxed)) << 12;
+        slot.map_offset.store(fresh, Ordering::Release);
+        Some(fresh)
+    }
+
+    /// Appends one flip-completion event to the shared ring, dropping the OLDEST if it is already
+    /// full (a real kernel's own event ring behaves the same way -- a client that never reads must
+    /// not be able to fail the presenting process's `PAGE_FLIP`). Callers hold `guard`.
+    fn flip_push(&self, event: &DrmEventVblank) {
+        let count = self.region.flip_count.load(Ordering::Acquire) as usize;
+        let head = self.region.flip_head.load(Ordering::Acquire) as usize;
+        let idx = if count == SHARED_DRM_FLIP_EVENTS {
+            // Full: overwrite the oldest in place and advance the head past it.
+            let idx = head;
+            self.region
+                .flip_head
+                .store(((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32, Ordering::Release);
+            idx
+        } else {
+            let idx = (head + count) % SHARED_DRM_FLIP_EVENTS;
+            self.region
+                .flip_count
+                .store((count + 1) as u32, Ordering::Release);
+            idx
+        };
+        let bytes = event.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            self.region.flip_events[idx][i].store(*b, Ordering::Release);
+        }
+    }
+
+    /// Pops the oldest flip-completion event's exact byte image. Callers hold `guard`.
+    fn flip_pop(&self) -> Option<[u8; FLIP_EVENT_BYTES]> {
+        let count = self.region.flip_count.load(Ordering::Acquire) as usize;
+        if count == 0 {
+            return None;
+        }
+        let head = self.region.flip_head.load(Ordering::Acquire) as usize;
+        let mut out = [0u8; FLIP_EVENT_BYTES];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = self.region.flip_events[head][i].load(Ordering::Acquire);
+        }
+        self.region
+            .flip_head
+            .store(((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32, Ordering::Release);
+        self.region
+            .flip_count
+            .store((count - 1) as u32, Ordering::Release);
+        Some(out)
     }
 
     /// A snapshot of the current front buffer's identity for a host-side control channel to hand
@@ -359,47 +755,32 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// Reads the exact same `crtc_fb`/`framebuffers`/`buffers` bookkeeping
     /// [`Self::notify_flip_callback`] already consults, but returns the platform's own
     /// [`ShimPlatform::SharedMemoryHandle`] itself rather than mapping it and handing out bytes --
-    /// unlike [`Self::flip_callbacks`] (a `Box<dyn Fn>` that cannot carry this associated type
+    /// unlike [`DrmFlipLocal::callbacks`] (a `Box<dyn Fn>` that cannot carry this associated type
     /// across a trait object, see that field's own doc comment), a plain generic method call from
     /// a caller that already knows the concrete `Platform` type (the runner) has no such
     /// limitation. `None` until the guest has attached a framebuffer to the CRTC at least once.
     pub(crate) fn scanout_snapshot(&self) -> Option<ScanoutSnapshot<Platform>> {
-        let fb_id = (*self.crtc_fb.lock())?;
-        let framebuffers = self.framebuffers.lock();
-        let fb = framebuffers.get(&fb_id)?;
-        let buffers = self.buffers.lock();
-        let buffer = buffers.get(&fb.handle)?;
+        let _guard = self.region.guard.lock();
+        let fb_id = self.region.crtc_fb.load(Ordering::Acquire);
+        if fb_id == 0 {
+            return None;
+        }
+        let fb_slot = self.fb_slot(fb_id)?;
+        let fb = &self.region.framebuffers[fb_slot];
+        let buffer = &self.region.buffers[self.buffer_slot(fb.handle.load(Ordering::Acquire))?];
         Some(ScanoutSnapshot {
-            handle: buffer.handle,
-            size: buffer.size,
-            width: fb.width,
-            height: fb.height,
-            pitch: buffer.pitch,
-            pixel_format: fb.pixel_format,
+            handle: buffer.get_handle()?,
+            size: buffer.size.load(Ordering::Acquire),
+            width: fb.width.load(Ordering::Acquire),
+            height: fb.height.load(Ordering::Acquire),
+            pitch: buffer.pitch.load(Ordering::Acquire),
+            pixel_format: fb.pixel_format.load(Ordering::Acquire),
             // Single-buffer dumb-buffer allocation: the whole section backs one buffer starting
             // at byte 0 (see `create_dumb`). A future double-buffered upgrade (design doc section
             // 2.2's own noted future step) is the only case that would ever make this non-zero.
             offset: 0,
-            seq: self.frame_seq.load(core::sync::atomic::Ordering::Acquire),
+            seq: self.region.frame_seq.load(Ordering::Acquire),
         })
-    }
-
-    /// Append a host-side frame observer -- see [`Self::flip_callbacks`]'s doc
-    /// comment for when/why a runner calls this, and why it takes plain pixel bytes rather than
-    /// the platform-specific shared-memory handle. Not part of [`Self::new`] itself since
-    /// `litebox_shim_linux` has no presentation layer of its own to default to; a runner that
-    /// wants flipped frames actually displayed calls this once, right after
-    /// [`crate::LinuxShimBuilder::build`], with a closure that forwards the bytes to its own
-    /// window/GPU-surface presentation code.
-    /// Observers are ADDITIVE: calling this twice installs two, both invoked per flip in
-    /// registration order. It does not replace a previously-installed one.
-    pub fn add_flip_callback(
-        &self,
-        callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
-    ) {
-        self.flip_callbacks
-            .lock()
-            .push(alloc::boxed::Box::new(callback));
     }
 
     /// Pop the oldest pending flip-completion event, if any, encoded as the exact bytes a real
@@ -409,9 +790,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// `syscalls::file::do_read`'s DRI-fd branch) is responsible for real Linux's actual
     /// `read()`-with-nothing-pending behavior (blocks, or `EAGAIN` if the fd is non-blocking).
     pub(crate) fn pop_flip_event_bytes(&self) -> Option<alloc::vec::Vec<u8>> {
-        let event = self.pending_flip_events.lock().pop_front()?;
-        let mut bytes = alloc::vec::Vec::with_capacity(size_of::<DrmEventVblank>());
-        bytes.extend_from_slice(event.as_bytes());
+        let _guard = self.region.guard.lock();
+        let event = self.flip_pop()?;
+        let mut bytes = alloc::vec::Vec::with_capacity(FLIP_EVENT_BYTES);
+        bytes.extend_from_slice(&event);
         Some(bytes)
     }
 
@@ -419,7 +801,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// -- the readiness half of the same fact [`Self::pop_flip_event_bytes`] consumes. Exists so
     /// `syscalls::epoll::EpollDescriptor::poll`'s `File` arm can report a DRM fd `Events::IN`
     /// exactly when this device genuinely has something to deliver, mirroring
-    /// `EvdevSubsystem::has_pending`'s identical role for `/dev/input/event0`. Without this, a
+    /// `SharedEvdevTable::has_pending`'s identical role for `/dev/input/event0`. Without this, a
     /// real compositor's own event loop -- which registers the DRM fd with `epoll`/`poll` and
     /// waits for it to become readable BEFORE calling `read()`, rather than reading unconditionally
     /// right after issuing a flip -- never observes a flip-complete notification for any repaint
@@ -428,17 +810,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// one `SETCRTC`+`PAGE_FLIP` pair at startup and never repainted again for the rest of a 60+
     /// second run with three live Wayland/X11 client applications attached the entire time.
     pub(crate) fn has_pending_flip_events(&self) -> bool {
-        !self.pending_flip_events.lock().is_empty()
-    }
-
-    /// Register an observer for DRM fd readiness -- see [`Self::flip_pollee`]'s doc comment.
-    /// Called from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `DriFd` branch, exactly
-    /// where every other pollable fd kind (e.g. eventfd) registers its own observer.
-    pub(crate) fn register_flip_observer(
-        &self,
-        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
-    ) {
-        self.flip_pollee.register_observer(observer, Events::IN);
+        let _guard = self.region.guard.lock();
+        self.region.flip_count.load(Ordering::Acquire) != 0
     }
 
     pub(crate) fn get_resources(&self, ptr: UserPtrMut<DrmModeCardRes>) -> Result<u32, Errno> {
@@ -465,22 +838,27 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             out.write_at_offset::<Platform>(0, VIRTUAL_CRTC_ID)
                 .ok_or(Errno::EFAULT)?;
         }
-        let fbs = self.framebuffers.lock();
-        let fb_count = u32::try_from(fbs.len()).unwrap_or(u32::MAX);
+        let _guard = self.region.guard.lock();
+        let fb_count = u32::try_from(self.fb_count()).unwrap_or(u32::MAX);
         if req.count_fbs > 0 && req.fb_id_ptr != 0 {
             let out = UserPtrMut::<u32>::from_usize(req.fb_id_ptr as usize);
-            for (i, (fb_id, _)) in fbs.iter().enumerate() {
-                if i as u32 >= req.count_fbs {
+            let mut i: u32 = 0;
+            for slot in self.region.framebuffers.iter() {
+                if i >= req.count_fbs {
                     break;
+                }
+                if slot.state.load(Ordering::Acquire) != DRM_SLOT_USED {
+                    continue;
                 }
                 out.write_at_offset::<Platform>(
                     isize::try_from(i).map_err(|_| Errno::EINVAL)?,
-                    *fb_id,
+                    slot.fb_id.load(Ordering::Acquire),
                 )
                 .ok_or(Errno::EFAULT)?;
+                i += 1;
             }
         }
-        drop(fbs);
+        drop(_guard);
 
         req.count_connectors = 1;
         req.count_encoders = 1;
@@ -560,13 +938,13 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.crtc_id != 0 && req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        let fb_id = self.crtc_fb.lock().unwrap_or(0);
+        let _guard = self.region.guard.lock();
         req.crtc_id = VIRTUAL_CRTC_ID;
-        req.fb_id = fb_id;
+        req.fb_id = self.region.crtc_fb.load(Ordering::Acquire);
         req.x = 0;
         req.y = 0;
         req.gamma_size = 0;
-        if *self.crtc_mode_set.lock() {
+        if self.region.crtc_mode_set.load(Ordering::Acquire) {
             req.mode_valid = 1;
             req.mode = virtual_mode();
         } else {
@@ -587,14 +965,18 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     pub(crate) fn set_crtc(
         &self,
         platform: &Platform,
+        local: &DrmFlipLocal<Platform>,
         ptr: UserPtr<DrmModeCrtc>,
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        if req.fb_id != 0 && !self.framebuffers.lock().contains_key(&req.fb_id) {
-            return Err(Errno::ENOENT);
+        {
+            let _guard = self.region.guard.lock();
+            if req.fb_id != 0 && self.fb_slot(req.fb_id).is_none() {
+                return Err(Errno::ENOENT);
+            }
         }
         // This device advertises exactly ONE mode (`VIRTUAL_WIDTH`x`VIRTUAL_HEIGHT`, see
         // `GETCONNECTOR`'s `modes` array and `min_width`/`max_width`/`min_height`/`max_height` in
@@ -628,22 +1010,25 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             count_connectors:? = req.count_connectors;
             "drm-ioctl: SETCRTC request"
         );
-        *self.crtc_fb.lock() = if req.fb_id == 0 {
-            None
-        } else {
-            Some(req.fb_id)
+        let attached_fb = {
+            let _guard = self.region.guard.lock();
+            self.region
+                .crtc_fb
+                .store(if req.fb_id == 0 { 0 } else { req.fb_id }, Ordering::Release);
+            // Track mode-configured state independent of `fb_id` -- see
+            // [`SharedDrmRegion::crtc_mode_set`]'s own doc comment for why conflating the two
+            // previously misreported `GETCRTC` during a legitimate empty-buffer modeset
+            // transition.
+            if req.mode_valid != 0 {
+                self.region.crtc_mode_set.store(true, Ordering::Release);
+            } else if req.fb_id == 0 {
+                // A real "disable this CRTC" SETCRTC (no mode, no framebuffer) genuinely clears
+                // the configured mode too -- distinct from an empty-buffer-during-modeset call,
+                // which still carries `mode_valid != 0` and is handled by the branch above.
+                self.region.crtc_mode_set.store(false, Ordering::Release);
+            }
+            self.region.crtc_fb.load(Ordering::Acquire)
         };
-        // Track mode-configured state independent of `fb_id` -- see [`Self::crtc_mode_set`]'s
-        // own doc comment for why conflating the two previously misreported `GETCRTC` during a
-        // legitimate empty-buffer modeset transition.
-        if req.mode_valid != 0 {
-            *self.crtc_mode_set.lock() = true;
-        } else if req.fb_id == 0 {
-            // A real "disable this CRTC" SETCRTC (no mode, no framebuffer) genuinely clears the
-            // configured mode too -- distinct from an empty-buffer-during-modeset call, which
-            // still carries `mode_valid != 0` and is handled by the branch above.
-            *self.crtc_mode_set.lock() = false;
-        }
         // A legacy (non-atomic) client's own repaint loop -- weston's DRM backend with a shadow
         // framebuffer included, confirmed live this session -- commonly re-attaches its updated
         // framebuffer via repeated `SETCRTC` calls rather than `PAGE_FLIP` once initial modesetting
@@ -657,8 +1042,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // its own (litebox-emulated) CRTC state. Fire the identical callback here too, whenever this
         // call actually attaches a real framebuffer (not the `fb_id == 0` detach case, which has
         // nothing to present).
-        if let Some(fb_id) = *self.crtc_fb.lock() {
-            self.notify_flip_callback(platform, fb_id);
+        if attached_fb != 0 {
+            self.notify_flip_callback(platform, local, attached_fb);
         }
         Ok(0)
     }
@@ -676,41 +1061,43 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// registered a single callback would otherwise see every `diag-drm-*` line below silently
     /// vanish, indistinguishable from "no presents happened" (see this fn's own fix history for
     /// the LYING INSTRUMENTS writeup this corrects).
-    fn notify_flip_callback(&self, platform: &Platform, fb_id: u32) {
+    fn notify_flip_callback(&self, platform: &Platform, local: &DrmFlipLocal<Platform>, fb_id: u32) {
         // Unconditional: see this field's own doc comment for why this must not be gated behind
         // `callback_count == 0` the way the rest of this function is.
-        self.frame_seq
-            .fetch_add(1, core::sync::atomic::Ordering::Release);
-        let callback_count = self.flip_callbacks.lock().len();
+        self.region.frame_seq.fetch_add(1, Ordering::Release);
+        let callback_count = local.callbacks.lock().len();
         litebox_util_log::debug!(callback_count:? = callback_count; "drm-diag: notify_flip_callback called");
         if callback_count == 0 && !drm_trace_enabled() {
             return;
         }
         let Some((handle, size, width, height, pitch, pixel_format)) = ({
-            let framebuffers = self.framebuffers.lock();
-            framebuffers.get(&fb_id).and_then(|fb| {
-                let buffers = self.buffers.lock();
-                // `destroy_dumb` deliberately leaves a framebuffer pointing at a destroyed buffer
-                // (real Linux does the same; userspace is expected to RMFB first), so an ordinary
-                // CREATE_DUMB -> ADDFB2 -> DESTROY_DUMB -> PAGE_FLIP/SETCRTC sequence reaches here
-                // with nothing live behind `fb_id`. Real Linux answers ENOENT to such a flip, but
-                // this callback reports nothing to the guest (see its own contract above), so warn
-                // and skip the present rather than kill the session.
-                let Some(buffer) = buffers.get(&fb.handle) else {
+            let _guard = self.region.guard.lock();
+            self.fb_slot(fb_id).and_then(|fb_i| {
+                let fb = &self.region.framebuffers[fb_i];
+                // No `.expect(...)`: a framebuffer whose backing buffer was destroyed dangles in
+                // real Linux too (see `destroy_dumb`'s own doc comment), and a panic here would
+                // take down the whole host process -- which IS the guest session (AGENTS.md).
+                // `destroy_dumb` deliberately leaves such a framebuffer behind, so warn and skip the
+                // present rather than kill the session: this callback reports nothing to the guest.
+                let Some(b_i) = self.buffer_slot(fb.handle.load(Ordering::Acquire)) else {
                     litebox_util_log::warn!(
-                        fb_id:? = fb_id, handle:? = fb.handle;
+                        fb_id:? = fb_id, handle:? = fb.handle.load(Ordering::Acquire);
                         "drm-ioctl: framebuffer references a destroyed dumb buffer, skipping flip"
                     );
                     return None;
                 };
-                Some((
-                    buffer.handle,
-                    buffer.size,
-                    fb.width,
-                    fb.height,
-                    buffer.pitch,
-                    fb.pixel_format,
-                ))
+                let buffer = &self.region.buffers[b_i];
+                buffer.get_handle().map(|handle| {
+                    (
+                        handle,
+                        buffer.size.load(Ordering::Acquire),
+                        fb.width.load(Ordering::Acquire),
+                        fb.height.load(Ordering::Acquire),
+                        buffer.pitch.load(Ordering::Acquire),
+                        fb.pixel_format.load(Ordering::Acquire),
+                    )
+                })
+            })
             })
         }) else {
             return;
@@ -784,7 +1171,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 // Every observer sees the same frame. The SAFETY note below depends on all of
                 // them having returned before the mapping is torn down, which this loop
                 // guarantees exactly as the previous single call did.
-                for callback in self.flip_callbacks.lock().iter() {
+                for callback in local.callbacks.lock().iter() {
                     callback(bytes, width, height, pitch, pixel_format);
                 }
                 // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
@@ -831,10 +1218,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             out.write_at_offset::<Platform>(0, DRM_FORMAT_XRGB8888)
                 .ok_or(Errno::EFAULT)?;
         }
-        let plane_fb = *self.plane_fb.lock();
+        let _guard = self.region.guard.lock();
+        let plane_fb = self.region.plane_fb.load(Ordering::Acquire);
         req.plane_id = VIRTUAL_PLANE_ID;
-        req.crtc_id = plane_fb.map_or(0, |_| VIRTUAL_CRTC_ID);
-        req.fb_id = plane_fb.unwrap_or(0);
+        req.crtc_id = if plane_fb == 0 { 0 } else { VIRTUAL_CRTC_ID };
+        req.fb_id = plane_fb;
         // Bit 0 set = "can be attached to CRTC index 0", the only CRTC this device has.
         req.possible_crtcs = 0b1;
         req.gamma_size = 0;
@@ -852,17 +1240,18 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         // `fb_id == 0` is the real-DRM-defined way to disable a plane (detach whatever
         // framebuffer it currently shows); any other `fb_id` must name a real framebuffer object,
         // same validation `set_crtc` already applies to its own `fb_id` field.
+        let _guard = self.region.guard.lock();
         if req.fb_id == 0 {
-            *self.plane_fb.lock() = None;
+            self.region.plane_fb.store(0, Ordering::Release);
             return Ok(0);
         }
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        if !self.framebuffers.lock().contains_key(&req.fb_id) {
+        if self.fb_slot(req.fb_id).is_none() {
             return Err(Errno::ENOENT);
         }
-        *self.plane_fb.lock() = Some(req.fb_id);
+        self.region.plane_fb.store(req.fb_id, Ordering::Release);
         Ok(0)
     }
 
@@ -975,16 +1364,14 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     // wrapped" case, just a shared interface.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn set_master(&self) -> Result<u32, Errno> {
-        self.is_master
-            .store(true, core::sync::atomic::Ordering::Relaxed);
+        self.region.is_master.store(true, Ordering::Relaxed);
         Ok(0)
     }
 
     /// `DRM_IOCTL_DROP_MASTER`. See [`Self::set_master`]'s doc comment.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn drop_master(&self) -> Result<u32, Errno> {
-        self.is_master
-            .store(false, core::sync::atomic::Ordering::Relaxed);
+        self.region.is_master.store(false, Ordering::Relaxed);
         Ok(0)
     }
 
@@ -1339,19 +1726,32 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         let shared_handle = platform
             .create_shared_memory(page_aligned_size)
             .map_err(|_| Errno::ENOMEM)?;
-        let handle = self.next_buffer_handle.fetch_add(1, Ordering::Relaxed);
-        self.buffers.lock().insert(
-            handle,
-            DumbBuffer {
-                width: req.width,
-                height: req.height,
-                bpp: req.bpp,
-                pitch,
-                size: size_usize,
-                handle: shared_handle,
-                map_offset: None,
-            },
-        );
+        let _guard = self.region.guard.lock();
+        let handle = self.region.next_buffer_handle.fetch_add(1, Ordering::Relaxed);
+        let owner = platform.current_host_pid();
+        // Table full (after dead-owner reclaim): real DRM answers a GEM object it cannot allocate
+        // with ENOMEM, and so does this. Never a panic.
+        let Some(i) = self.claim_buffer(platform) else {
+            drop(_guard);
+            let _ = platform.close_shared_memory(shared_handle);
+            litebox_util_log::error!(
+                capacity:% = SHARED_DRM_BUFFERS, cross_process:% = self.is_shared();
+                "drm-ioctl: CREATE_DUMB refused -- shared drm buffer table full"
+            );
+            return Err(Errno::ENOMEM);
+        };
+        let slot = &self.region.buffers[i];
+        slot.gem_handle.store(handle, Ordering::Release);
+        slot.width.store(req.width, Ordering::Release);
+        slot.height.store(req.height, Ordering::Release);
+        slot.bpp.store(req.bpp, Ordering::Release);
+        slot.pitch.store(pitch, Ordering::Release);
+        slot.size.store(size_usize, Ordering::Release);
+        slot.set_handle(Some(shared_handle));
+        slot.map_offset.store(0, Ordering::Release);
+        slot.owner_host.store(owner, Ordering::Release);
+        slot.state.store(DRM_SLOT_USED, Ordering::Release);
+        drop(_guard);
         req.handle = handle;
         req.pitch = pitch;
         req.size = size;
@@ -1362,16 +1762,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
 
     pub(crate) fn map_dumb(&self, ptr: UserPtrMut<DrmModeMapDumb>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        let mut buffers = self.buffers.lock();
-        let buffer = buffers.get_mut(&req.handle).ok_or(Errno::ENOENT)?;
-        let offset = *buffer.map_offset.get_or_insert_with(|| {
-            // Real DRM fake offsets are page-aligned, opaque `mmap()` targets in a reserved
-            // range distinct from any real memory address. `<< 12` (page-align) keeps this
-            // device's offsets shaped the same way without claiming to match the kernel's exact
-            // internal allocation scheme (which is driver-private and not part of the UAPI
-            // contract clients rely on).
-            u64::from(self.next_map_offset.fetch_add(1, Ordering::Relaxed)) << 12
-        });
+        let offset = self.map_offset_for(req.handle).ok_or(Errno::ENOENT)?;
         req.offset = offset;
         ptr.write_at_offset::<Platform>(0, req)
             .ok_or(Errno::EFAULT)?;
@@ -1379,7 +1770,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     }
 
     /// `DRM_IOCTL_PRIME_HANDLE_TO_FD` support: validate `handle` names a live dumb buffer and
-    /// return its fake `mmap` offset (allocating one via the same lazy `get_or_insert_with` path
+    /// return its fake `mmap` offset (allocating one via the same lazy path
     /// [`Self::map_dumb`] uses, if this buffer has never been `MAP_DUMB`'d before -- a real
     /// client always maps a dumb buffer before/around exporting it, but nothing in the UAPI
     /// actually requires that ordering, so this covers the export-first case too). The caller
@@ -1388,12 +1779,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// back onto this SAME buffer's real shared-memory handle -- see that function's own doc
     /// comment for the tag-then-resolve mechanism.
     pub(crate) fn prime_export_offset(&self, handle: u32) -> Result<u64, Errno> {
-        let mut buffers = self.buffers.lock();
-        let buffer = buffers.get_mut(&handle).ok_or(Errno::ENOENT)?;
-        let offset = *buffer.map_offset.get_or_insert_with(|| {
-            u64::from(self.next_map_offset.fetch_add(1, Ordering::Relaxed)) << 12
-        });
-        Ok(offset)
+        self.map_offset_for(handle).ok_or(Errno::ENOENT)
     }
 
     pub(crate) fn destroy_dumb(
@@ -1402,16 +1788,25 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         ptr: UserPtr<DrmModeDestroyDumb>,
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        let mut buffers = self.buffers.lock();
-        let Some(buffer) = buffers.remove(&req.handle) else {
+        let _guard = self.region.guard.lock();
+        let Some(i) = self.buffer_slot(req.handle) else {
             return Err(Errno::ENOENT);
         };
-        drop(buffers);
+        let slot = &self.region.buffers[i];
+        let taken = slot.get_handle();
+        slot.state.store(DRM_SLOT_FREE, Ordering::Release);
+        slot.set_handle(None);
+        slot.map_offset.store(0, Ordering::Release);
+        slot.owner_host.store(0, Ordering::Release);
+        drop(_guard);
+        let Some(buffer) = taken else {
+            return Err(Errno::ENOENT);
+        };
         // Best-effort: `close_shared_memory` is refcounted (see its own doc comment) and the
         // buffer's storage is real host memory that must eventually be released, but a real
         // Linux `DRM_IOCTL_MODE_DESTROY_DUMB` itself has no failure mode userspace can act on
         // either -- match that by not surfacing a platform-level close failure as an ioctl error.
-        let _ = platform.close_shared_memory(buffer.handle);
+        let _ = platform.close_shared_memory(buffer);
         // A destroyed buffer's framebuffers become dangling references in real Linux too (the
         // kernel does not auto-remove a framebuffer when its backing buffer is destroyed;
         // userspace is responsible for removing the framebuffer first via
@@ -1430,7 +1825,11 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// Before this handler existed, that ioctl fell through to the generic unmatched-ioctl case
     /// and returned `EINVAL` with no framebuffer created, which is exactly the `failed to add fb
     /// -22` / `(EE) modeset(0): failed to set mode: Invalid argument` failure this fixes.
-    pub(crate) fn add_fb(&self, ptr: UserPtrMut<DrmModeFbCmd>) -> Result<u32, Errno> {
+    pub(crate) fn add_fb(
+        &self,
+        platform: &Platform,
+        ptr: UserPtrMut<DrmModeFbCmd>,
+    ) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         // This device's dumb buffers are always 32bpp/depth-24 `XRGB8888` (see `create_dumb`'s
         // own `bpp == 32` case and `DRM_FORMAT_XRGB8888`'s doc comment) -- the legacy ADDFB
@@ -1442,31 +1841,47 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::EINVAL);
         }
         let handle = req.handle;
-        if !self.buffers.lock().contains_key(&handle) {
-            return Err(Errno::ENOENT);
+        {
+            let _guard = self.region.guard.lock();
+            if self.buffer_slot(handle).is_none() {
+                return Err(Errno::ENOENT);
+            }
         }
         litebox_util_log::warn!(
             width:? = req.width, height:? = req.height, pitch:? = req.pitch,
             bpp:? = req.bpp, depth:? = req.depth, handle:? = handle;
             "drm-ioctl: ADDFB (v1) request"
         );
-        let fb_id = self.next_fb_id.fetch_add(1, Ordering::Relaxed);
-        self.framebuffers.lock().insert(
-            fb_id,
-            Framebuffer {
-                width: req.width,
-                height: req.height,
-                pixel_format: DRM_FORMAT_XRGB8888,
-                handle,
-            },
-        );
+        let _guard = self.region.guard.lock();
+        let fb_id = self.region.next_fb_id.fetch_add(1, Ordering::Relaxed);
+        let owner = platform.current_host_pid();
+        let Some(i) = self.claim_fb(platform) else {
+            litebox_util_log::error!(
+                capacity:% = SHARED_DRM_FRAMEBUFFERS, cross_process:% = self.is_shared();
+                "drm-ioctl: ADDFB (v1) refused -- shared drm framebuffer table full"
+            );
+            return Err(Errno::ENOMEM);
+        };
+        let slot = &self.region.framebuffers[i];
+        slot.fb_id.store(fb_id, Ordering::Release);
+        slot.width.store(req.width, Ordering::Release);
+        slot.height.store(req.height, Ordering::Release);
+        slot.pixel_format.store(DRM_FORMAT_XRGB8888, Ordering::Release);
+        slot.handle.store(handle, Ordering::Release);
+        slot.owner_host.store(owner, Ordering::Release);
+        slot.state.store(DRM_SLOT_USED, Ordering::Release);
+        drop(_guard);
         req.fb_id = fb_id;
         ptr.write_at_offset::<Platform>(0, req)
             .ok_or(Errno::EFAULT)?;
         Ok(0)
     }
 
-    pub(crate) fn add_fb2(&self, ptr: UserPtrMut<DrmModeFbCmd2>) -> Result<u32, Errno> {
+    pub(crate) fn add_fb2(
+        &self,
+        platform: &Platform,
+        ptr: UserPtrMut<DrmModeFbCmd2>,
+    ) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.handles[1] != 0 || req.handles[2] != 0 || req.handles[3] != 0 {
             // A dumb buffer is always single-plane; a multi-plane request names a real
@@ -1474,24 +1889,36 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             return Err(Errno::EINVAL);
         }
         let handle = req.handles[0];
-        if !self.buffers.lock().contains_key(&handle) {
-            return Err(Errno::ENOENT);
+        {
+            let _guard = self.region.guard.lock();
+            if self.buffer_slot(handle).is_none() {
+                return Err(Errno::ENOENT);
+            }
         }
         litebox_util_log::warn!(
             width:? = req.width, height:? = req.height, pixel_format:? = req.pixel_format,
             handle:? = handle;
             "drm-ioctl: ADDFB2 request"
         );
-        let fb_id = self.next_fb_id.fetch_add(1, Ordering::Relaxed);
-        self.framebuffers.lock().insert(
-            fb_id,
-            Framebuffer {
-                width: req.width,
-                height: req.height,
-                pixel_format: req.pixel_format,
-                handle,
-            },
-        );
+        let _guard = self.region.guard.lock();
+        let fb_id = self.region.next_fb_id.fetch_add(1, Ordering::Relaxed);
+        let owner = platform.current_host_pid();
+        let Some(i) = self.claim_fb(platform) else {
+            litebox_util_log::error!(
+                capacity:% = SHARED_DRM_FRAMEBUFFERS, cross_process:% = self.is_shared();
+                "drm-ioctl: ADDFB2 refused -- shared drm framebuffer table full"
+            );
+            return Err(Errno::ENOMEM);
+        };
+        let slot = &self.region.framebuffers[i];
+        slot.fb_id.store(fb_id, Ordering::Release);
+        slot.width.store(req.width, Ordering::Release);
+        slot.height.store(req.height, Ordering::Release);
+        slot.pixel_format.store(req.pixel_format, Ordering::Release);
+        slot.handle.store(handle, Ordering::Release);
+        slot.owner_host.store(owner, Ordering::Release);
+        slot.state.store(DRM_SLOT_USED, Ordering::Release);
+        drop(_guard);
         req.fb_id = fb_id;
         ptr.write_at_offset::<Platform>(0, req)
             .ok_or(Errno::EFAULT)?;
@@ -1513,7 +1940,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     ///
     /// # Why it is smaller than `page_flip`
     ///
-    /// `page_flip` must retarget the CRTC (`*self.crtc_fb.lock() = Some(req.fb_id)`) because the
+    /// `page_flip` must retarget the CRTC (`crtc_fb.store(req.fb_id)`) because the
     /// scanout framebuffer is CHANGING. A damage flush does not change it -- `fb_id` is already
     /// the current scanout -- so this only has to notify the presenter. Deliberately does NOT
     /// touch `crtc_fb`: doing so on a stale or unrelated `fb_id` would silently repoint the
@@ -1529,6 +1956,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     pub(crate) fn dirty_fb(
         &self,
         platform: &Platform,
+        local: &DrmFlipLocal<Platform>,
         ptr: UserPtr<DrmModeFbDirtyCmd>,
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
@@ -1540,19 +1968,23 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             fb_id:% = req.fb_id, num_clips:% = req.num_clips;
             "DIAG_DIRTYFB"
         );
-        if !self.framebuffers.lock().contains_key(&req.fb_id) {
-            return Err(Errno::ENOENT);
+        {
+            let _guard = self.region.guard.lock();
+            if self.fb_slot(req.fb_id).is_none() {
+                return Err(Errno::ENOENT);
+            }
         }
         if !dirty_fb_enabled() {
             return Ok(0);
         }
-        self.notify_flip_callback(platform, req.fb_id);
+        self.notify_flip_callback(platform, local, req.fb_id);
         Ok(0)
     }
 
     pub(crate) fn page_flip(
         &self,
         platform: &Platform,
+        local: &DrmFlipLocal<Platform>,
         boot_time: &<Platform as litebox::platform::TimeProvider>::Instant,
         ptr: UserPtr<DrmModeCrtcPageFlip>,
     ) -> Result<u32, Errno> {
@@ -1561,10 +1993,13 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         if req.crtc_id != VIRTUAL_CRTC_ID {
             return Err(Errno::ENOENT);
         }
-        if !self.framebuffers.lock().contains_key(&req.fb_id) {
-            return Err(Errno::ENOENT);
+        {
+            let _guard = self.region.guard.lock();
+            if self.fb_slot(req.fb_id).is_none() {
+                return Err(Errno::ENOENT);
+            }
+            self.region.crtc_fb.store(req.fb_id, Ordering::Release);
         }
-        *self.crtc_fb.lock() = Some(req.fb_id);
         // Log WHICH framebuffer is being scanned out. A screen that goes black while
         // flips continue is either the same fb losing its contents (a mapping or
         // coherency problem) or a different fb being scanned out than the one being
@@ -1576,13 +2011,16 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 "diag-drm-flip"
             );
         }
-        self.notify_flip_callback(platform, req.fb_id);
+        self.notify_flip_callback(platform, local, req.fb_id);
         // This device has no real vsync/vblank interrupt to wait for, so the flip is complete
         // (in the sense a client cares about -- the CRTC now scans out the new framebuffer) the
         // instant this ioctl returns; if the guest asked to be told, queue the completion event
         // immediately rather than modeling any real timing delay.
         if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
-            let sequence = self.next_vblank_sequence.fetch_add(1, Ordering::Relaxed);
+            let sequence = self
+                .region
+                .next_vblank_sequence
+                .fetch_add(1, Ordering::Relaxed);
             // Report the CURRENT guest-monotonic time (the same clock domain `CLOCK_MONOTONIC`
             // reads via `gettime_as_duration`, i.e. `platform.now().duration_since(boot_time)`),
             // not a fixed `0`/1970 epoch. Confirmed live via a full XFCE repro trace
@@ -1606,7 +2044,7 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
             )]
             let tv_sec = elapsed.as_secs() as u32;
             let tv_usec = elapsed.subsec_micros();
-            self.pending_flip_events.lock().push_back(DrmEventVblank {
+            let event = DrmEventVblank {
                 base: DrmEvent {
                     r#type: DRM_EVENT_FLIP_COMPLETE,
                     length: size_of::<DrmEventVblank>() as u32,
@@ -1616,8 +2054,12 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
                 tv_usec,
                 sequence,
                 crtc_id: VIRTUAL_CRTC_ID,
-            });
-            self.flip_pollee.notify_observers(Events::IN);
+            };
+            {
+                let _guard = self.region.guard.lock();
+                self.flip_push(&event);
+            }
+            local.pollee.notify_observers(Events::IN);
         }
         Ok(0)
     }
@@ -1631,11 +2073,10 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
         &self,
         offset: u64,
     ) -> Option<(Platform::SharedMemoryHandle, usize)> {
-        self.buffers
-            .lock()
-            .values()
-            .find(|b| b.map_offset == Some(offset))
-            .map(|b| (b.handle, b.size))
+        let _guard = self.region.guard.lock();
+        let i = self.buffer_slot_by_map_offset(offset)?;
+        let slot = &self.region.buffers[i];
+        Some((slot.get_handle()?, slot.size.load(Ordering::Acquire)))
     }
 
     /// `DRM_IOCTL_PRIME_FD_TO_HANDLE` support: given a real Linux dma-buf fd, real Linux resolves
@@ -1651,18 +2092,16 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// dumb-buffer handle the export started from -- correct for a self-import, since there is
     /// only ever one buffer object involved, not a fresh second one.
     pub(crate) fn lookup_handle_by_map_offset(&self, offset: u64) -> Option<u32> {
-        self.buffers
-            .lock()
-            .iter()
-            .find(|(_, b)| b.map_offset == Some(offset))
-            .map(|(handle, _)| *handle)
+        let _guard = self.region.guard.lock();
+        let i = self.buffer_slot_by_map_offset(offset)?;
+        Some(self.region.buffers[i].gem_handle.load(Ordering::Acquire))
     }
 
     /// `DRM_IOCTL_GEM_CLOSE` -- release the CALLER's local reference to a GEM handle. On real
     /// Linux this decrements a per-open-file GEM handle refcount, only actually freeing the
     /// underlying object once every fd-local reference AND every driver-internal reference
     /// (framebuffer attachment, active scanout, ...) drops to zero. This device tracks exactly
-    /// one refcount-free handle table (`self.buffers`, indexed by the same handle
+    /// one refcount-free handle table (`SharedDrmRegion::buffers`, indexed by the same handle
     /// `CREATE_DUMB`/`PRIME_FD_TO_HANDLE` hand out) with a single, explicit teardown entry point
     /// (`DRM_IOCTL_MODE_DESTROY_DUMB`, see [`Self::destroy_dumb`]) -- real refcounting has nothing
     /// to model here since there is exactly one client and one reference per handle ever created.
@@ -1672,7 +2111,8 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     /// caller's observable perspective (the object doesn't disappear underneath a sibling
     /// reference either). An unknown handle still gets a real `ENOENT`, not a fabricated success.
     pub(crate) fn gem_close(&self, handle: u32) -> Result<u32, Errno> {
-        if self.buffers.lock().contains_key(&handle) {
+        let _guard = self.region.guard.lock();
+        if self.buffer_slot(handle).is_some() {
             Ok(0)
         } else {
             Err(Errno::ENOENT)
@@ -1680,12 +2120,38 @@ impl<Platform: ShimPlatform> DrmSubsystem<Platform> {
     }
 }
 
-/// Suppress an unused-field warning for state genuinely written but not yet read anywhere (the
-/// framebuffer format, tracked correctly now so the follow-up wgpu-presentation work has real
-/// data to read from, but not consumed by anything in this pass).
-#[allow(dead_code)]
-impl Framebuffer {
-    fn info(&self) -> (u32, u32, u32, u32) {
-        (self.width, self.height, self.pixel_format, self.handle)
+impl<Platform: ShimPlatform> DrmFlipLocal<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            callbacks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    /// Append a host-side frame observer -- see [`Self::callbacks`]'s doc comment for when/why a
+    /// runner calls this, and why it takes plain pixel bytes rather than the platform-specific
+    /// shared-memory handle. Not part of [`crate::LinuxShimBuilder::build`] itself since
+    /// `litebox_shim_linux` has no presentation layer of its own to default to; a runner that
+    /// wants flipped frames actually displayed calls this once, right after the shim is built,
+    /// with a closure that forwards the bytes to its own window/GPU-surface presentation code.
+    /// Observers are ADDITIVE: calling this twice installs two, both invoked per flip in
+    /// registration order. It does not replace a previously-installed one.
+    pub fn add_flip_callback(
+        &self,
+        callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
+    ) {
+        self.callbacks
+            .lock()
+            .push(alloc::boxed::Box::new(callback) as DrmFlipCallback);
+    }
+
+    /// Register an observer for DRM fd readiness -- see [`Self::pollee`]'s doc comment. Called
+    /// from `syscalls::epoll::EpollDescriptor::poll`'s `File` arm's `DriFd` branch, exactly where
+    /// every other pollable fd kind (e.g. eventfd) registers its own observer.
+    pub(crate) fn register_flip_observer(
+        &self,
+        observer: alloc::sync::Weak<dyn litebox::event::observer::Observer<Events>>,
+    ) {
+        self.pollee.register_observer(observer, Events::IN);
     }
 }

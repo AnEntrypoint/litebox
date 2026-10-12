@@ -4445,7 +4445,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // events (`struct drm_event`-prefixed), never raw pixel bytes -- the
                     // filesystem backend's own `read` (`litebox::fs::devices::DriDevices`)
                     // deliberately rejects every read outright, since it has no reach into
-                    // `DrmSubsystem`'s event queue (a higher-crate-layer state, `litebox` cannot
+                    // `SharedDrmTable`'s event queue (a higher-crate-layer state, `litebox` cannot
                     // depend on `litebox_shim_linux`). Intercept here instead, the same layer
                     // that already special-cases DRI-fd `ioctl`/`mmap`.
                     // One stat answers both device questions (see `classify_device_fd`);
@@ -4455,7 +4455,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let Some(event_bytes) = self.global.drm.pop_flip_event_bytes() else {
                             // Real Linux blocks here until an event arrives; this device
                             // completes every flip synchronously inside the PAGE_FLIP ioctl
-                            // itself (see `DrmSubsystem::page_flip`'s doc comment), so by the
+                            // itself (see `SharedDrmTable::page_flip`'s doc comment), so by the
                             // time a client reads for a flip it requested, the event is already
                             // queued -- an empty queue here means no flip was ever requested with
                             // `DRM_MODE_PAGE_FLIP_EVENT`, which is a genuine client bug (blocking
@@ -4472,13 +4472,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // An evdev device fd's `read()` delivers queued `struct input_event`
                     // records, handled the same way as the DRI-fd branch immediately above --
                     // `litebox::fs::devices::InputDevices`'s own `read` deliberately rejects
-                    // every read outright (it has no reach into `EvdevSubsystem`'s event queue,
+                    // every read outright (it has no reach into `SharedEvdevTable`'s event queue,
                     // a higher-crate-layer state `litebox` cannot depend on), so intercept here.
                     if is_input {
                         let Some(event_bytes) = self.global.evdev.pop_event_bytes() else {
                             // Real Linux blocks a blocking-mode `read()` here until an event
                             // arrives; this shim has no real blocking-wait wired for evdev yet
-                            // (see `EvdevSubsystem`'s own doc comment's "what this pass does not
+                            // (see `SharedEvdevTable`'s own doc comment's "what this pass does not
                             // implement" list), so a genuinely empty queue reports `EAGAIN`
                             // regardless of the fd's blocking mode -- a client polling in a loop
                             // (the common shape for a GUI toolkit's input thread) works
@@ -5205,7 +5205,7 @@ fn stdio_stream_for_path(path: &CString) -> Option<StdioStream> {
 /// `global`+the fd handle alone (no `FS`/`FilesState` reachable at that call site), the exact same
 /// structural gap `StdioStream` metadata already works around for `/dev/stdin`'s genuinely
 /// non-blocking-vs-not readiness -- an evdev fd needs the identical treatment so a guest's
-/// `select()`/`poll()` loop can observe `EvdevSubsystem::has_pending()` becoming true, rather than
+/// `select()`/`poll()` loop can observe `SharedEvdevTable::has_pending()` becoming true, rather than
 /// falling into that `File` arm's untagged-fd default (`Events::OUT`, permanently "not readable").
 #[derive(Clone, Copy)]
 pub(crate) struct EvdevFd;
@@ -5213,7 +5213,7 @@ pub(crate) struct EvdevFd;
 /// Marker metadata tagged onto a `/dev/dri/card0` fd at `open()` time -- mirrors [`EvdevFd`]'s
 /// identical role and identical reason for existing: a plain filesystem-backed fd's
 /// `poll`/`select`/`epoll_wait` readiness (`syscalls::epoll::EpollDescriptor::poll`'s `File` arm)
-/// is computed from `global`+the fd handle alone, with no reach into `DrmSubsystem`'s own
+/// is computed from `global`+the fd handle alone, with no reach into `SharedDrmTable`'s own
 /// `pending_flip_events` queue without this tag identifying which fd to check.
 #[derive(Clone, Copy)]
 pub(crate) struct DriFd;
@@ -8245,7 +8245,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// in-mem files are plain guest-heap bytes, not real OS shared memory, so `MAP_SHARED|
     /// PROT_WRITE` needs a separate real `PageManagementProvider::create_shared_memory` object --
     /// see `syscalls::mm::MemfdRegistry`/`try_memfd_mmap`, the same two-tier shape
-    /// `DrmSubsystem`'s dumb buffers already established). A fresh memfd is 0 bytes, matching
+    /// `SharedDrmTable`'s dumb buffers already established). A fresh memfd is 0 bytes, matching
     /// real Linux (nothing is mmapped until the client calls `ftruncate`); `sys_ftruncate`
     /// creates/resizes the real handle lazily on first (or later) growth.
     pub fn sys_memfd_create(&self, flags: MfdFlags) -> Result<u32, Errno> {
@@ -9210,7 +9210,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_fd| Err(Errno::ENOTTY),
                 )??;
                 // The device only ever emits `EV_KEY`/`EV_REL` events (see
-                // `EvdevSubsystem::push_key`/`push_rel`) -- report exactly that supported-types
+                // `SharedEvdevTable::push_key`/`push_rel`) -- report exactly that supported-types
                 // set for `ev == 0`, the real code ranges for `EV_KEY`/`EV_REL` themselves
                 // (matching what `push_key`/`push_rel` actually accept), and an all-zero
                 // bitmask for every other event type: a real, correct "device supports none of
@@ -9447,7 +9447,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Dispatch a `DRM_IOCTL_MODE_*` request (already confirmed to target a real DRI device fd
-    /// by the caller) to the shim-wide [`crate::syscalls::drm::DrmSubsystem`].
+    /// by the caller) to the shim-wide [`crate::syscalls::drm::SharedDrmTable`].
     fn drm_ioctl(&self, arg: &IoctlArg) -> Result<u32, Errno> {
         // Every DRM ioctl funnels through here, so this one line makes the whole
         // guest<->KMS conversation visible. Gated behind `LITEBOX_DRM_TRACE=1` so it
@@ -9460,7 +9460,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
-            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(self.global.platform, *ptr),
+            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(
+                self.global.platform,
+                &self.global.drm_flip_local,
+                *ptr,
+            ),
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
             IoctlArg::DrmModeCreateDumb(ptr) => {
@@ -9470,14 +9474,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             IoctlArg::DrmModeDestroyDumb(ptr) => {
                 self.global.drm.destroy_dumb(self.global.platform, *ptr)
             }
-            IoctlArg::DrmModeAddFb(ptr) => self.global.drm.add_fb(*ptr),
-            IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(*ptr),
+            IoctlArg::DrmModeAddFb(ptr) => self.global.drm.add_fb(self.global.platform, *ptr),
+            IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(self.global.platform, *ptr),
             IoctlArg::DrmModePageFlip(ptr) => {
-                self.global
-                    .drm
-                    .page_flip(self.global.platform, &self.global.boot_time, *ptr)
+                self.global.drm.page_flip(
+                    self.global.platform,
+                    &self.global.drm_flip_local,
+                    &self.global.boot_time,
+                    *ptr,
+                )
             }
-            IoctlArg::DrmModeDirtyFb(ptr) => self.global.drm.dirty_fb(self.global.platform, *ptr),
+            IoctlArg::DrmModeDirtyFb(ptr) => self.global.drm.dirty_fb(
+                self.global.platform,
+                &self.global.drm_flip_local,
+                *ptr,
+            ),
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
