@@ -126,3 +126,12 @@ Candidate refuted (2026-10-12): `--disable-features=VizDisplayCompositor`, plain
 The desktop paints (203 colours) and chromium's window stays uniform grey (`cececeff`, 9 captures). The
 compositor-selection flag does not change the paint result. (A first run at a 60 s hold showed no desktop
 yet, so only the 150 s run is the valid comparison.)
+
+## PAINT ACHIEVED in the webtop, multi-process, no --no-sandbox (2026-10-12)
+
+Flags: `--disable-gpu --in-process-gpu` (no `--single-process`, no `--no-sandbox`). The renderer is a
+separate chromium process; the GPU process is folded into the browser.
+- Run `ingpu` (10 captures): chromium window painted, page yellow `ffd400` (BGRA `00d4ff`), 633-884 colours.
+- Run `ig3` (9 captures): same, 632-773 colours, stable. Evidence: `docs/evidence/webtop-chromium-paint-in-process-gpu.png`.
+- Run `ingpu2`: stalled after one capture in the guest (a reliability problem, not a paint failure).
+- Process count is NOT a discriminator: the single-process run also reached 27-33 live runner processes.
