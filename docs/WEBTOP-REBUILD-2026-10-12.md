@@ -83,3 +83,9 @@ shared bitmap, under `map_shared_memory` (`litebox_platform_linux_userland/src/l
 
 Verbose chromium logging (`--v=1`) makes the guest too slow to finish: do not use it for runs that must
 complete; use `--vmodule` only.
+
+Band structure (token path ON, mid-band row y=559 of the 1024x744 chromium window): colour changes EVERY
+pixel, repeating every 4 px with a 2:1:1 mix (512 px `ff7f0000`, 256 px `30403fff`, 256 px `b04c3fff`).
+That is a stride or pixel-format mismatch between the producer and the reader of the same bitmap, not
+random aliasing. Next: find where the viz-side reader takes its row stride/format for a shared software
+bitmap, and check it against the producer's size under the pool-token mapping.
