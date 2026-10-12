@@ -2574,7 +2574,7 @@ where
             // checked against -- but the TYPE check is not optional: a slot reused by a UDP socket
             // answers `socket_set_contains` and would then panic inside smoltcp's `get`. Skipped
             // here means "not in `Listen`", which is a slot the refill below re-arms anyway.
-            let Some(socket) = try_get_socket::<tcp::Socket>(
+            let socket = try_get_socket::<tcp::Socket>(
                 socket_set,
                 *handle,
                 None,
@@ -3216,9 +3216,7 @@ where
                         stamped: socket_handle.slot_gen,
                     }),
                     "fork_carry_spec:tcp",
-                ) else {
-                    return None;
-                };
+                )?;
                 // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
                 // so there is nothing a child could match it on -- and nothing to share yet either.
                 let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
@@ -3231,7 +3229,7 @@ where
                 ))
             }
             Protocol::Udp => {
-                let Some(socket) = try_get_socket::<udp::Socket>(
+                let socket = try_get_socket::<udp::Socket>(
                     &self.socket_set,
                     socket_handle.handle,
                     Some(SlotIdentity {
@@ -3239,9 +3237,7 @@ where
                         stamped: socket_handle.slot_gen,
                     }),
                     "fork_carry_spec:udp",
-                ) else {
-                    return None;
-                };
+                )?;
                 let endpoint = socket.endpoint();
                 let remote = socket_handle.udp().remote_endpoint;
                 if endpoint.port == 0 && remote.is_none() {
@@ -4205,7 +4201,7 @@ where
                 }),
                 "get_remote_addr:tcp",
             )
-            .and_then(|socket| socket.remote_endpoint())
+            .and_then(tcp::Socket::remote_endpoint)
             .ok_or(RemoteAddrError::NotConnected)?,
             Protocol::Udp => socket_handle
                 .udp()
