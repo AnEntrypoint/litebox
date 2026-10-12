@@ -63,3 +63,23 @@ Variants at rung 4 (all: window mapped, never drawn):
 - The paint question is now a renderer-to-viz frame problem: the window is mapped, the compositor has
   nothing to show. Next: whether the renderer commits frames at all (Mojo/BeginFrame, timerfd firing in
   the renderer and GPU-less viz), not the X server.
+
+## Paint discriminators (2026-10-12, later runs)
+
+Single-process `--single-process --disable-gpu` in this webtop **PAINTS**: chromium window 910-1113 colours,
+BGRA `00d4ff` = RGB `ffd400` = the page's yellow. Multi-process with the same flags does not.
+So the blocker is the cross-process path (renderer -> viz), not the X11 presentation.
+
+A/B of the memfd switch (`LITEBOX_MEMFD_TOKEN_OFF`), multi-process, `--disable-gpu`, compositor vmodules:
+- token path ON (default, `bef9d55a`): chromium window shows a **striped blue band** (vertical stripes,
+  two colours, rows ~216 of 744), not the page. Rendered to PNG and inspected: real pixels reach the
+  compositor, but the content is wrong. Not blank.
+- token path OFF (`LITEBOX_MEMFD_TOKEN_OFF=1`): chromium window **blank grey** (`cececeff`, no stripes).
+
+Reading: the token path makes frames cross processes (something is painted), but the bytes the viz
+side reads are not the bytes the renderer wrote. Candidate: pool-offset mapping or stride/format in the
+shared bitmap, under `map_shared_memory` (`litebox_platform_linux_userland/src/lib.rs` ~3125-3145) and
+`try_memfd_mmap` (`litebox_shim_linux/src/syscalls/mm.rs:1260`). Not yet diagnosed.
+
+Verbose chromium logging (`--v=1`) makes the guest too slow to finish: do not use it for runs that must
+complete; use `--vmodule` only.
