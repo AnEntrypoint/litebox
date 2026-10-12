@@ -143,3 +143,9 @@ Stall tally (`--disable-gpu --in-process-gpu`, full 150 s hold): 7 of 9 full run
 (`ingpu`, `ig3`, `ig5`, `st1`-`st4`). The 2 stalls (`ingpu2`, `ig4`) stopped in the guest before any capture.
 The four `st*` runs had `LITEBOX_DIAG_STUCK_SECS=45` and produced no stuck-thread records, so the stall
 trigger is still unidentified. Reliability is 7/9, not yet "perfect".
+
+Reliability tally, `--disable-gpu --in-process-gpu`, full runs (2026-10-12): 13 painted and completed of 19.
+Failures (6): 4 guest stalls before the first capture (`ingpu2`, `ig4`, `sa3`, `sa4`; no stuck-thread record
+with `LITEBOX_DIAG_STUCK_SECS=45`) and 2 completed runs where the XFCE desktop never came up (`sa2`, `sa5`:
+root stays the bare weave, chromium window 0 bytes). The session-log dump was added to `wt.sh`; the four
+`lg*` runs all painted, so no failure was captured with its logs yet.
