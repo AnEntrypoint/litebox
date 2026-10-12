@@ -314,6 +314,11 @@ pub(crate) struct VehGates {
     /// i.e. restore the behaviour before the cross-process-fork fix. That is the OFF switch for
     /// the fix, not a diagnostic -- see `fork_verify::begin`.
     pub(crate) forkverify_identity: bool,
+    /// `LITEBOX_FORKVERIFY_XMM_OFF`: do not heal stale pointers held in the 64-bit lanes of an
+    /// `xmm` register about to be stored to memory by an SSE store
+    /// (`fork_verify::translate_stale_xmm_store_lanes`). That is the OFF switch for the fix, not a
+    /// diagnostic.
+    pub(crate) forkverify_xmm_off: bool,
     /// `LITEBOX_DIAG_GS_BASE_REPAIR`
     pub(crate) gs_base_repair: bool,
     /// `LITEBOX_DIAG_FS_BASE_REPAIR` (94th pass, mirrors `gs_base_repair` above): logs every time
@@ -347,6 +352,7 @@ impl VehGates {
                 .filter(|&a| a != 0),
             forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
             forkverify_identity: std::env::var_os("LITEBOX_FORKVERIFY_IDENTITY").is_some(),
+            forkverify_xmm_off: std::env::var_os("LITEBOX_FORKVERIFY_XMM_OFF").is_some(),
             gs_base_repair: std::env::var_os("LITEBOX_DIAG_GS_BASE_REPAIR").is_some(),
             fs_base_repair: std::env::var_os("LITEBOX_DIAG_FS_BASE_REPAIR").is_some(),
         }
@@ -15688,9 +15694,7 @@ mod tests {
 
     #[test]
     fn test_raw_mutex() {
-        let mutex = std::sync::Arc::new(super::RawMutex {
-            inner: AtomicU32::new(0),
-        });
+        let mutex = std::sync::Arc::new(super::RawMutex::new());
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {
