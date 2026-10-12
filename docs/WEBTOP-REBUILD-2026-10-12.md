@@ -95,3 +95,7 @@ Big-message check (`LITEBOX_DIAG_BIGMSG=1`, diagnostic in `unix.rs` write path):
 (no `EMSGSIZE` refusals, no partial writes). So the ring is not in the paint path. Plain-flag multi-process:
 desktop paints (201 colours), chromium window stays uniform grey. The striped band appeared only with
 `--vmodule` logging, so it is timing-dependent, not a deterministic stride bug.
+
+Syscall summary (`LITEBOX_STRACE_SUMMARY=1`, plain multi-process): the table reports only the guest
+shell (`comm=sh`), not chromium's processes, so it cannot show the browser main-thread poll loop. Per-process
+summaries are needed before the busy-loop can be attributed. No `epoll_wait`/`ppoll` appears in this table.
