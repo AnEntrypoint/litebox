@@ -103,3 +103,9 @@ summaries are needed before the busy-loop can be attributed. No `epoll_wait`/`pp
 ppoll spin (`LITEBOX_SPIN_STACK=271`, every 8192nd ppoll): multi-process 13 entries, single-process
 (which paints) 12 entries. The hot ppoll loop is present in both, so it is NOT the paint blocker. It is a
 separate defect; the multi-process renderer's missing frames are a different problem.
+
+IO-thread timeline (`LITEBOX_DIAG_SYSCALL_TIMELINE=Chrome_ChildIOT`, plain multi-process, 170 s):
+four processes' IO threads (pids 1443, 1825, 1850, 1867). Of 4,170 `epoll_pwait` exits, 2,930 returned
+0 events; timeouts are either 0 (bursts) or about 170 s (idle). `sendto` returned EAGAIN 118 times of 2,146
+(not a send-retry spin). The zero-timeout bursts show work pending without a ready fd, so the spin is
+a task-reposting loop. The attribution to a task source needs chromium's own task traces, not yet done.
