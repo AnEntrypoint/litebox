@@ -2927,6 +2927,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         new_range: core::ops::Range<usize>,
         _permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+        // The range comes from the guest's `mremap`, so a kernel refusal is an errno for the
+        // guest, not a host panic (the host process is the whole session).
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
@@ -2936,8 +2938,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 MRemapFlags::MREMAP_MAYMOVE.bits() as usize,
                 new_range.start,
             )
-            .expect("mremap failed")
-        };
+        }
+        .map_err(|err| match err {
+            syscalls::Errno::ENOMEM => litebox::platform::page_mgmt::RemapError::OutOfMemory,
+            syscalls::Errno::EFAULT => litebox::platform::page_mgmt::RemapError::AlreadyUnallocated,
+            // EINVAL and any other refusal of the arguments.
+            _ => litebox::platform::page_mgmt::RemapError::Unaligned,
+        })?;
         Ok(UserMutPtr::from_usize(res))
     }
 
