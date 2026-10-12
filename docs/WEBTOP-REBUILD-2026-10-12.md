@@ -89,3 +89,9 @@ pixel, repeating every 4 px with a 2:1:1 mix (512 px `ff7f0000`, 256 px `30403ff
 That is a stride or pixel-format mismatch between the producer and the reader of the same bitmap, not
 random aliasing. Next: find where the viz-side reader takes its row stride/format for a shared software
 bitmap, and check it against the producer's size under the pool-token mapping.
+
+Big-message check (`LITEBOX_DIAG_BIGMSG=1`, diagnostic in `unix.rs` write path): with plain
+`--disable-gpu` the multi-process run sent **zero** cross-process messages over the 2048-byte ring
+(no `EMSGSIZE` refusals, no partial writes). So the ring is not in the paint path. Plain-flag multi-process:
+desktop paints (201 colours), chromium window stays uniform grey. The striped band appeared only with
+`--vmodule` logging, so it is timing-dependent, not a deterministic stride bug.
