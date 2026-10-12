@@ -109,3 +109,10 @@ four processes' IO threads (pids 1443, 1825, 1850, 1867). Of 4,170 `epoll_pwait`
 0 events; timeouts are either 0 (bursts) or about 170 s (idle). `sendto` returned EAGAIN 118 times of 2,146
 (not a send-retry spin). The zero-timeout bursts show work pending without a ready fd, so the spin is
 a task-reposting loop. The attribution to a task source needs chromium's own task traces, not yet done.
+
+Attribution blockers (2026-10-12): `/usr/lib/chromium/chromium` has NO `.symtab` and no debug info
+(only 1878 dynamic symbols), so the spin's rip values cannot be mapped to chromium functions. No
+chromium debug package is in the local apt cache (xtradeb PPA build 154.0.8037.92-1xtradeb1). The
+`--vmodule` runs for message_pump and sequence_manager produced no task-level log lines in this build.
+Remaining routes: a symbolized build (needs apt index update, root, network), or litebox-side per-task
+instrumentation.
