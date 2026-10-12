@@ -110,13 +110,43 @@ impl PidNamespaceTable {
     /// taken by a namespace still in use.
     ///
     /// Slots are reclaimed, never refcounted: a namespace is dead once no live row mentions it
-    /// (its init process, and every descendant, has exited).
+    /// (its init process, and every descendant, has exited), and a dead slot's id is never handed
+    /// out twice while it is still referenced by a row.
     ///
-    /// `reclaim_dead` is the `LITEBOX_PIDNS_RECLAIM_OFF` A/B switch: with it false this behaves
-    /// exactly as it did before reclamation existed, which is what makes the leak's own symptom
-    /// (`clone(CLONE_NEWPID)` answering `EAGAIN` after `MAX_NAMESPACES` calls, forever) reproducible
-    /// from the same binary as the fix.
-    pub(crate) fn create(&self, parent: u32, reclaim_dead: bool) -> Option<u32> {
+    /// `alive` names whether an internal pid is a process that still exists -- the SAME host-pid
+    /// liveness the shared process table, the flock/record-lock tables and the shared accept queue
+    /// each use to reclaim a dead holder. It is what makes this reclaim possible at all: a row is
+    /// released when a parent REAPS (`process.rs`'s `sys_wait4`), so a child nobody reaps keeps its
+    /// rows and would pin its namespace for the rest of the session.
+    ///
+    /// `reclaim` is the `LITEBOX_PIDNS_RECLAIM_OFF` A/B switch: with it false no slot is ever freed,
+    /// which is what makes the leak's own symptom (`clone(CLONE_NEWPID)` answering `EAGAIN` after
+    /// `MAX_NAMESPACES` calls, forever) reproducible from the same binary as the fix.
+    pub(crate) fn create(
+        &self,
+        parent: u32,
+        alive: &dyn Fn(i32) -> bool,
+        reclaim: bool,
+    ) -> Option<u32> {
+        static CREATES: AtomicU32 = AtomicU32::new(0);
+        let seen = CREATES.fetch_add(1, Ordering::Relaxed);
+        // Sweep periodically, not only when the table is full. A dead slot only BITES when the
+        // table is full, but the ROWS of the processes that pinned it are released by nobody until
+        // then (`release` runs on reap), and `MAX_MEMBERS` is the next cap a session can hit --
+        // measured: zygprobe2's rows reached 569 while only the slots were being recycled. 1 in 64
+        // creations is far below the rate a guest can fork at.
+        if reclaim && seen.wrapping_rem(64) == 0 {
+            let reclaimed = self.reclaim_dead(alive);
+            let (in_use, sealed, members) = self.occupancy();
+            litebox_util_log::warn!(
+                what = "sweep",
+                in_use = in_use,
+                sealed = sealed,
+                members = members,
+                reclaimed = reclaimed;
+                "diag-pidtab: pid-namespace table occupancy"
+            );
+        }
         // Two passes, cheapest-first: prefer a slot no row names at all, then fall back to any free
         // slot (an id a dead-but-not-yet-recycled row still mentions is safe to reuse -- see
         // `is_referenced` -- but a genuinely untouched one is better).
@@ -132,16 +162,13 @@ impl PidNamespaceTable {
         // slots for the whole session even though the namespace died with its init seconds later.
         // Once they were all gone, `create` answered `None`, `do_clone` turned that into `EAGAIN`,
         // `fork()` returned -1, and Chromium logged `Zygote could not fork: ... child_pid -1`.
-        if reclaim_dead {
-            let freed = self.reclaim_dead();
-            if freed > 0 {
+        if reclaim {
+            let reclaimed = self.reclaim_dead(alive);
+            if reclaimed > 0 {
                 litebox_util_log::debug!(
-                    freed:% = freed;
+                    reclaimed:% = reclaimed;
                     "pidns: reclaimed dead namespace slots"
                 );
-                if let Some(id) = self.claim(parent, true) {
-                    return Some(id);
-                }
                 if let Some(id) = self.claim(parent, false) {
                     return Some(id);
                 }
@@ -150,7 +177,7 @@ impl PidNamespaceTable {
         let (in_use, sealed, members) = self.occupancy();
         let stale = self.stale_rows();
         litebox_util_log::warn!(
-            in_use:% = in_use, sealed:% = sealed, members:% = members, reclaim_dead:% = reclaim_dead,
+            in_use:% = in_use, sealed:% = sealed, members:% = members, reclaim:% = reclaim,
             max_namespaces:% = MAX_NAMESPACES, max_members:% = MAX_MEMBERS,
             referenced_namespaces:% = stale.0, min_internal_pid:% = stale.1, max_internal_pid:% = stale.2,
             rows_per_namespace:? = self.rows_per_namespace(),
@@ -254,37 +281,73 @@ impl PidNamespaceTable {
         None
     }
 
-    /// Frees every slot that is `sealed` and that no member row names any more, returning how many
-    /// were freed.
+    /// Frees every `sealed` slot whose members are all gone, returning how many were freed.
     ///
-    /// A `sealed` slot with zero rows is dead by construction: the only way a row for a namespace
-    /// disappears is [`Self::release`] forgetting a pid that has exited, and the namespace's own
-    /// init (pid 1 there) is registered by the very `allocate` that sealed it. An UNsealed slot is
-    /// never touched -- that is a `clone()` between `create` and `allocate`, legitimately rowless,
-    /// and recycling it would hand its id to a second, concurrent clone.
-    fn reclaim_dead(&self) -> usize {
+    /// A namespace is alive exactly as long as a task in it is: its init, and every descendant,
+    /// each holds a row here named by its internal pid. So a sealed slot is dead when no row naming
+    /// it belongs to a process that still exists -- which covers BOTH ways a namespace outlives its
+    /// usefulness: its processes exited and were reaped (no rows left), and its processes exited
+    /// and were never reaped (rows left, every one of them naming a process that is gone).
+    ///
+    /// An UNsealed slot is never touched: that is a `clone()` between `create` and `allocate`,
+    /// legitimately rowless, and recycling it would hand its id to a second, concurrent clone.
+    fn reclaim_dead(&self, alive: &dyn Fn(i32) -> bool) -> usize {
         let mut freed = 0;
         for (index, slot) in self.namespaces.iter().enumerate() {
             if !slot.in_use.load(Ordering::Acquire) || !slot.sealed.load(Ordering::Acquire) {
                 continue;
             }
-            if self.is_referenced(index as u32 + 1) {
+            let id = index as u32 + 1;
+            let mut any_live = false;
+            for row in self.members.iter() {
+                if row.ns_pid.load(Ordering::Acquire) == FREE_PID
+                    || row.ns.load(Ordering::Acquire) != id
+                {
+                    continue;
+                }
+                let internal = row.internal_pid.load(Ordering::Acquire);
+                if internal > 0 && alive(internal) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if any_live {
                 continue;
             }
-            // Reset every field, `in_use` last: until it is stored the slot still reads as taken,
+            // Free the rows with it. They name processes that no longer exist, and a row left
+            // behind would make a LATER namespace that reuses this id look like it holds pid 1
+            // twice -- `translate`/`pid_in` would then answer for the wrong process. A parent
+            // still waiting on one of them is answered from its OWN namespace's row, not from
+            // this one, so nothing a live process can ask for is lost by freeing these.
+            for row in self.members.iter() {
+                if row.ns_pid.load(Ordering::Acquire) != FREE_PID
+                    && row.ns.load(Ordering::Acquire) == id
+                {
+                    row.internal_pid.store(FREE_PID, Ordering::Release);
+                    row.ns.store(INITIAL_NS, Ordering::Release);
+                    row.ns_pid.store(FREE_PID, Ordering::Release);
+                }
+            }
+            // Reset every field, `in_use` last: until it is cleared the slot still reads as taken,
             // so no concurrent `claim` can observe a half-reset slot.
             slot.parent.store(INITIAL_NS, Ordering::Release);
             slot.next_pid.store(1, Ordering::Release);
             slot.sealed.store(false, Ordering::Release);
-            slot.in_use.store(false, Ordering::Release);
-            freed += 1;
+            if slot
+                .in_use
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                freed += 1;
+            }
         }
         freed
     }
 
     /// `(slots in use, slots sealed, live member rows)` -- the whole table's occupancy, logged when
-    /// a create or an allocate fails so the failure names which of the two limits it hit.
-    fn occupancy(&self) -> (usize, usize, usize) {
+    /// a create or an allocate fails (and by `diag-clone-fail`) so the failure names which of the
+    /// two limits it hit.
+    pub(crate) fn occupancy(&self) -> (usize, usize, usize) {
         let mut in_use = 0;
         let mut sealed = 0;
         for slot in self.namespaces.iter() {

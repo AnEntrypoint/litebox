@@ -310,6 +310,15 @@ pub(crate) struct VehGates {
     pub(crate) watchaddr: Option<usize>,
     /// `LITEBOX_FORKVERIFY_OFF`
     pub(crate) forkverify_off: bool,
+    /// `LITEBOX_FORKVERIFY_IDENTITY`: arm fork verification even for an IDENTITY relocation map,
+    /// i.e. restore the behaviour before the cross-process-fork fix. That is the OFF switch for
+    /// the fix, not a diagnostic -- see `fork_verify::begin`.
+    pub(crate) forkverify_identity: bool,
+    /// `LITEBOX_FORKVERIFY_XMM_OFF`: do not heal stale pointers held in the 64-bit lanes of an
+    /// `xmm` register about to be stored to memory by an SSE store
+    /// (`fork_verify::translate_stale_xmm_store_lanes`). That is the OFF switch for the fix, not a
+    /// diagnostic.
+    pub(crate) forkverify_xmm_off: bool,
     /// `LITEBOX_DIAG_GS_BASE_REPAIR`
     pub(crate) gs_base_repair: bool,
     /// `LITEBOX_DIAG_FS_BASE_REPAIR` (94th pass, mirrors `gs_base_repair` above): logs every time
@@ -342,6 +351,8 @@ impl VehGates {
                 .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .filter(|&a| a != 0),
             forkverify_off: std::env::var_os("LITEBOX_FORKVERIFY_OFF").is_some(),
+            forkverify_identity: std::env::var_os("LITEBOX_FORKVERIFY_IDENTITY").is_some(),
+            forkverify_xmm_off: std::env::var_os("LITEBOX_FORKVERIFY_XMM_OFF").is_some(),
             gs_base_repair: std::env::var_os("LITEBOX_DIAG_GS_BASE_REPAIR").is_some(),
             fs_base_repair: std::env::var_os("LITEBOX_DIAG_FS_BASE_REPAIR").is_some(),
         }
@@ -15187,6 +15198,16 @@ fn close_unused_pipe_ends(pumps: std::vec::Vec<(usize, litebox::platform::ForkPi
 /// the parent returns from `fork()` immediately, as it must. `local` and `child_process` are
 /// passed as `usize` because a Windows `HANDLE` is a raw pointer and therefore `!Send`; the values
 /// are process-wide and thread-agnostic, so re-forming them here is sound.
+/// Whether a cross-process `fork()` child's inherited pipe read end should be left deaf to the
+/// bytes its parent's pipe already held.
+///
+/// `LITEBOX_FORK_PIPE_PEEK_OFF=1` restores the pre-fix shape -- the child sees only what the pump
+/// drains out of the guest pipe, which for any read end the guest still holds a reference to is
+/// nothing at all. It exists to prove the copy BOTH WAYS, not as a configuration knob.
+fn fork_pipe_peek_disabled() -> bool {
+    std::env::var_os("LITEBOX_FORK_PIPE_PEEK_OFF").is_some_and(|value| !value.is_empty())
+}
+
 fn spawn_fork_child_pipe_pump(
     local: usize,
     bridge: litebox::platform::ForkPipeBridge,
@@ -15266,13 +15287,48 @@ fn spawn_fork_child_pipe_pump(
                 // running instead of idling to its timeout.
                 const UNDRAINED_GRACE: core::time::Duration =
                     core::time::Duration::from_millis(500);
+                // One Linux pipe capacity: the most a carried read end can ever have queued, so one
+                // peek of this size copies whatever was already there when the fork happened.
+                const SNAPSHOT_BYTES: usize = 64 * 1024;
                 // False for every carried read end but the child's stdin. See
                 // `ForkPipeBridge::buffered_belongs_to_child`.
                 let may_forward_buffered = end.buffered_belongs_to_child();
                 let mut last_pending = usize::MAX;
                 let mut undrained_since: Option<std::time::Instant> = None;
+
+                // Bytes that were already queued when the fork happened are, on a real `fork()`,
+                // there for whichever of parent and child reads first -- the child included. This
+                // bridge cannot share the guest's queue across a process boundary, so it hands the
+                // child a COPY (a peek, which consumes nothing): the guest parent keeps every byte
+                // it had, and the child stops blocking on data already sitting in its parent.
+                // `already_forwarded` stops the drain below from delivering those bytes twice.
+                let mut already_forwarded = 0usize;
+                if !fork_pipe_peek_disabled() {
+                    let mut snapshot = std::vec::Vec::new();
+                    snapshot.resize(SNAPSHOT_BYTES, 0u8);
+                    let peeked = end.peek(&mut snapshot);
+                    if peeked > 0 {
+                        if process_fork::write_all_to_inherited_handle(local, &snapshot[..peeked]) {
+                            already_forwarded = peeked;
+                            litebox_util_log::debug!(
+                                handle:% = local, owners:% = end.owners(), bytes:% = peeked;
+                                "fork-child pipe pump (parent): copied the bytes the guest pipe held at fork time into the child's inherited read end"
+                            );
+                        } else {
+                            litebox_util_log::debug!(
+                                handle:% = local, bytes:% = peeked;
+                                "fork-child pipe pump (parent): the child was gone before it could take the bytes its parent held at fork time"
+                            );
+                        }
+                    }
+                }
                 while end.owners() > 1 {
-                    if end.at_eof() {
+                    // Every writer is gone, so all this end can still yield is what is queued right
+                    // now, and then end-of-file. Waiting for `at_eof()` -- which ALSO demands an
+                    // empty buffer -- would wait for somebody to drain it, and when this pump is
+                    // the only thing that can, the child blocks for ever on bytes its own parent is
+                    // holding, and never even learns that the pipe is finished.
+                    if end.peer_shutdown() {
                         break;
                     }
                     let pending = end.pending_bytes();
@@ -15313,7 +15369,16 @@ fn spawn_fork_child_pipe_pump(
                 loop {
                     match end.read(&mut buf) {
                         litebox::platform::ForkPipeRead::Bytes(n) => {
-                            if !process_fork::write_all_to_inherited_handle(local, &buf[..n]) {
+                            // The leading bytes are the ones the snapshot above already handed the
+                            // child; handing them again would double every carried message.
+                            let already = already_forwarded.min(n);
+                            already_forwarded -= already;
+                            if already < n
+                                && !process_fork::write_all_to_inherited_handle(
+                                    local,
+                                    &buf[already..n],
+                                )
+                            {
                                 // The child is gone or has closed its end; nothing left to deliver.
                                 break;
                             }
@@ -15628,9 +15693,7 @@ mod tests {
 
     #[test]
     fn test_raw_mutex() {
-        let mutex = std::sync::Arc::new(super::RawMutex {
-            inner: AtomicU32::new(0),
-        });
+        let mutex = std::sync::Arc::new(super::RawMutex::new());
 
         let copied_mutex = mutex.clone();
         std::thread::spawn(move || {

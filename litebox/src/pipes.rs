@@ -312,6 +312,41 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DetachedPipeEnd<Platfor
         }
     }
 
+    /// Whether every writer on the other end is gone, so that once the buffer is drained no read
+    /// can ever return anything but end-of-file.
+    ///
+    /// Deliberately NOT the same question as [`Self::at_eof`], which additionally requires the
+    /// buffer to be empty: "no writer is left" is the point at which a reader's fate is sealed and
+    /// the only remaining question is who gets the bytes still queued, while "nothing is queued
+    /// either" depends on when somebody reads them. A host pump forwarding a `fork()` child's
+    /// inherited read end must start draining at the former, not wait for the latter -- waiting for
+    /// an empty buffer it is itself the one that has to empty is a deadlock.
+    #[must_use]
+    pub fn peer_shutdown(&self) -> bool {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.is_peer_shutdown(),
+            PipeEnd::Sender(_) => false,
+        }
+    }
+
+    /// Copy up to `buf.len()` bytes out of a receiver half WITHOUT consuming them, returning how
+    /// many were copied; `0` on a sender half.
+    ///
+    /// A `fork()` leaves parent and child reading from ONE queue, so a byte either of them takes
+    /// is gone for the other -- and litebox's cross-process child cannot share the queue, only
+    /// have bytes copied into it. Copying instead of draining is what lets that copy be a gift
+    /// rather than a theft: the parent's own read end still holds every byte it held before, so
+    /// forwarding to a child cannot empty a pipe the guest is still going to read (libuv's global
+    /// signal lock, a pipe holding one byte whose disappearance hangs the next locker, is the case
+    /// that made draining unsafe).
+    #[must_use]
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        match &self.end {
+            PipeEnd::Receiver(p) => p.peek(buf),
+            PipeEnd::Sender(_) => 0,
+        }
+    }
+
     /// Whether this is the sender half or the receiver half.
     #[must_use]
     pub fn half_pipe_type(&self) -> HalfPipeType {
@@ -721,6 +756,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
             }
             Err(TryOpError::TryAgain)
         }
+    }
+
+    /// Copy up to `buf.len()` values out of the pipe WITHOUT consuming them, returning how many
+    /// were copied.
+    ///
+    /// Same bytes a [`Self::read`] would return, left in place for whoever reads them next. See
+    /// [`DetachedPipeEnd::peek`] for why a `fork()` bridge needs the copy and not the read.
+    fn peek(&self, buf: &mut [T]) -> usize
+    where
+        T: Copy,
+    {
+        if buf.is_empty() {
+            return 0;
+        }
+        self.endpoint.rb.lock().peek_slice(buf)
     }
 
     /// Read values in the pipe into `buf`, returning the number of elements read.

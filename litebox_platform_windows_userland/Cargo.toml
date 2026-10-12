@@ -63,5 +63,16 @@ winit = "0.30"
 # which this crate does not otherwise pull in).
 pollster = "0.4"
 
+# `litebox_util_log`'s tracing backend is the only thing `is_process_alive`'s two
+# `litebox_util_log::__private::tracing::event!` call sites can expand against, and it is enabled
+# by feature unification when a binary (the runner) is built -- which is why the plain `cargo
+# build` of this crate alone still succeeds. A `cargo test -p` of this crate gets no such
+# unification, so the feature has to be turned on for the test build explicitly or the crate's own
+# unit tests cannot compile at all.
+[target.'cfg(windows)'.dev-dependencies]
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = [
+    "backend_tracing",
+] }
+
 [lints]
 workspace = true

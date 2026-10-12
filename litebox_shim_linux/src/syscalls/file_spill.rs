@@ -24,6 +24,18 @@ const PATH_CAPACITY: usize = 192;
 const TRANSFER_CHUNK: usize = 256 * 1024;
 const LOCK_SPIN_LIMIT: u32 = 400_000_000;
 
+/// The token a host process that has no cross-process identity locks under: `current_host_pid()`
+/// is `0` on a platform without cross-process delivery, and `0` is this lock's "free" value.
+const LOCK_TOKEN_NO_HOST_PID: u32 = u32::MAX;
+
+/// How often a waiter asks whether the holder is still alive. `is_process_alive` is a host query,
+/// so it cannot be asked once per spin.
+const DEAD_HOLDER_CHECK_EVERY: u32 = 1 << 16;
+
+/// `LITEBOX_SPILL_LOCK_BARGE` re-enables the pre-fix behaviour, cached because `locked` is on the
+/// path of every spilled write. 0 = unread, 1 = barge, 2 = strict.
+static SPILL_LOCK_BARGE: AtomicU8 = AtomicU8::new(0);
+
 const SLOT_EMPTY: u32 = 0;
 const SLOT_LIVE: u32 = 1;
 const SLOT_DELETED: u32 = 2;
@@ -118,6 +130,44 @@ pub(crate) struct AppliedEdit {
     local_diverged: bool,
 }
 
+/// How a waiter may become the owner of the shared file-spill lock.
+enum LockPolicy {
+    /// Wait for the holder to release. A dead holder is recovered from, so this never waits on a
+    /// lock that nobody will release.
+    Wait,
+    /// The pre-fix behaviour, reachable only through `LITEBOX_SPILL_LOCK_BARGE`: give up after
+    /// this many spins and enter the critical section WITHOUT owning the lock.
+    BargeAfter(u32),
+}
+
+enum Acquired {
+    Fresh,
+    Recovered { dead_owner: u32 },
+    /// Still held by `owner`. Only `LockPolicy::BargeAfter` may proceed after this, and doing so
+    /// is the interleaving the lock exists to prevent.
+    Contended { owner: u32 },
+}
+
+fn policy_for(barge: bool) -> LockPolicy {
+    if barge {
+        LockPolicy::BargeAfter(LOCK_SPIN_LIMIT)
+    } else {
+        LockPolicy::Wait
+    }
+}
+
+fn spill_lock_policy<Platform: ShimPlatform>(platform: &Platform) -> LockPolicy {
+    match SPILL_LOCK_BARGE.load(Ordering::Relaxed) {
+        0 => {
+            let barge = platform.env_value("LITEBOX_SPILL_LOCK_BARGE").is_some();
+            SPILL_LOCK_BARGE.store(if barge { 1 } else { 2 }, Ordering::Relaxed);
+            policy_for(barge)
+        }
+        1 => policy_for(true),
+        _ => policy_for(false),
+    }
+}
+
 impl SharedFileSpill {
     pub(crate) fn new() -> Self {
         Self {
@@ -126,22 +176,99 @@ impl SharedFileSpill {
         }
     }
 
-    fn locked<R>(&self, body: impl FnOnce() -> R) -> R {
+    /// A lock that gives up is not a lock: the store's bytes, lengths and generations are only
+    /// coherent while exactly one actor is inside, and the old `locked` ran its body after
+    /// `LOCK_SPIN_LIMIT` spins whether or not it had ever acquired anything -- two host processes
+    /// then interleaved inside one critical section, which is exactly the interleaving the lock
+    /// exists to prevent. The only holder that can fail to release is one that DIED holding the
+    /// lock, so ownership now transfers out of a provably-dead host process and out of nothing
+    /// else, and the lock word records WHO holds it so that is decidable.
+    ///
+    /// A live holder is a holder that is still making progress: this critical section is bounded
+    /// host I/O, so a waiter spins instead of entering. A waiter of the SAME host pid is another
+    /// thread of this process (a multi-threaded guest), whose hold is likewise bounded.
+    fn acquire(
+        &self,
+        me: u32,
+        is_alive: &impl Fn(u32) -> bool,
+        policy: LockPolicy,
+    ) -> Acquired {
         let mut spins = 0u32;
-        while self
-            .lock
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            spins += 1;
-            if spins > LOCK_SPIN_LIMIT {
-                break;
+        loop {
+            match self
+                .lock
+                .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Acquired::Fresh,
+                Err(owner) => {
+                    let recoverable = me != LOCK_TOKEN_NO_HOST_PID
+                        && owner != LOCK_TOKEN_NO_HOST_PID
+                        && spins % DEAD_HOLDER_CHECK_EVERY == 0
+                        && !is_alive(owner);
+                    if recoverable
+                        && self
+                            .lock
+                            .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        return Acquired::Recovered { dead_owner: owner };
+                    }
+                    spins = spins.wrapping_add(1);
+                    if spins % LOCK_SPIN_LIMIT == 0 {
+                        litebox_util_log::warn!(
+                            owner:% = owner, me:% = me;
+                            "spill-lock: a host process has held the shared file-spill lock across a very long wait"
+                        );
+                    }
+                    if let LockPolicy::BargeAfter(limit) = policy {
+                        if spins >= limit {
+                            return Acquired::Contended { owner };
+                        }
+                    }
+                    core::hint::spin_loop();
+                }
             }
-            core::hint::spin_loop();
+        }
+    }
+
+    fn locked_body<R>(
+        &self,
+        me: u32,
+        is_alive: &impl Fn(u32) -> bool,
+        policy: LockPolicy,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        match self.acquire(me, is_alive, policy) {
+            Acquired::Fresh => {}
+            Acquired::Recovered { dead_owner } => litebox_util_log::warn!(
+                dead_owner:% = dead_owner, me:% = me;
+                "spill-lock: a host process died holding the shared file-spill lock, ownership recovered"
+            ),
+            Acquired::Contended { owner } => litebox_util_log::warn!(
+                owner:% = owner, me:% = me;
+                "spill-lock: BARGE - running the critical section without owning the lock (LITEBOX_SPILL_LOCK_BARGE)"
+            ),
         }
         let result = body();
         self.lock.store(0, Ordering::Release);
         result
+    }
+
+    fn locked<Platform: ShimPlatform, R>(
+        &self,
+        platform: &Platform,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let me = match platform.current_host_pid() {
+            0 => LOCK_TOKEN_NO_HOST_PID,
+            pid => pid,
+        };
+        self.locked_body(
+            me,
+            &|pid| platform.is_process_alive(pid),
+            spill_lock_policy(platform),
+            body,
+        )
     }
 
     fn find(&self, path: &str) -> Option<usize> {
@@ -173,11 +300,16 @@ impl SharedFileSpill {
     /// process's `refresh_from_spill` and its `rename(2)` has its bytes silently reverted, which
     /// real Linux cannot do. Moving the row cannot lose them, and the move happens under the spill
     /// lock, so no writer can interleave with it.
-    fn move_slot(&self, from: &str, to: &str) -> Option<AppliedEdit> {
+    fn move_slot<Platform: ShimPlatform>(
+        &self,
+        platform: &Platform,
+        from: &str,
+        to: &str,
+    ) -> Option<AppliedEdit> {
         if from.len() > PATH_CAPACITY || to.len() > PATH_CAPACITY {
             return None;
         }
-        self.locked(|| {
+        self.locked(platform, || {
             let index = self.find(from)?;
             // Renaming onto a live path replaces it, as Linux does: the destination's own row has to
             // go, or two rows would claim the same path and `find` would answer either.
@@ -203,11 +335,15 @@ impl SharedFileSpill {
         })
     }
 
-    pub(crate) fn view(&self, path: &str) -> Option<SpillView> {
+    pub(crate) fn view<Platform: ShimPlatform>(
+        &self,
+        platform: &Platform,
+        path: &str,
+    ) -> Option<SpillView> {
         if path.len() > PATH_CAPACITY {
             return None;
         }
-        self.locked(|| {
+        self.locked(platform, || {
             let index = self.find(path)?;
             let slot = &self.slots[index];
             Some(SpillView {
@@ -219,8 +355,12 @@ impl SharedFileSpill {
         })
     }
 
-    pub(crate) fn paths_in_directory(&self, directory: &str) -> Vec<String> {
-        self.locked(|| {
+    pub(crate) fn paths_in_directory<Platform: ShimPlatform>(
+        &self,
+        platform: &Platform,
+        directory: &str,
+    ) -> Vec<String> {
+        self.locked(platform, || {
             self.slots
                 .iter()
                 .filter(|slot| slot.state.load(Ordering::Relaxed) != SLOT_EMPTY)
@@ -233,7 +373,7 @@ impl SharedFileSpill {
         })
     }
 
-    fn apply<Platform: SystemInfoProvider>(
+    fn apply<Platform: ShimPlatform>(
         &self,
         platform: &Platform,
         path: &str,
@@ -243,7 +383,7 @@ impl SharedFileSpill {
         if path.len() > PATH_CAPACITY {
             return None;
         }
-        self.locked(|| {
+        self.locked(platform, || {
             let index = self.claim(path)?;
             let slot = &self.slots[index];
             let slot_id = index as u32;
@@ -351,7 +491,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.spill_enabled_for(path) {
             return;
         }
-        let Some(view) = self.global.shared_file_spill.view(path) else {
+        let Some(view) = self.global.shared_file_spill.view(self.global.platform, path) else {
             return;
         };
         let seen = &LOCALLY_SEEN_GENERATION[view.slot];
@@ -377,7 +517,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.spill_enabled_for(&directory) {
             return;
         }
-        for path in self.global.shared_file_spill.paths_in_directory(&directory) {
+        for path in self
+            .global
+            .shared_file_spill
+            .paths_in_directory(self.global.platform, &directory)
+        {
             self.refresh_from_spill(&path);
         }
     }
@@ -487,7 +631,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.spill_enabled_for(from) && !self.spill_enabled_for(to) {
             return;
         }
-        if let Some(applied) = self.global.shared_file_spill.move_slot(from, to) {
+        if let Some(applied) = self
+            .global
+            .shared_file_spill
+            .move_slot(self.global.platform, from, to)
+        {
             // The move does not touch the bytes, so a local copy that already matched the store
             // still matches it; one that was behind stays behind, so the next read installs.
             let seen = &LOCALLY_SEEN_GENERATION[applied.slot];
@@ -500,5 +648,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // which after the rename is the moved file.
         self.publish_spilled(from, SpillEdit::Remove);
         self.publish_spilled(to, SpillEdit::Replace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: u32 = 91;
+    const OTHER: u32 = 77;
+
+    fn nobody_alive(_pid: u32) -> bool {
+        false
+    }
+
+    fn everybody_alive(_pid: u32) -> bool {
+        true
+    }
+
+    fn held_by(spill: &SharedFileSpill, owner: u32) {
+        spill.lock.store(owner, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_free_lock_is_taken_immediately() {
+        let spill = SharedFileSpill::new();
+        assert!(matches!(
+            spill.acquire(ME, &everybody_alive, LockPolicy::Wait),
+            Acquired::Fresh
+        ));
+        assert_eq!(spill.lock.load(Ordering::Relaxed), ME);
+    }
+
+    #[test]
+    fn a_dead_holder_is_recovered_from() {
+        let spill = SharedFileSpill::new();
+        held_by(&spill, OTHER);
+        assert!(matches!(
+            spill.acquire(ME, &nobody_alive, LockPolicy::Wait),
+            Acquired::Recovered { dead_owner: OTHER }
+        ));
+        assert_eq!(spill.lock.load(Ordering::Relaxed), ME);
+    }
+
+    /// The fix: a LIVE holder keeps the lock. `LockedPolicy::BargeAfter` is what reports
+    /// "contended" at all -- under `Wait` the caller never gets here, it keeps waiting.
+    #[test]
+    fn a_live_holder_is_never_entered_on() {
+        let spill = SharedFileSpill::new();
+        held_by(&spill, OTHER);
+        assert!(matches!(
+            spill.acquire(ME, &everybody_alive, LockPolicy::BargeAfter(64)),
+            Acquired::Contended { owner: OTHER }
+        ));
+        assert_eq!(
+            spill.lock.load(Ordering::Relaxed),
+            OTHER,
+            "a live holder must still own the lock"
+        );
+    }
+
+    /// What `LITEBOX_SPILL_LOCK_BARGE` restores, kept as the OFF switch's own regression: the body
+    /// runs and observes ANOTHER process's ownership, i.e. two actors inside one critical section.
+    #[test]
+    fn the_legacy_barge_runs_the_body_unowned() {
+        let spill = SharedFileSpill::new();
+        held_by(&spill, OTHER);
+        let owner_during_body =
+            spill.locked_body(ME, &everybody_alive, LockPolicy::BargeAfter(64), || {
+                spill.lock.load(Ordering::Relaxed)
+            });
+        assert_eq!(owner_during_body, OTHER);
+    }
+
+    #[test]
+    fn the_switch_selects_wait_or_barge() {
+        assert!(matches!(policy_for(false), LockPolicy::Wait));
+        assert!(matches!(
+            policy_for(true),
+            LockPolicy::BargeAfter(LOCK_SPIN_LIMIT)
+        ));
     }
 }

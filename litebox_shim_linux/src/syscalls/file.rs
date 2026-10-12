@@ -2579,6 +2579,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let (master, _id) = self.global.ptmx_open();
             return self.insert_raw_pty_fd(master, flags, path);
         }
+        // Opening `/dev/pts` ITSELF (a directory listing, `ls /dev/pts`) is the one path whose
+        // answer comes from the per-process mirror, so refresh that mirror from every pty this
+        // fork family knows about first -- without this a second guest process lists nothing,
+        // because it is a second HOST process and the mirror only ever holds its own allocations.
+        // `LITEBOX_PTS_LIST_SHARED_OFF=1` restores the per-process-only listing.
+        if path_str == "/dev/pts"
+            && !self
+                .global
+                .platform
+                .env_value("LITEBOX_PTS_LIST_SHARED_OFF")
+                .is_some()
+        {
+            self.global.sync_pts_registry();
+        }
         if let Some(id_str) = path_str.strip_prefix("/dev/pts/")
             && let Ok(id) = id_str.parse::<u32>()
         {

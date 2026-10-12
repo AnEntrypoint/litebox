@@ -1649,6 +1649,40 @@ impl ForkPipeBridge {
         }
     }
 
+    /// Copy up to `buf.len()` bytes out of a [`Self::Source`]'s pipe WITHOUT consuming them,
+    /// returning how many were copied; `0` for a [`Self::Sink`].
+    ///
+    /// This is how a bridge gives a child bytes without taking them from anybody. Draining takes
+    /// the bytes away from a guest parent that still holds the very same read end -- and the parent
+    /// holding one is not evidence that it will not read (libuv's global signal lock, a pipe holding
+    /// exactly one byte whose disappearance hangs the next locker for ever, is the case that proved
+    /// it). A copy that leaves every byte in place cannot harm that parent, so a child's inherited
+    /// read end can be fed from a buffer the guest is still entitled to read.
+    #[must_use]
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        match self {
+            Self::Sink(_) => 0,
+            Self::Source(e) => e.peek(buf),
+        }
+    }
+
+    /// Whether every writer on a [`Self::Source`]'s pipe is gone, whether or not bytes are still
+    /// buffered; `false` for a [`Self::Sink`].
+    ///
+    /// Not the same question as [`Self::at_eof`], which also requires the buffer to be empty. "No
+    /// writer is left" is the moment a reader's fate is sealed: the only bytes it can ever get are
+    /// the ones already queued, and then end-of-file. Waiting for the buffer to EMPTY before
+    /// acting is waiting for somebody to drain it -- and when the bridge is the only thing that
+    /// can, that wait never ends, and a child blocked on its inherited read end stays blocked for
+    /// ever on data that is already sitting in the parent.
+    #[must_use]
+    pub fn peer_shutdown(&self) -> bool {
+        match self {
+            Self::Sink(_) => false,
+            Self::Source(e) => e.peer_shutdown(),
+        }
+    }
+
     /// Whether bytes already buffered in a [`Self::Source`]'s pipe are destined for the child that
     /// carries this end, so the platform's pump may drain them out of the parent.
     ///
@@ -1706,6 +1740,8 @@ pub struct ForkPipeEnd<F> {
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
     pending: alloc::boxed::Box<dyn Fn() -> usize + Send>,
+    peek: alloc::boxed::Box<dyn Fn(&mut [u8]) -> usize + Send>,
+    peer_shutdown: alloc::boxed::Box<dyn Fn() -> bool + Send>,
     buffered_belongs_to_child: bool,
     cloexec: bool,
 }
@@ -1721,6 +1757,8 @@ impl<F> ForkPipeEnd<F> {
         owners: impl Fn() -> usize + Send + 'static,
         at_eof: impl Fn() -> bool + Send + 'static,
         pending: impl Fn() -> usize + Send + 'static,
+        peek: impl Fn(&mut [u8]) -> usize + Send + 'static,
+        peer_shutdown: impl Fn() -> bool + Send + 'static,
         buffered_belongs_to_child: bool,
     ) -> Self {
         Self {
@@ -1728,6 +1766,8 @@ impl<F> ForkPipeEnd<F> {
             owners: alloc::boxed::Box::new(owners),
             at_eof: alloc::boxed::Box::new(at_eof),
             pending: alloc::boxed::Box::new(pending),
+            peek: alloc::boxed::Box::new(peek),
+            peer_shutdown: alloc::boxed::Box::new(peer_shutdown),
             buffered_belongs_to_child,
             cloexec: false,
         }
@@ -1757,6 +1797,18 @@ impl<F> ForkPipeEnd<F> {
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
         (self.pending)()
+    }
+
+    /// See [`ForkPipeBridge::peek`].
+    #[must_use]
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        (self.peek)(buf)
+    }
+
+    /// See [`ForkPipeBridge::peer_shutdown`].
+    #[must_use]
+    pub fn peer_shutdown(&self) -> bool {
+        (self.peer_shutdown)()
     }
 
     /// See [`ForkPipeBridge::buffered_belongs_to_child`].

@@ -161,6 +161,31 @@ fn host_process_tag() -> u64 {
     }
 }
 
+/// One row of [`Network::slot_generations`]: a `smoltcp::iface::SocketHandle` and how many times
+/// the slot it names has been vacated since this row was created.
+///
+/// KEYED BY THE HANDLE ITSELF, never by a numeric slot index. `SocketHandle` is a newtype over a
+/// private `usize` (`smoltcp-0.12.0/src/iface/socket_set.rs:30`) and smoltcp 0.12 exposes no way
+/// to read that field -- no `From`, and `SocketSet::iter` (`socket_set.rs:133-145`) SKIPS EMPTY
+/// SLOTS, so `iter().position(..)` is an ordinal among the occupied slots, not a slot index.
+/// An earlier revision indexed a parallel `[u32; MAX_SOCKETS]` with that ordinal, which bumped the
+/// generation of an unrelated slot on every free: it both failed to invalidate the freed slot and
+/// spuriously invalidated every live socket above it. `SocketHandle` derives `PartialEq`/`Eq`/
+/// `Copy` (`socket_set.rs:28`) and `SocketSet::add` returns `SocketHandle(first_empty_slot_index)`
+/// (`:62-91`), so a freed-and-reused slot yields an EQUAL handle -- comparing handles is enough,
+/// and no index is ever derived.
+pub(crate) type SlotGenerationRow = Option<(smoltcp::iface::SocketHandle, u32)>;
+
+/// One row of [`Network::accepted_slots`]: the backlog slot `accept` handed out, plus
+/// [`Network::slot_generations`]'s value for it at the moment of the claim.
+///
+/// The generation is what makes a claim expire. Without it a mark compares by handle alone, and
+/// smoltcp reuses a freed slot index, so a claim left on a slot that has since been vacated and
+/// re-armed still matches the NEXT connection to land there -- `unclaimed_connection_on` and
+/// `take_ready_backlog_slot` would both skip it, and that connection is silently dropped with no
+/// log line. Keyed by handle, never by index, for the reason [`SlotGenerationRow`] gives.
+pub(crate) type AcceptedSlot = Option<(smoltcp::iface::SocketHandle, u32)>;
+
 pub struct Network<Platform>
 where
     Platform: platform::IPInterfaceProvider
@@ -227,8 +252,11 @@ where
     /// ONE queue, and a connection in that queue belongs to whichever of them takes it first. The
     /// queue itself is the set of smoltcp slots armed on the listen endpoint -- shared already --
     /// but a slot is claimed here at `accept` time and skipped by every later scan. Cleared when a
-    /// slot is armed back into LISTEN (a reused slot must be claimable again).
-    accepted_slots: [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+    /// slot is armed back into LISTEN (a reused slot must be claimable again), and when the claim
+    /// itself goes stale -- see [`Self::reap_stale_claims_in`]: a mark left on a slot that has since
+    /// been vacated and reused would silently strand the NEXT connection to land on that slot,
+    /// because that one would still read as already claimed.
+    accepted_slots: [AcceptedSlot; MAX_SOCKETS],
     /// ONE accept queue per listening port, in shared memory, indexed by nothing: [`ListenQueue`]
     /// is where the port's backlog slots live now, not any process's descriptor entry.
     ///
@@ -244,6 +272,24 @@ where
     /// swept, and sweeping from shared state is exactly what this queue rework is about. Being
     /// shared also means one process's ticks are every process's, which is the intent.
     reclaim_tick: u32,
+    /// How many times the slot each `smoltcp::iface::SocketHandle` names has been vacated, keyed by
+    /// the handle itself (see [`SlotGenerationRow`] for why the key is the handle and not an index).
+    /// Bumped in [`Self::remove_socket`] and stamped onto every handle minted from an `add`, which is
+    /// what turns a bare slot index into an identity: `smoltcp::iface::SocketHandle` is a `usize` with
+    /// no generation counter of its own, so slot N being occupied says nothing about whether it still
+    /// holds the socket a handle minted earlier named. A handle whose stamped generation no longer
+    /// matches this table names a socket that is GONE, including the case no type check can see --
+    /// the slot being reused by another socket OF THE SAME TYPE (chromium's churn reuses a freed
+    /// slot within seconds: 256 slots, thousands of sockets).
+    ///
+    /// Rows are never freed, and that is bounded: `add` hands out `SocketHandle(slot_index)` for a
+    /// slot of a fixed `MAX_SOCKETS`-capacity set, so at most `MAX_SOCKETS` distinct handle values
+    /// can ever exist and the table can never fill.
+    ///
+    /// Pointer-free and `MAX_SOCKETS`-sized for the same reason as `closing_in_background` above:
+    /// this lives in the shared kernel arena at a fixed address, and a fork child that attaches
+    /// reads the very same bytes.
+    slot_generations: [SlotGenerationRow; MAX_SOCKETS],
     /// Storage for every socket's rx/tx buffers, placed in the shared kernel arena so any process
     /// in the fork family can poll any socket (see `socket_buffers`).
     buffers: SocketBuffers,
@@ -315,6 +361,7 @@ where
             accepted_slots: [None; MAX_SOCKETS],
             listen_queues: core::array::from_fn(|_| ListenQueue::EMPTY),
             reclaim_tick: 0,
+            slot_generations: [None; MAX_SOCKETS],
             buffers: SocketBuffers::new(litebox.x.platform),
         }
     }
@@ -382,6 +429,14 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
     shutdown_wr_pending: bool,
     /// The handle into the `socket_set`
     handle: smoltcp::iface::SocketHandle,
+    /// [`Network::slot_generations`]'s value for `handle`'s slot at the moment this handle was
+    /// minted. Compared against that table before every typed access: equal means `handle` still
+    /// names the socket it was minted for, different means the slot was vacated since -- and has
+    /// possibly been reused by another socket, of the same type or not. Without it, "slot N is
+    /// occupied" is all anyone can ask, and the wrong socket is read or, worse,
+    /// `SocketBuffers::release` hands ANOTHER socket's buffer claims back to the shared pool
+    /// (`.wfgy/NOTES_STALEHANDLE.md` §5).
+    slot_gen: u32,
     specific: ProtocolSpecific,
     /// The proxy associated with this socket to enable lock-free data transfer
     /// and event notification
@@ -409,25 +464,48 @@ pub(crate) struct SocketHandle<Platform: RawSyncPrimitivesProvider + TimeProvide
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> {
-    /// Convenience function to perform an operation depending on the socket type
+    /// Convenience function to perform an operation depending on the socket type.
+    ///
+    /// `None` -- nothing is invoked -- when `self.handle` no longer names a socket of the type this
+    /// process expects: the slot is empty, or it was vacated and reused since this handle was
+    /// minted. Both used to be a panic inside smoltcp (`socket_set.rs:101`/`:115`, 288,137 of them
+    /// in one 300 s chromium run) and every one of those was followed by
+    /// [`Network::reset_after_poisoning`] wiping every socket of every process.
     fn with_socket<TCP, UDP, R>(
         &self,
         socket_set: &smoltcp::iface::SocketSet<'static>,
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
         tcp: TCP,
         udp: UDP,
-    ) -> R
+    ) -> Option<R>
     where
         TCP: FnOnce(&tcp::Socket) -> R,
         UDP: FnOnce(&udp::Socket) -> R,
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
-                let tcp_socket = socket_set.get::<tcp::Socket>(self.handle);
-                tcp(tcp_socket)
+                let tcp_socket = try_get_socket(
+                    socket_set,
+                    self.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: self.slot_gen,
+                    }),
+                    "with_socket:tcp",
+                )?;
+                Some(tcp(tcp_socket))
             }
             crate::net::Protocol::Udp => {
-                let udp_socket = socket_set.get::<udp::Socket>(self.handle);
-                udp(udp_socket)
+                let udp_socket = try_get_socket(
+                    socket_set,
+                    self.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: self.slot_gen,
+                    }),
+                    "with_socket:udp",
+                )?;
+                Some(udp(udp_socket))
             }
             crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
                 unimplemented!()
@@ -438,21 +516,38 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
     fn with_socket_mut<TCP, UDP, R>(
         &mut self,
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
         tcp: TCP,
         udp: UDP,
-    ) -> R
+    ) -> Option<R>
     where
         TCP: FnOnce(&mut tcp::Socket) -> R,
         UDP: FnOnce(&mut udp::Socket) -> R,
     {
         match self.protocol() {
             crate::net::Protocol::Tcp => {
-                let tcp_socket = socket_set.get_mut::<tcp::Socket>(self.handle);
-                tcp(tcp_socket)
+                let tcp_socket = try_get_socket_mut(
+                    socket_set,
+                    self.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: self.slot_gen,
+                    }),
+                    "with_socket_mut:tcp",
+                )?;
+                Some(tcp(tcp_socket))
             }
             crate::net::Protocol::Udp => {
-                let udp_socket = socket_set.get_mut::<udp::Socket>(self.handle);
-                udp(udp_socket)
+                let udp_socket = try_get_socket_mut(
+                    socket_set,
+                    self.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: self.slot_gen,
+                    }),
+                    "with_socket_mut:udp",
+                )?;
+                Some(udp(udp_socket))
             }
             crate::net::Protocol::Icmp | crate::net::Protocol::Raw { protocol: _ } => {
                 unimplemented!()
@@ -975,6 +1070,278 @@ impl PlatformInteractionReinvocationAdvice {
     }
 }
 
+/// Whether [`try_get_socket`]/[`try_get_socket_mut`] must behave exactly as the unchecked
+/// `SocketSet::get`/`get_mut` they stand in for: `LITEBOX_SOCKET_TYPE_FALLIBLE_OFF=1` puts the
+/// panicking original back, so one binary can be run both ways over the same probe.
+///
+/// WHY a `static AtomicBool` written once by [`set_socket_type_fallible_off`] rather than
+/// `platform().env_flag(..)`, which is what every other `LITEBOX_*` flag in this file uses: these
+/// two helpers are also called from [`SocketHandle::with_socket`], and that one has no `LiteBox`
+/// in hand at all.
+///
+/// WHY the flag is SET BY THE RUNNER and not read here with `std::env::var_os`: `litebox` is
+/// `#![no_std]` (`litebox/src/lib.rs:13`), and an `extern crate std` in this crate is a hard
+/// dependency on a std sysroot -- CI builds each of these crates for `x86_64-unknown-none`
+/// (`.github/workflows/ci.yml`) and `litebox_runner_lvbs` for a custom `x86_64_vtl1.json` with
+/// `build-std = ["core", "compiler_builtins", "alloc"]`, neither of which has one. The runner is a
+/// std binary and already forwards `LITEBOX_NO_MAPPING_GUARD_GAP` exactly this way, through
+/// `litebox::mm::linux::set_mapping_guard_gap_disabled`.
+static SOCKET_TYPE_FALLIBLE_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Turns the fallible, type-checked socket accessors back into the panicking originals. Written
+/// once by the runner from `LITEBOX_SOCKET_TYPE_FALLIBLE_OFF`, before any socket exists.
+pub fn set_socket_type_fallible_off(off: bool) {
+    SOCKET_TYPE_FALLIBLE_OFF.store(off, Ordering::Relaxed);
+}
+
+fn socket_type_fallible_off() -> bool {
+    SOCKET_TYPE_FALLIBLE_OFF.load(Ordering::Relaxed)
+}
+
+/// Whether a handle's stamped generation must be ignored, so a bare slot index is accepted again:
+/// `LITEBOX_SOCKET_GEN_OFF=1` restores today's behaviour, where slot N being occupied is the whole
+/// of identity. Same shape as [`SOCKET_TYPE_FALLIBLE_OFF`] for the same reason.
+static SOCKET_GENERATION_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Makes every generation check pass. Written once by the runner from `LITEBOX_SOCKET_GEN_OFF`.
+pub fn set_socket_generation_off(off: bool) {
+    SOCKET_GENERATION_OFF.store(off, Ordering::Relaxed);
+}
+
+fn socket_generation_off() -> bool {
+    SOCKET_GENERATION_OFF.load(Ordering::Relaxed)
+}
+
+/// The generation [`Network::slot_generations`] currently records for `handle`: how many times the
+/// slot this handle names has been vacated. `None` when the table has no row for it at all.
+///
+/// Found by HANDLE EQUALITY, never by index -- see [`SlotGenerationRow`].
+fn slot_generation(
+    slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
+    handle: smoltcp::iface::SocketHandle,
+) -> Option<u32> {
+    for row in slot_generations.iter() {
+        if let Some((marked, generation)) = *row {
+            if marked == handle {
+                return Some(generation);
+            }
+        }
+    }
+    None
+}
+
+/// Records `handle` in the shared generation table and answers the generation to stamp on it.
+///
+/// Called once, immediately after every `socket_set.add`, which is what gives a freshly minted
+/// handle an identity to compare on every later access. A handle already in the table keeps its
+/// row and gets that row's CURRENT generation back: `SocketSet::add` hands out
+/// `SocketHandle(slot_index)` and reuses a freed slot, so a re-used slot yields an EQUAL handle
+/// whose generation [`bump_slot_generation`] has already moved on -- the new socket is therefore
+/// stamped with a generation no older handle can match, which is exactly the ABA the stamp exists
+/// to catch, and which no type check can see when the re-use is by a socket of the same type.
+fn mint_slot_generation(
+    slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
+    handle: smoltcp::iface::SocketHandle,
+) -> u32 {
+    for row in slot_generations.iter_mut() {
+        if let Some((marked, generation)) = *row {
+            if marked == handle {
+                return generation;
+            }
+        }
+    }
+    // Not in the table yet: this slot has never been vacated in this run, so it starts at 1 --
+    // NOT 0, so that "no row" (which [`slot_generation`] reports as `None`, never `Some(0)`) can
+    // never be mistaken for a real generation.
+    for row in slot_generations.iter_mut() {
+        if row.is_none() {
+            *row = Some((handle, 1));
+            return 1;
+        }
+    }
+    // Unreachable: `add` only ever hands out `MAX_SOCKETS` distinct handle values, and rows are
+    // never removed, so the table cannot fill. 0 is returned rather than panicking on a
+    // guest-reachable path; no row means every generation check on this handle fails closed.
+    0
+}
+
+/// Retires `handle`'s identity: every handle minted for the socket that used to occupy this slot --
+/// in this process's descriptor table and in every other process of the fork family -- stops
+/// matching from here on, so the next typed access reports a stale handle instead of reading (or
+/// releasing the buffers of) whatever socket reuses the slot next.
+///
+/// Called from [`Network::remove_socket`] BEFORE `SocketSet::remove`, while the socket is still
+/// there, so a concurrent observer never sees a slot whose generation has not moved yet.
+fn bump_slot_generation(
+    slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
+    handle: smoltcp::iface::SocketHandle,
+) {
+    for row in slot_generations.iter_mut() {
+        if let Some((marked, generation)) = row.as_mut() {
+            if *marked == handle {
+                *generation = generation.wrapping_add(1);
+                return;
+            }
+        }
+    }
+    // No row: this socket was never minted through `Network` (a listening socket a port's backlog
+    // armed, for instance). Give it one, so the NEXT socket to land on this slot is stamped with a
+    // generation the backlog's own bare handle cannot match.
+    for row in slot_generations.iter_mut() {
+        if row.is_none() {
+            *row = Some((handle, 1));
+            return;
+        }
+    }
+}
+
+/// The shared generation table plus the generation one handle was stamped with: what turns
+/// "slot N is occupied" into "slot N still holds the socket this handle was minted for".
+struct SlotIdentity<'a> {
+    slot_generations: &'a [SlotGenerationRow; MAX_SOCKETS],
+    stamped: u32,
+}
+
+impl SlotIdentity<'_> {
+    /// Whether `handle` still names the socket it named when `self.stamped` was recorded.
+    ///
+    /// A handle with NO row fails CLOSED. Rows are minted at every `socket_set.add` and are never
+    /// removed, and `add` can only ever hand out `MAX_SOCKETS` distinct handle values, so a handle
+    /// with no row is one this `Network` never minted a generation for. Closed is the right
+    /// direction for those too: "not live" makes every caller skip, and skipping never reads or
+    /// releases a socket that is not this handle's own.
+    fn matches(&self, handle: smoltcp::iface::SocketHandle) -> bool {
+        if socket_generation_off() {
+            return true;
+        }
+        slot_generation(self.slot_generations, handle) == Some(self.stamped)
+    }
+
+    /// The handle's generation NOW, for the log line -- `None` when it has no row.
+    fn current(&self, handle: smoltcp::iface::SocketHandle) -> Option<u32> {
+        slot_generation(self.slot_generations, handle)
+    }
+}
+
+/// Says, throttled, that a `smoltcp::iface::SocketHandle` no longer names a socket OF THE TYPE the
+/// caller asked for: the slot is empty, it was reused by a socket of another type, or -- the case
+/// only a generation stamp can see -- it was reused by a socket of the very same type.
+///
+/// WHY this exists: `smoltcp::iface::SocketSet::get::<T>` (0.12, `iface/socket_set.rs:98-105`) is
+/// `T::downcast(&item.socket).expect("handle refers to a socket of a wrong type")` -- it panics as
+/// soon as the slot is occupied by the wrong kind of socket, and `SocketHandle(usize)` carries NO
+/// generation counter, so a handle that outlives the socket it named (a per-process descriptor
+/// entry, a `closing_in_background` row, a `listen_queues` backlog slot, an `accepted_slots`
+/// claim) can still index a slot that now holds a UDP socket where a TCP one used to be.
+/// [`Network::socket_set_contains`] only answers "is this slot occupied", never "by the right
+/// type" and never "by the same one", so every such reuse panicked. A chromium desktop run measured
+/// 288,137 of these panics in 300 s -- one cluster per fork child -- alongside 288,128
+/// `reset_after_poisoning` recoveries, and each of those resets stales MORE handles, so the same
+/// panic re-fired every tick for the rest of the run. Throttled because this fires from per-tick
+/// sweeps as well as from syscalls. `site` is a fixed per-call-site tag so a run can be
+/// histogrammed by where the stale handle surfaced.
+fn warn_stale_socket_handle(
+    site: &'static str,
+    handle: smoltcp::iface::SocketHandle,
+    stamped: Option<u32>,
+    current: Option<u32>,
+) {
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // BOTH lines are throttled, not just the `warn!`: this fires from per-tick sweeps as well as
+    // from syscalls, so an unthrottled `debug!` here floods any `LITEBOX_LOG=debug` run the moment
+    // a generation bug makes every handle look stale (one 300 s chromium run measured 288,137 of
+    // these). Four up front to show a real cluster beginning, then one in 64 forever -- and the
+    // `warn!` rides the very same gate, so a run at `warn` sees the same cadence it always did.
+    if n >= 4 && n % 64 != 0 {
+        return;
+    }
+    litebox_util_log::debug!(
+        site:% = site,
+        handle:% = handle,
+        slot_gen = stamped.unwrap_or(0),
+        now = current.unwrap_or(0),
+        n = n;
+        "diag-socket-type: stale smoltcp handle (slot freed or reused by another socket type)"
+    );
+    litebox_util_log::warn!(
+        site:% = site,
+        handle:% = handle,
+        slot_gen = stamped.unwrap_or(0),
+        now = current.unwrap_or(0);
+        "diag-socket-type: stale smoltcp handle (slot freed or reused by another socket type)"
+    );
+}
+
+/// The socket `handle` names, when that slot is occupied by a socket of type `T` AND, where
+/// `identity` is given, by the same socket `identity` was stamped for.
+///
+/// A fallible, TYPE-CHECKED, generation-checked [`smoltcp::iface::SocketSet::get`]. `None` covers
+/// all three of the cases the original turns into panics -- the slot is empty (`"handle does not
+/// refer to a valid socket"`), the slot is occupied by a socket of ANOTHER type (`"handle refers to
+/// a socket of a wrong type"`), and the slot having been vacated and reused since, which neither of
+/// those two checks nor [`Network::socket_set_contains`] can see. Bounded by `MAX_SOCKETS` (256),
+/// so the scan is cheap.
+fn try_get_socket<'a, T: smoltcp::socket::AnySocket<'static>>(
+    socket_set: &'a smoltcp::iface::SocketSet<'static>,
+    handle: smoltcp::iface::SocketHandle,
+    identity: Option<SlotIdentity<'_>>,
+    site: &'static str,
+) -> Option<&'a T> {
+    if socket_type_fallible_off() {
+        // Today's behaviour exactly: whatever smoltcp's own `get` does, including both panics.
+        return Some(socket_set.get::<T>(handle));
+    }
+    let stamped = identity.as_ref().map(|it| it.stamped);
+    let current = identity.as_ref().and_then(|it| it.current(handle));
+    if identity.is_some_and(|identity| !identity.matches(handle)) {
+        warn_stale_socket_handle(site, handle, stamped, current);
+        return None;
+    }
+    let socket = socket_set.iter().find_map(|(candidate, socket)| {
+        if candidate == handle {
+            T::downcast(socket)
+        } else {
+            None
+        }
+    });
+    if socket.is_none() {
+        warn_stale_socket_handle(site, handle, stamped, current);
+    }
+    socket
+}
+
+/// The mutable counterpart of [`try_get_socket`]; `SocketSet::iter_mut` yields `(SocketHandle,
+/// &mut Socket)`, so the type check and the borrow come from the same walk.
+fn try_get_socket_mut<'a, T: smoltcp::socket::AnySocket<'static>>(
+    socket_set: &'a mut smoltcp::iface::SocketSet<'static>,
+    handle: smoltcp::iface::SocketHandle,
+    identity: Option<SlotIdentity<'_>>,
+    site: &'static str,
+) -> Option<&'a mut T> {
+    if socket_type_fallible_off() {
+        // Today's behaviour exactly: whatever smoltcp's own `get_mut` does, including both panics.
+        return Some(socket_set.get_mut::<T>(handle));
+    }
+    let stamped = identity.as_ref().map(|it| it.stamped);
+    let current = identity.as_ref().and_then(|it| it.current(handle));
+    if identity.is_some_and(|identity| !identity.matches(handle)) {
+        warn_stale_socket_handle(site, handle, stamped, current);
+        return None;
+    }
+    let socket = socket_set.iter_mut().find_map(|(candidate, socket)| {
+        if candidate == handle {
+            T::downcast_mut(socket)
+        } else {
+            None
+        }
+    });
+    if socket.is_none() {
+        warn_stale_socket_handle(site, handle, stamped, current);
+    }
+    socket
+}
+
 impl<Platform> Network<Platform>
 where
     Platform: platform::IPInterfaceProvider
@@ -1167,7 +1534,12 @@ where
             // `Network` again after this loop, and because it was never THIS process's allocation
             // to free in the first place: Windows itself reclaims it in bulk, for free, whenever
             // the process that actually owns that address space exits.
-            core::mem::forget(Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle));
+            core::mem::forget(Self::remove_socket(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut self.slot_generations,
+                handle,
+            ));
         }
         self.closing_in_background = [None; MAX_SOCKETS];
         // Every listening port's armed backlog slot was in the set just wiped, so every row's
@@ -1266,6 +1638,28 @@ where
             // to the gateway, so a poll here would lose the frames it transmits.
             return smoltcp::iface::PollResult::None;
         }
+        // A STALL HERE STALLS THE WHOLE SESSION, so measure it instead of inferring it. Every
+        // other process returned above; this process's `interface.poll` is the only thing that
+        // moves a packet into or out of ANY fork family, so whatever keeps this process off its
+        // tick turns a connect to an armed, idle, accepting port into a TIMEOUT instead of a
+        // refusal -- chrF37 answered in 80 ms on 39 of 40 host probes and timed out for the full
+        // 20 s on the 40th, with two 8 s timeouts to two other ports from inside the guest, and
+        // nothing in any log said why. The gap is the whole explanation, so it is logged whenever
+        // this process was away for a second or more.
+        static LAST_POLL_MS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+        let now_ms = self.now().millis();
+        let prev = LAST_POLL_MS.swap(now_ms, core::sync::atomic::Ordering::Relaxed);
+        if prev != 0 {
+            let gap_ms = now_ms.saturating_sub(prev);
+            if gap_ms >= 1000 {
+                litebox_util_log::warn!(
+                    gap_ms = gap_ms,
+                    uptime_ms = now_ms,
+                    owner_pid = self.litebox.platform().current_pid();
+                    "diag-poll-gap: the process that owns the IP interface went this long without polling it"
+                );
+            }
+        }
         self.interface
             .poll(self.now(), &mut self.device, &mut self.socket_set)
     }
@@ -1316,14 +1710,61 @@ where
     }
 
     /// Removes `handle` from the socket table and returns its buffer slots to the shared pools.
+    ///
+    /// The ONE choke point every free path already routes through, which is what makes it the right
+    /// place to retire the handle's identity: bumping `slot_generations` for the slot it vacates
+    /// leaves every handle minted for the socket that used to be there -- in this process's
+    /// descriptor table, and in every other process of the fork family -- unmatchable, so the next
+    /// typed access reports EBADF instead of reading (or releasing the buffers of) whatever socket
+    /// reuses the slot next. Bumped BEFORE the removal, so an observer never sees a vacated slot
+    /// whose generation has not moved yet.
+    ///
+    /// Callers MUST have established that `handle` is still this caller's own socket (existence +
+    /// type, and a generation stamp where the caller has one). Passing a stale handle here does far
+    /// more than fail: `socket_set.remove` tears down ANOTHER process's socket and `buffers.release`
+    /// hands ANOTHER socket's buffer claims back to the shared pool, silently, with no log line.
     fn remove_socket(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
+        slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
         handle: smoltcp::iface::SocketHandle,
     ) -> smoltcp::socket::Socket<'static> {
+        bump_slot_generation(slot_generations, handle);
         let socket = socket_set.remove(handle);
         buffers.release(handle);
         socket
+    }
+
+    /// The generation to stamp on a handle minted for `handle` right now, after recording `handle`
+    /// in the shared generation table (see [`mint_slot_generation`], which this forwards to).
+    ///
+    /// Minting, not merely reading, is the whole point: the first socket ever placed in a slot has
+    /// no row yet, and a handle stamped `0` against a table with no row would never match again --
+    /// every later typed access on a perfectly good socket would report a stale handle. Rows start
+    /// at 1 so that "no row" can never be confused with a real generation.
+    fn mint_handle_generation(&mut self, handle: smoltcp::iface::SocketHandle) -> u32 {
+        mint_slot_generation(&mut self.slot_generations, handle)
+    }
+
+    /// Whether `handle` still names the socket `stamped` was minted for: existence AND generation,
+    /// never existence alone. Every guard that used to be [`Self::socket_set_contains`] and has a
+    /// stamped generation to compare should be this instead.
+    ///
+    /// Existence is still required on top of the generation: a row outlives the socket it was
+    /// created for (rows are never removed), so the generation alone would keep answering "live"
+    /// for a slot that is currently empty.
+    fn handle_is_live(
+        socket_set: &smoltcp::iface::SocketSet<'static>,
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
+        handle: smoltcp::iface::SocketHandle,
+        stamped: u32,
+    ) -> bool {
+        socket_set.iter().any(|(h, _)| h == handle)
+            && SlotIdentity {
+                slot_generations,
+                stamped,
+            }
+            .matches(handle)
     }
 
     /// Drops every backlog slot of one listening port that reached a terminal TCP state, returning
@@ -1339,6 +1780,7 @@ where
     fn reclaim_finished_backlog_slots(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
+        slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
         handles: &mut [Option<smoltcp::iface::SocketHandle>; MAX_BACKLOG_SLOTS],
     ) -> usize {
         let mut reclaimed = 0usize;
@@ -1350,7 +1792,22 @@ where
                 *slot = None;
                 continue;
             }
-            let socket: &tcp::Socket = socket_set.get(handle);
+            // A backlog slot's handle is a bare `smoltcp::iface::SocketHandle` in shared state with
+            // no generation stamped on it, so existence is all it can be checked against -- but the
+            // TYPE check is not optional: a slot reused by a UDP socket answers `contains` and would
+            // otherwise reach `socket.state()` as a panic. A stale slot is dropped here (the queue
+            // re-arms it), never reported to a guest: nothing has an fd for it yet.
+            //
+            // No buffer claims are released for a stale slot, deliberately, and it leaks nothing:
+            // `remove_socket` is this file's only socket-removal path and it always releases, so a
+            // socket that is gone was already released, while a slot still occupied belongs to its
+            // CURRENT socket -- whose claims `buffers.release` would hand back out from under it.
+            let Some(socket) =
+                try_get_socket::<tcp::Socket>(socket_set, handle, None, "reclaim_finished_backlog_slots")
+            else {
+                *slot = None;
+                continue;
+            };
             let terminal = matches!(
                 socket.state(),
                 tcp::State::Closed
@@ -1370,7 +1827,12 @@ where
             // `remove_socket` hands the socket back by value; it is dropped nowhere here, matching
             // `remove_dead_sockets` -- see that call's own comment on running a socket's destructor
             // from a process that did not create it.
-            core::mem::forget(Self::remove_socket(socket_set, buffers, handle));
+            core::mem::forget(Self::remove_socket(
+                socket_set,
+                buffers,
+                slot_generations,
+                handle,
+            ));
             *slot = None;
             reclaimed += 1;
         }
@@ -1509,12 +1971,36 @@ where
         queue.ref_pids = [0; MAX_QUEUE_REF_OWNERS];
         queue.no_slot_listening_reported = false;
         for handle in handles.into_iter().flatten() {
-            // Stale-handle guard: a dead-holder `reset_after_poisoning()` elsewhere may have wiped
-            // this slot out of the shared set already, and `SocketSet::remove` panics on a handle
-            // it no longer holds.
-            if Self::socket_set_contains(&self.socket_set, handle) {
-                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
+            // Existence is NOT enough here, and `remove_socket` is not a no-op on a wrong handle:
+            // `socket_set.remove` tears down whatever socket now occupies that slot and
+            // `buffers.release` hands THAT socket's buffer claims back to the shared pool, silently.
+            // A backlog handle carries no generation stamp (nothing has an fd for it yet), so the
+            // type check is the whole guard -- it is what separates "the port's own listening
+            // socket" from "a UDP socket that reused this slot".
+            //
+            // Skipping leaks nothing on purpose: `remove_socket` is the ONLY path in this file that
+            // both removes a socket and releases its buffer claims (grep `socket_set.remove`), so a
+            // socket that is already gone had its claims released by whoever removed it, and a
+            // socket still here owns claims belonging to the slot's CURRENT occupant, not to this
+            // handle. Releasing either would be a double release or a foreign release, so the only
+            // correct action is to drop this queue's reference to the handle -- which is happening
+            // either way: `queue.handles` was already replaced with `[None; MAX_BACKLOG_SLOTS]`.
+            if try_get_socket::<tcp::Socket>(
+                &self.socket_set,
+                handle,
+                None,
+                "retire_listen_queue",
+            )
+            .is_none()
+            {
+                continue;
             }
+            let _ = Self::remove_socket(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut self.slot_generations,
+                handle,
+            );
         }
     }
 
@@ -1533,10 +2019,34 @@ where
                 *slot = None;
                 continue;
             }
-            let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
+            // `closing_in_background` rows are bare `smoltcp::iface::SocketHandle`s in shared state,
+            // with no generation stamped on them, so existence is all they can be checked against --
+            // but the TYPE check is not optional: chrF47's 288,137 panics were exactly a slot reused
+            // by a UDP socket answering `socket_set_contains` and then being read as a TCP one. A
+            // stale row is dropped, never read.
+            //
+            // Dropping a stale row does NOT leak buffer claims: `remove_socket` is the only path in
+            // this file that both removes a socket and releases its claims, so a socket already gone
+            // was released by whoever removed it, and a socket still here owns claims belonging to
+            // the slot's CURRENT occupant. Calling `remove_socket` on this handle would be a foreign
+            // release (and would tear down another process's socket), so it is skipped deliberately.
+            let Some(tcp_socket) = try_get_socket::<tcp::Socket>(
+                &self.socket_set,
+                handle,
+                None,
+                "remove_dead_sockets",
+            ) else {
+                *slot = None;
+                continue;
+            };
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
-                core::mem::forget(Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle));
+                core::mem::forget(Self::remove_socket(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut self.slot_generations,
+                handle,
+            ));
                 *slot = None;
             }
         }
@@ -1553,7 +2063,14 @@ where
         for (_, mut handle) in table.iter_mut_nowait::<Network<Platform>>() {
             let socket_handle = &mut handle.entry;
             if socket_handle.shutdown_wr_pending {
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
+                    // The socket this descriptor was minted for is gone, so there is no FIN left to
+                    // defer: drop the flag rather than leaving this descriptor pending forever.
                     socket_handle.shutdown_wr_pending = false;
                 } else if !socket_handle
                     .proxy
@@ -1562,6 +2079,7 @@ where
                 {
                     let sent_fin = socket_handle.with_socket_mut(
                         &mut self.socket_set,
+                        &self.slot_generations,
                         |tcp_socket| {
                             let has_pending_data =
                                 tcp_socket.may_send() && tcp_socket.send_queue() > 0;
@@ -1572,7 +2090,8 @@ where
                         },
                         |_| true,
                     );
-                    if sent_fin {
+                    // `None` = the socket went away mid-flush; the flag is moot either way.
+                    if sent_fin.unwrap_or(true) {
                         socket_handle.shutdown_wr_pending = false;
                     }
                 }
@@ -1583,8 +2102,15 @@ where
             {
                 // See `socket_set_contains`'s doc comment: a stale handle (this descriptor's own
                 // socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
-                // elsewhere) has nothing left to close.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                // elsewhere) has nothing left to close. Generation-checked, not merely
+                // existence-checked: the slot may since have been reused by a different socket, in
+                // which case closing it would tear down someone else's connection.
+                if !Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     socket_handle
                         .consider_closed
                         .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -1598,6 +2124,7 @@ where
 
                 let closed = socket_handle.with_socket_mut(
                     &mut self.socket_set,
+                    &self.slot_generations,
                     |tcp_socket| {
                         let has_pending_data = tcp_socket.may_send() && tcp_socket.send_queue() > 0;
                         if !has_pending_data {
@@ -1613,7 +2140,9 @@ where
                         !has_pending_data
                     },
                 );
-                if closed {
+                // `None` = the socket is gone; a closed flag for a socket that no longer exists is
+                // moot, so it is cleared rather than left to fire on every later tick.
+                if closed.unwrap_or(true) {
                     socket_handle
                         .consider_closed
                         .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -1644,35 +2173,52 @@ where
     /// These four take the array itself rather than `&self` because the one caller that matters,
     /// [`Self::accept`], holds a borrow of `self.litebox` (the descriptor table) across them; the
     /// array and `socket_set` are disjoint fields, so naming them keeps that borrow legal.
+    ///
+    /// The generation is recorded ALONGSIDE the handle (see [`AcceptedSlot`]): smoltcp reuses a
+    /// freed slot index, so the handle alone is not an identity. A mark is therefore minted
+    /// (`mint_slot_generation`), never merely read, so that the table is guaranteed to HAVE a row
+    /// for this handle -- a mark stamped with a generation no row can ever match would silently
+    /// stop suppressing anything, and the same connection could be handed out twice.
     fn mark_accepted_in(
-        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &mut [AcceptedSlot; MAX_SOCKETS],
+        slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
         handle: smoltcp::iface::SocketHandle,
     ) {
-        if Self::is_accepted_in(accepted_slots, handle) {
+        if Self::is_accepted_in(accepted_slots, slot_generations, handle) {
             return;
         }
+        let generation = mint_slot_generation(slot_generations, handle);
         if let Some(slot) = accepted_slots.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(handle);
+            *slot = Some((handle, generation));
         }
     }
 
     fn is_accepted_in(
-        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &[AcceptedSlot; MAX_SOCKETS],
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
         handle: smoltcp::iface::SocketHandle,
     ) -> bool {
-        accepted_slots
-            .iter()
-            .any(|marked| *marked == Some(handle))
+        let current = slot_generation(slot_generations, handle);
+        accepted_slots.iter().any(|marked| {
+            marked.is_some_and(|(marked_handle, generation)| {
+                marked_handle == handle && (socket_generation_off() || current == Some(generation))
+            })
+        })
     }
 
     /// Forgets the claim on `handle`, for a slot armed back into LISTEN: the same smoltcp slot
     /// index gets reused for the port's next connection, which must be claimable again.
+    ///
+    /// Keyed on the handle alone, deliberately: this is the only one of the four that is called for
+    /// a handle whose generation has ALREADY moved on (a connection that died and a slot re-armed),
+    /// and a claim that can no longer match is a claim that must go -- clearing is the safe
+    /// direction, and it can never suppress a connection that is actually pending.
     fn clear_accepted_in(
-        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &mut [AcceptedSlot; MAX_SOCKETS],
         handle: smoltcp::iface::SocketHandle,
     ) {
         for slot in accepted_slots.iter_mut() {
-            if *slot == Some(handle) {
+            if slot.is_some_and(|(marked_handle, _)| marked_handle == handle) {
                 *slot = None;
             }
         }
@@ -1689,7 +2235,8 @@ where
     /// left at all (see `Network::accept`).
     fn unclaimed_connection_on(
         socket_set: &smoltcp::iface::SocketSet<'static>,
-        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &[AcceptedSlot; MAX_SOCKETS],
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
         port: u16,
     ) -> Option<smoltcp::iface::SocketHandle> {
         socket_set.iter().find_map(|(handle, socket)| {
@@ -1703,7 +2250,7 @@ where
             let on_port = socket
                 .local_endpoint()
                 .is_some_and(|local| local.port == port);
-            let claimed = accepted_slots.iter().any(|marked| *marked == Some(handle));
+            let claimed = Self::is_accepted_in(accepted_slots, slot_generations, handle);
             (established && on_port && socket.remote_endpoint().is_some() && !claimed)
                 .then_some(handle)
         })
@@ -1721,13 +2268,14 @@ where
     fn take_ready_backlog_slot(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
-        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &mut [AcceptedSlot; MAX_SOCKETS],
+        slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
         queue: &mut ListenQueue,
     ) -> Option<smoltcp::iface::SocketHandle> {
         // A claim outlives the connection it marked only until the slot is armed back into LISTEN,
         // and smoltcp reuses a freed slot index, so claims are reaped before any scan -- otherwise
         // one stale mark strands the next connection that lands on that slot.
-        Self::reap_stale_claims_in(socket_set, accepted_slots);
+        Self::reap_stale_claims_in(socket_set, accepted_slots, slot_generations);
         let position = queue.handles.iter().position(|slot| {
             let Some(handle) = *slot else {
                 return false;
@@ -1736,9 +2284,12 @@ where
             // elsewhere may already have wiped this slot out of the shared socket set, and
             // smoltcp's `get` panics on a handle it no longer has ("handle does not refer to a
             // valid socket", live-caught killing a fork child's guest-execution thread outright --
-            // this was selkies' own `accept()` call).
-            Self::socket_set_contains(socket_set, handle) && {
-                let socket: &tcp::Socket = socket_set.get(handle);
+            // this was selkies' own `accept()` call). Existence is all a bare backlog handle can be
+            // checked against (no generation is stamped on it), but the TYPE check is not optional:
+            // a slot reused by a UDP socket answers `socket_set_contains` and was exactly what made
+            // `get` panic 288,137 times in one 300 s chromium run.
+            try_get_socket::<tcp::Socket>(socket_set, handle, None, "take_ready_backlog_slot")
+                .is_some_and(|socket| {
                 // Linux hands a connection out of the accept queue even once its peer's FIN has
                 // landed (`CloseWait`): the application gets the fd and learns the peer is gone by
                 // reading EOF. Requiring `Established` here stranded such a slot -- no later
@@ -1749,13 +2300,13 @@ where
                     socket.state(),
                     tcp::State::Established | tcp::State::CloseWait
                 )
-            }
+            })
             // A slot another process of this fork family already took is not pending here (see
             // `Network::accepted_slots`): parent and child accept from ONE queue.
-            && !Self::is_accepted_in(accepted_slots, handle)
+            && !Self::is_accepted_in(accepted_slots, slot_generations, handle)
         })?;
         let ready_handle = queue.handles[position].take()?;
-        Self::mark_accepted_in(accepted_slots, ready_handle);
+        Self::mark_accepted_in(accepted_slots, slot_generations, ready_handle);
         queue.refill(socket_set, buffers);
         Some(ready_handle)
     }
@@ -1765,13 +2316,23 @@ where
     /// port's next one, and smoltcp reuses a freed slot index, so the mark cannot simply stay.
     fn reap_stale_claims_in(
         socket_set: &smoltcp::iface::SocketSet<'static>,
-        accepted_slots: &mut [Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &mut [AcceptedSlot; MAX_SOCKETS],
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
     ) {
         let stale: alloc::vec::Vec<smoltcp::iface::SocketHandle> = accepted_slots
             .iter()
             .flatten()
             .copied()
-            .filter(|handle| {
+            .filter(|(handle, generation)| {
+                // A mark whose generation has MOVED ON names a connection that is gone however
+                // alive the slot looks: the slot was vacated and reused since. Reaped here rather
+                // than left for `is_accepted_in` to keep answering "not mine": a stale row is a row
+                // the table can never hand out again, and `MAX_SOCKETS` of them would stop `accept`
+                // from marking anything at all.
+                if !socket_generation_off() && slot_generation(slot_generations, *handle) != Some(*generation)
+                {
+                    return true;
+                }
                 !socket_set.iter().any(|(live, socket)| {
                     live == *handle
                         && matches!(socket, smoltcp::socket::Socket::Tcp(socket) if matches!(
@@ -1780,6 +2341,7 @@ where
                         ))
                 })
             })
+            .map(|(handle, _)| handle)
             .collect();
         for handle in stale {
             Self::clear_accepted_in(accepted_slots, handle);
@@ -1791,7 +2353,7 @@ where
         // Stale accept claims would suppress BOTH the readiness sweep below and `accept` itself
         // (see `Network::reap_stale_claims`), and this is the one place that runs for every
         // process on every tick whether or not anything is accepted.
-        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots);
+        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots, &self.slot_generations);
         // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
         // A table that stays unreadable tick after tick makes this whole sweep a no-op in one
         // process while every other process keeps going, which is indistinguishable in the log
@@ -1819,6 +2381,7 @@ where
             let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
             Self::drain_socket_channel_buffers(
                 &mut self.socket_set,
+                &self.slot_generations,
                 &entry.entry,
                 now,
                 shared_across_fork,
@@ -1857,7 +2420,11 @@ where
     fn reclaim_orphaned_listen_queues(&mut self) {
         let tick = self.reclaim_tick;
         self.reclaim_tick = self.reclaim_tick.wrapping_add(1);
-        if tick % 512 != 0 {
+        // Tick 0 is skipped: the counter starts there, so a bare `% 512 == 0` would audit every
+        // port's liveness on the very first tick, before anything was registered (chrF37: 8081 and
+        // 8082 were retired 0.167 s into a spawned process). The sweep runs on 512-tick multiples,
+        // which is the cadence `dev_tests` drives it with (`reclaim_tick = 512`).
+        if tick == 0 || tick % 512 != 0 {
             return;
         }
         let me = self.litebox.platform().current_pid();
@@ -1932,9 +2499,15 @@ where
                 listen_queues,
                 socket_set,
                 buffers,
+                slot_generations,
                 ..
             } = self;
-            Self::maintain_one_listening_queue(socket_set, buffers, &mut listen_queues[index]);
+            Self::maintain_one_listening_queue(
+                socket_set,
+                buffers,
+                slot_generations,
+                &mut listen_queues[index],
+            );
         }
         // WHICH ports this tick maintained. This is the instrument chrF10/chrF32 were missing: it
         // reads shared state, so it is the same in every process, and a port that drops out of it
@@ -1965,6 +2538,7 @@ where
     fn maintain_one_listening_queue(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
         buffers: &mut SocketBuffers,
+        slot_generations: &mut [SlotGenerationRow; MAX_SOCKETS],
         queue: &mut ListenQueue,
     ) {
         let port = queue.ip_listen_endpoint.port;
@@ -1980,7 +2554,8 @@ where
             }
         }
         let went_fully_dead = queue.live_handles() == 0 && handles_before > 0;
-        let reclaimed = Self::reclaim_finished_backlog_slots(socket_set, buffers, &mut queue.handles);
+        let reclaimed =
+            Self::reclaim_finished_backlog_slots(socket_set, buffers, slot_generations, &mut queue.handles);
         if reclaimed > 0 {
             static RECLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             if RECLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
@@ -1995,7 +2570,19 @@ where
         let mut pending = 0usize;
         let mut other = 0usize;
         for handle in queue.handles.iter().flatten() {
-            match socket_set.get::<tcp::Socket>(*handle).state() {
+            // A backlog slot's handle carries no stamped generation, so existence is all it can be
+            // checked against -- but the TYPE check is not optional: a slot reused by a UDP socket
+            // answers `socket_set_contains` and would then panic inside smoltcp's `get`. Skipped
+            // here means "not in `Listen`", which is a slot the refill below re-arms anyway.
+            let Some(socket) = try_get_socket::<tcp::Socket>(
+                socket_set,
+                *handle,
+                None,
+                "maintain_one_listening_queue",
+            ) else {
+                continue;
+            };
+            match socket.state() {
                 tcp::State::Listen => listening += 1,
                 // `CloseWait` is a connection whose peer already hung up: `accept` hands it out, so
                 // it is pending work for the application, not a slot stuck in limbo.
@@ -2086,11 +2673,12 @@ where
     /// whatever the per-tick rule below would leave in smoltcp.
     fn drain_socket_channel_buffers(
         socket_set: &mut smoltcp::iface::SocketSet<'static>,
+        slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
         socket_handle: &SocketHandle<Platform>,
         now: smoltcp::time::Instant,
         shared_across_fork: bool,
         pull_rx: bool,
-        accepted_slots: &[Option<smoltcp::iface::SocketHandle>; MAX_SOCKETS],
+        accepted_slots: &[AcceptedSlot; MAX_SOCKETS],
     ) {
         let proxy = match &socket_handle.proxy {
             Some(proxy) => proxy.as_ref(),
@@ -2108,12 +2696,30 @@ where
         // See `Network::socket_set_contains`'s doc comment: a stale handle (this descriptor's
         // own socket, wiped out from under it by a dead-holder `reset_after_poisoning()`
         // elsewhere) has nothing left to drain -- `socket_set.get_mut` would otherwise panic.
-        if !socket_set.iter().any(|(h, _)| h == socket_handle.handle) {
+        // Generation-checked, not existence-checked: chrF47's 288,137 panics were reached from
+        // exactly here, one cluster per fork child, because the slot had since been reused by a
+        // UDP socket, which answers "is this slot occupied" just as well as a TCP one does.
+        if !Self::handle_is_live(
+            socket_set,
+            slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
             return;
         }
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
-                let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
+                    socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "drain_socket_channel_buffers:tcp",
+                ) else {
+                    return;
+                };
 
                 while tcp_socket.can_send() {
                     let sent = proxy
@@ -2262,6 +2868,7 @@ where
                     let pending = Self::unclaimed_connection_on(
                         socket_set,
                         accepted_slots,
+                        slot_generations,
                         server_socket.ip_listen_endpoint.port,
                     )
                     .is_some();
@@ -2272,7 +2879,17 @@ where
                 }
             }
             (Protocol::Udp, NetworkProxy::Datagram(udp_proxy)) => {
-                let udp_socket = socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                let Some(udp_socket) = try_get_socket_mut::<udp::Socket>(
+                    socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "drain_socket_channel_buffers:udp",
+                ) else {
+                    return;
+                };
                 let remote_endpoint = socket_handle.udp().remote_endpoint;
 
                 while udp_socket.can_send() {
@@ -2349,6 +2966,7 @@ where
         let shared_across_fork = self.is_shared_across_fork(entry.entry.handle);
         Self::drain_socket_channel_buffers(
             &mut self.socket_set,
+            &self.slot_generations,
             &entry.entry,
             now,
             shared_across_fork,
@@ -2472,10 +3090,15 @@ where
             }
         };
 
+        // Read the slot's generation NOW that `add` has placed the socket: every later typed access
+        // compares this value against `Network::slot_generations`, so a slot vacated and reused
+        // since is reported as a stale handle instead of being read as whatever socket is there now.
+        let slot_gen = self.mint_handle_generation(handle);
         Ok(self.new_socket_fd_for(SocketHandle {
             consider_closed: core::sync::atomic::AtomicBool::new(false),
             shutdown_wr_pending: false,
             handle,
+            slot_gen,
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
@@ -2562,7 +3185,15 @@ where
         let descriptor_table = self.litebox.descriptor_table();
         let table_entry = descriptor_table.get_entry_mut(fd)?;
         let socket_handle = &table_entry.entry;
-        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+        // Generation-checked: a carry spec describes a socket that must still be the one this fd
+        // was minted for. Naming a reused slot instead would have the child adopt ANOTHER process's
+        // socket -- a wrong connection, silently, and one more referent on someone else's fd.
+        if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
             return None;
         }
         match socket_handle.protocol() {
@@ -2577,7 +3208,17 @@ where
                         backlog
                     ));
                 }
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                let Some(socket) = try_get_socket::<tcp::Socket>(
+                    &self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "fork_carry_spec:tcp",
+                ) else {
+                    return None;
+                };
                 // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
                 // so there is nothing a child could match it on -- and nothing to share yet either.
                 let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
@@ -2590,7 +3231,18 @@ where
                 ))
             }
             Protocol::Udp => {
-                let endpoint = self.socket_set.get::<udp::Socket>(socket_handle.handle).endpoint();
+                let Some(socket) = try_get_socket::<udp::Socket>(
+                    &self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "fork_carry_spec:udp",
+                ) else {
+                    return None;
+                };
+                let endpoint = socket.endpoint();
                 let remote = socket_handle.udp().remote_endpoint;
                 if endpoint.port == 0 && remote.is_none() {
                     // Never bound, never connected: the child can simply make its own.
@@ -2647,10 +3299,17 @@ where
                 // From here on this socket has TWO referents, in two processes, and only the one
                 // that reads it may take its RX (see `drain_socket_channel_buffers`).
                 self.mark_shared_across_fork(handle);
+                // The parent's socket, adopted by this child: stamp the slot's CURRENT generation,
+                // so the moment that slot is vacated and reused this referent stops being usable,
+                // instead of silently naming whatever socket takes its place -- another process's
+                // connection, whose bytes this child would then read and whose buffers it would
+                // release.
+                let slot_gen = self.mint_handle_generation(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle,
+                    slot_gen,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         // Deliberately `None`: the parent owns the port's refcount, and a token
                         // here would make this child's `close()` free a port the parent still
@@ -2721,10 +3380,13 @@ where
                         );
                     }
                 }
+                // Added above, so the slot's generation is this child's to stamp.
+                let slot_gen = self.mint_handle_generation(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle,
+                    slot_gen,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port: None,
                         server_socket: Some(TcpServerSpecific {
@@ -2763,10 +3425,17 @@ where
                 })?;
                 // Two referents in two processes from here on: see the TCP arm above.
                 self.mark_shared_across_fork(handle);
+                // The parent's socket, adopted by this child: stamp the slot's CURRENT generation,
+                // so the moment that slot is vacated and reused this referent stops being usable,
+                // instead of silently naming whatever socket takes its place -- another process's
+                // connection, whose bytes this child would then read and whose buffers it would
+                // release.
+                let slot_gen = self.mint_handle_generation(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle,
+                    slot_gen,
                     specific: ProtocolSpecific::Udp(UdpSpecific {
                         remote_endpoint: (rport != 0).then(|| smoltcp::wire::IpEndpoint {
                             addr: smoltcp::wire::IpAddress::Ipv4(u32_to_v4(rip)),
@@ -2787,10 +3456,13 @@ where
                 let (rx, tx, claim) = self.buffers.udp()?;
                 let handle = self.socket_set.add(udp::Socket::new(rx, tx));
                 self.buffers.adopt(handle, claim);
+                // Added above, so the slot's generation is this child's to stamp.
+                let slot_gen = self.mint_handle_generation(handle);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle,
+                    slot_gen,
                     specific: ProtocolSpecific::Udp(UdpSpecific {
                         remote_endpoint: None,
                     }),
@@ -2864,6 +3536,7 @@ where
                             .any(|marked| *marked == Some(handle));
                         Self::drain_socket_channel_buffers(
                             &mut self.socket_set,
+                            &self.slot_generations,
                             &entry.entry,
                             now,
                             shared_across_fork,
@@ -2890,11 +3563,17 @@ where
                 // twenty-eighth pass). Nothing is left to flush for a socket that's already
                 // gone, so this closes immediately, matching a real Linux double-close's
                 // benign-no-op spirit, instead of panicking on a guest-reachable path.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return true;
                 }
                 let queued = socket_handle.with_socket(
                     &self.socket_set,
+                    &self.slot_generations,
                     |tcp_socket| tcp_socket.may_send() && tcp_socket.send_queue() > 0,
                     |udp_socket| udp_socket.is_open() && udp_socket.send_queue() > 0,
                 );
@@ -2907,7 +3586,10 @@ where
                     // descriptor-independent state, so root finishes the exchange either way.
                     return true;
                 }
-                !queued
+                // A stale handle has no socket to flush and no bytes in flight (the guard above
+                // already returned for one), so "nothing queued" is the only honest answer and
+                // lets this `close()` finish instead of deferring forever on a socket that is gone.
+                !queued.unwrap_or(false)
             })
             .ok_or(CloseError::InvalidFd)?
         {
@@ -3019,6 +3701,7 @@ where
             consider_closed: _,
             shutdown_wr_pending: _,
             handle,
+            slot_gen,
             mut specific,
             proxy,
             borrowed,
@@ -3060,11 +3743,16 @@ where
             // adoption of a listening port cost a socket-table slot and two shared buffer claims
             // for the rest of the session, which a long desktop session cannot afford
             // (`MAX_SOCKETS` 256, `MAX_DATA_SLOTS` 512 -- see `report_exhausted_buffer_pool`).
-            if Self::socket_set_contains(&self.socket_set, handle) {
+            if Self::handle_is_live(&self.socket_set, &self.slot_generations, handle, slot_gen) {
                 // Dropped, not `mem::forget` like `remove_dead_sockets`: that one may be retiring a
                 // socket ANOTHER process created (whose `PacketBuffer` vecs live on that process's
                 // private heap), while this one was added by this very process.
-                let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
+                let _ = Self::remove_socket(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut self.slot_generations,
+                handle,
+            );
             }
             return;
         }
@@ -3080,23 +3768,42 @@ where
         // proxy state) is independent of `socket_set` and still runs exactly as before either
         // way -- only the smoltcp-side close/abort is skipped when there is nothing left to
         // close or abort.
-        let handle_is_live = Self::socket_set_contains(&self.socket_set, handle);
+        // Generation-checked, not merely existence-checked: closing a slot that has since been
+        // reused would abort ANOTHER process's live connection and push ITS handle onto
+        // `closing_in_background`, which is a corruption no log line reports.
+        let handle_is_live =
+            Self::handle_is_live(&self.socket_set, &self.slot_generations, handle, slot_gen);
         match specific.protocol() {
             Protocol::Raw { .. } | Protocol::Icmp => {
                 // There is no close/abort for raw and icmp sockets
                 if handle_is_live {
-                    let _ = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
+                    let _ = Self::remove_socket(
+                &mut self.socket_set,
+                &mut self.buffers,
+                &mut self.slot_generations,
+                handle,
+            );
                 }
             }
             Protocol::Udp => {
                 if handle_is_live {
-                    let smoltcp::socket::Socket::Udp(mut socket) = Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle)
-                    else {
-                        unreachable!()
-                    };
-                    self.local_port_allocator
-                        .deallocate_port(socket.endpoint().port);
-                    socket.close();
+                    // Same wrong-type panic as smoltcp's own `get` (`socket_set_contains` answers
+                    // "occupied", never "by the right type"), reached from a guest `close()`:
+                    // `unreachable!()` here used to abort the whole fork child. A slot holding the
+                    // wrong kind of socket is simply not closed here -- it is not this fd's socket.
+                    let removed = Self::remove_socket(
+                        &mut self.socket_set,
+                        &mut self.buffers,
+                        &mut self.slot_generations,
+                        handle,
+                    );
+                    if let smoltcp::socket::Socket::Udp(mut socket) = removed {
+                        self.local_port_allocator
+                            .deallocate_port(socket.endpoint().port);
+                        socket.close();
+                    } else {
+                        warn_stale_socket_handle("close_handle:udp", handle, Some(slot_gen), None);
+                    }
                 }
             }
             Protocol::Tcp => {
@@ -3108,22 +3815,58 @@ where
                     self.local_port_allocator.deallocate(local_port);
                 }
                 if handle_is_live {
-                    let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
-                    if tcp_specific.immediate_close.load(Ordering::Relaxed) {
-                        tcp_socket.abort();
-                    } else {
-                        tcp_socket.close();
+                    // `retired_later` rather than an `else` arm on the `if let` below: an `if let`
+                    // scrutinee's borrow lives across BOTH arms, so the `else` arm could not touch
+                    // `self.socket_set`/`self.slot_generations` again to free the slot (NLL problem
+                    // case #3). The flag lets the borrow die at the end of the statement instead.
+                    let mut retired_later = false;
+                    if let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
+                        &mut self.socket_set,
+                        handle,
+                        Some(SlotIdentity {
+                            slot_generations: &self.slot_generations,
+                            stamped: slot_gen,
+                        }),
+                        "close_handle:tcp",
+                    ) {
+                        if tcp_specific.immediate_close.load(Ordering::Relaxed) {
+                            tcp_socket.abort();
+                        } else {
+                            tcp_socket.close();
+                        }
+                        let slot = self
+                            .closing_in_background
+                            .iter_mut()
+                            .find(|slot| slot.is_none())
+                            .expect(
+                                "closing_in_background has MAX_SOCKETS slots, one per possible live \
+                                 socket_set entry -- a socket being closed here always currently \
+                                 occupies one, so a free slot always exists",
+                            );
+                        *slot = Some(handle);
+                        retired_later = true;
                     }
-                    let slot = self
-                        .closing_in_background
-                        .iter_mut()
-                        .find(|slot| slot.is_none())
-                        .expect(
-                            "closing_in_background has MAX_SOCKETS slots, one per possible live \
-                             socket_set entry -- a socket being closed here always currently \
-                             occupies one, so a free slot always exists",
-                        );
-                    *slot = Some(handle);
+                    if !retired_later {
+                        // Nothing was closed and nothing was queued, so without this the slot would
+                        // leak for the rest of the session: `closing_in_background` is the ONLY
+                        // thing that later retires a TCP slot (`remove_dead_sockets`), and nothing
+                        // elsewhere in this file frees a slot on its own. MAX_SOCKETS is 256, so
+                        // even a rare leak here ends the run (`TooManySockets` = EMFILE).
+                        //
+                        // `remove_socket` is safe on this handle precisely because `handle_is_live`
+                        // above proved the slot still holds THIS descriptor's own socket -- so this
+                        // tears down nobody else's connection and releases nobody else's claims.
+                        // Forgotten, not dropped, for the same reason `remove_dead_sockets` forgets:
+                        // the socket's ring buffers may have been allocated by another process of
+                        // the fork family (`fork_adopt`), and dropping those frees a foreign heap.
+                        warn_stale_socket_handle("close_handle:tcp", handle, Some(slot_gen), None);
+                        core::mem::forget(Self::remove_socket(
+                            &mut self.socket_set,
+                            &mut self.buffers,
+                            &mut self.slot_generations,
+                            handle,
+                        ));
+                    }
                 }
             }
         }
@@ -3186,10 +3929,27 @@ where
                 // `reset_after_poisoning()` elsewhere may have wiped this handle out of
                 // `socket_set` already -- report it the same way a genuinely closed/reset socket
                 // would read, instead of panicking deep in smoltcp's own `get_mut`.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                // Generation-checked now, not existence-checked: a slot reused since this fd was
+                // minted must not be `connect()`ed -- that would dial on ANOTHER process's socket.
+                if !Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(ConnectError::InvalidState);
                 }
-                let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let Some(socket) = try_get_socket_mut::<tcp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "connect:tcp",
+                ) else {
+                    return Err(ConnectError::InvalidState);
+                };
                 if check_progress {
                     check_state(socket.state())
                 } else {
@@ -3222,10 +3982,25 @@ where
                     return Err(ConnectError::Unaddressable);
                 }
                 // Stale-handle guard -- see the identical TCP-branch guard above.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(ConnectError::InvalidState);
                 }
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let Some(socket) = try_get_socket_mut::<udp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "connect:udp",
+                ) else {
+                    return Err(ConnectError::InvalidState);
+                };
                 if !socket.is_open() {
                     let local_port = self.local_port_allocator.ephemeral_port()?;
                     let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
@@ -3293,7 +4068,12 @@ where
         // already. Reported the same way an unbound socket already is below (`Ipv4Addr::
         // UNSPECIFIED`, port 0) rather than panicking deep in smoltcp's own `get` -- a stale
         // handle genuinely has no address to report, same as a never-bound one.
-        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+        if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
             return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
         }
         match socket_handle.protocol() {
@@ -3310,7 +4090,19 @@ where
                     };
                     return Ok(SocketAddr::V4(SocketAddrV4::new(ip, endpoint.port)));
                 }
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                let Some(socket) = try_get_socket::<tcp::Socket>(
+                    &self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "get_local_addr:tcp",
+                ) else {
+                    // The socket this fd named is gone: `getsockname` has nothing to report, and
+                    // 0.0.0.0:0 is what a never-bound socket reports anyway.
+                    return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                };
                 match socket.local_endpoint() {
                     Some(endpoint) => match endpoint.addr {
                         smoltcp::wire::IpAddress::Ipv4(ipv4) => {
@@ -3343,7 +4135,17 @@ where
                 }
             }
             Protocol::Udp => {
-                let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
+                let Some(socket) = try_get_socket::<udp::Socket>(
+                    &self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "get_local_addr:udp",
+                ) else {
+                    return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
+                };
                 let local_endpoint = socket.endpoint();
                 match local_endpoint.addr {
                     Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => {
@@ -3385,15 +4187,26 @@ where
         // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported the same
         // way a real "never connected" TCP socket already is, rather than panicking deep in
         // smoltcp's own `get`.
-        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+        if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
             return Err(RemoteAddrError::NotConnected);
         }
         let endpoint = match socket_handle.protocol() {
-            Protocol::Tcp => self
-                .socket_set
-                .get::<tcp::Socket>(socket_handle.handle)
-                .remote_endpoint()
-                .ok_or(RemoteAddrError::NotConnected)?,
+            Protocol::Tcp => try_get_socket::<tcp::Socket>(
+                &self.socket_set,
+                socket_handle.handle,
+                Some(SlotIdentity {
+                    slot_generations: &self.slot_generations,
+                    stamped: socket_handle.slot_gen,
+                }),
+                "get_remote_addr:tcp",
+            )
+            .and_then(|socket| socket.remote_endpoint())
+            .ok_or(RemoteAddrError::NotConnected)?,
             Protocol::Udp => socket_handle
                 .udp()
                 .remote_endpoint
@@ -3482,11 +4295,29 @@ where
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- treated the
                 // same as an invalid fd (the handle no longer names anything real to bind)
                 // instead of panicking deep in smoltcp's own `get_mut`.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     self.local_port_allocator.deallocate(lp);
                     return Err(BindError::InvalidFd);
                 }
-                let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let Some(socket) = try_get_socket_mut::<udp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "bind:udp",
+                ) else {
+                    // Same shape as the guard above it: the port is given back and the guest is
+                    // told its fd is not valid any more, rather than binding another socket.
+                    self.local_port_allocator.deallocate(lp);
+                    return Err(BindError::InvalidFd);
+                };
                 if let Err(e) = socket.bind(local_endpoint) {
                     self.local_port_allocator.deallocate(lp);
                     return Err(match e {
@@ -3543,7 +4374,12 @@ where
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment): nothing left
                 // to send a FIN on, so this is a harmless no-op instead of panicking deep in
                 // smoltcp's own `get_mut`.
-                if Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if Self::handle_is_live(
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     // Mark the write side shut down and let the drain step send the FIN once the
                     // bytes still queued in the TX buffer have gone out; `close()` here (smoltcp's
                     // *send a FIN* operation, NOT a teardown: the socket stays in the set and the
@@ -3557,6 +4393,7 @@ where
                         let shared_across_fork = self.is_shared_across_fork(socket_handle.handle);
                         Self::drain_socket_channel_buffers(
                             &mut self.socket_set,
+                            &self.slot_generations,
                             socket_handle,
                             now,
                             shared_across_fork,
@@ -3568,8 +4405,19 @@ where
                             .proxy
                             .as_ref()
                             .is_some_and(|proxy| proxy.has_pending_tx());
-                        let tcp_socket: &mut tcp::Socket =
-                            self.socket_set.get_mut(socket_handle.handle);
+                        let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
+                            &mut self.socket_set,
+                            socket_handle.handle,
+                            Some(SlotIdentity {
+                                slot_generations: &self.slot_generations,
+                                stamped: socket_handle.slot_gen,
+                            }),
+                            "shutdown:tcp",
+                        ) else {
+                            // Nothing left to close: `SHUT_WR` on a socket that is gone is a no-op,
+                            // never a panic and never another socket's FIN.
+                            return Ok(());
+                        };
                         if pending_in_channel
                             || (tcp_socket.may_send() && tcp_socket.send_queue() > 0)
                         {
@@ -3732,12 +4580,14 @@ where
                             socket_set,
                             buffers,
                             accepted_slots,
+                            slot_generations,
                             ..
                         } = self;
                         Self::take_ready_backlog_slot(
                             socket_set,
                             buffers,
                             accepted_slots,
+                            slot_generations,
                             &mut listen_queues[index],
                         )
                     }
@@ -3747,6 +4597,7 @@ where
                     None => Self::unclaimed_connection_on(
                         &self.socket_set,
                         &self.accepted_slots,
+                        &self.slot_generations,
                         port,
                     ),
                 };
@@ -3767,10 +4618,15 @@ where
                     .map(|lp| self.local_port_allocator.allocate_same_local_port(lp));
                 drop(table_entry);
                 drop(descriptor_table);
+                // `ready_handle` was minted by the accept queue, not by `SocketHandle`, so it
+                // carries no generation of its own; read the slot's current one now, before
+                // anything can vacate it.
+                let slot_gen = self.mint_handle_generation(ready_handle);
                 let handle = SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
                     handle: ready_handle,
+                    slot_gen,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
                         server_socket: None,
@@ -3826,13 +4682,28 @@ where
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
                 // the same way smoltcp's own `tcp::SendError::InvalidState` already is just
                 // below, rather than panicking deep in its `get_mut`.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(SendError::SocketInInvalidState);
                 }
-                self.socket_set
-                    .get_mut::<tcp::Socket>(socket_handle.handle)
-                    .send_slice(buf)
-                    .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
+                try_get_socket_mut::<tcp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "send:tcp",
+                )
+                // Writing into ANOTHER process's socket would be worse than failing, so a stale
+                // handle reads exactly like the closed-socket case smoltcp itself reports.
+                .ok_or(SendError::SocketInInvalidState)?
+                .send_slice(buf)
+                .map_err(|tcp::SendError::InvalidState| SendError::SocketInInvalidState)
             }
             Protocol::Udp => {
                 let destination = destination
@@ -3844,10 +4715,25 @@ where
                 let Some(remote_endpoint) = destination else {
                     return Err(SendError::DestinationAddressRequired);
                 };
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(SendError::SocketInInvalidState);
                 }
-                let udp_socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                let Some(udp_socket) = try_get_socket_mut::<udp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "send:udp",
+                ) else {
+                    return Err(SendError::SocketInInvalidState);
+                };
                 if !udp_socket.is_open() {
                     let local_port = self
                         .local_port_allocator
@@ -3917,10 +4803,27 @@ where
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported
                 // the same way smoltcp's own `tcp::RecvError::InvalidState` already is just
                 // below, rather than panicking deep in its `get_mut`.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(ReceiveError::SocketInInvalidState);
                 }
-                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "receive:tcp",
+                ) else {
+                    // Reading ANOTHER process's socket would hand its bytes to the wrong fd, so a
+                    // stale handle is reported exactly like a socket in an invalid state.
+                    return Err(ReceiveError::SocketInInvalidState);
+                };
                 if flags.contains(ReceiveFlags::TRUNC) {
                     unimplemented!("TRUNC flag for tcp");
                 }
@@ -3945,10 +4848,25 @@ where
             }
             Protocol::Udp => {
                 // Stale-handle guard -- see the identical TCP-branch guard above.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(ReceiveError::SocketInInvalidState);
                 }
-                let udp_socket = self.socket_set.get_mut::<udp::Socket>(socket_handle.handle);
+                let Some(udp_socket) = try_get_socket_mut::<udp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "receive:udp",
+                ) else {
+                    return Err(ReceiveError::SocketInInvalidState);
+                };
                 match udp_socket.recv() {
                     Ok((data, meta)) => {
                         if let Some(source_addr) = source_addr {
@@ -4004,10 +4922,25 @@ where
                 // Stale-handle guard (see `socket_set_contains`'s own doc comment) -- reported as
                 // an invalid fd (the handle no longer names anything real) instead of panicking
                 // deep in smoltcp's own `get_mut`.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(errors::SetTcpOptionError::InvalidFd);
                 }
-                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
+                    &mut self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "set_tcp_option",
+                ) else {
+                    return Err(errors::SetTcpOptionError::InvalidFd);
+                };
                 match data {
                     TcpOptionData::NODELAY(nodelay) => {
                         tcp_socket.set_nagle_enabled(!nodelay);
@@ -4042,10 +4975,25 @@ where
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 // Stale-handle guard -- see the identical guard in `set_tcp_option` above.
-                if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
+                if !Self::handle_is_live(
+            &self.socket_set,
+            &self.slot_generations,
+            socket_handle.handle,
+            socket_handle.slot_gen,
+        ) {
                     return Err(errors::GetTcpOptionError::InvalidFd);
                 }
-                let tcp_socket = self.socket_set.get::<tcp::Socket>(socket_handle.handle);
+                let Some(tcp_socket) = try_get_socket::<tcp::Socket>(
+                    &self.socket_set,
+                    socket_handle.handle,
+                    Some(SlotIdentity {
+                        slot_generations: &self.slot_generations,
+                        stamped: socket_handle.slot_gen,
+                    }),
+                    "get_tcp_option",
+                ) else {
+                    return Err(errors::GetTcpOptionError::InvalidFd);
+                };
                 match name {
                     TcpOptionName::NODELAY => {
                         Ok(TcpOptionData::NODELAY(!tcp_socket.nagle_enabled()))

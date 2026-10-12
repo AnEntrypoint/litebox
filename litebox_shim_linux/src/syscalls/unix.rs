@@ -1049,8 +1049,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
                     "unix socket: SCM_RIGHTS over a cross-process connection carries only regular \
                      files, pty slaves, eventfds, shm/memfd snapshots and unix sockets that \
                      `UnixSocket::fork_carry` can describe (a connected endpoint, an unbound or \
-                     bound-but-unconnected socket, or a listener); a connect in progress and a \
-                     bound or connected DATAGRAM socket are refused -- refusing the send with \
+                     bound-but-unconnected socket, a bound or connected datagram socket, or a \
+                     listener); a connect in progress is refused -- refusing the send with \
                      EOPNOTSUPP rather than dropping the fds"
                 );
                 return Err((msg, Errno::EOPNOTSUPP));
@@ -2794,6 +2794,42 @@ type BoundDatagramAddr<Platform, FS> = (
     u32,
 );
 
+/// A datagram socket's transport once it has been promoted for a cross-process fork: `link` names
+/// the [`SharedUnixConnTable`] slot and is SHARED with the other end of a `socketpair(2)` pair, so
+/// both ends switch from their local channels to the slot together. A lone socket owns its link
+/// alone. The slot is always record-framed -- one ring record per datagram -- which is exactly
+/// datagram semantics (`SharedConnSlot::framed`).
+struct DatagramSlot<Platform: ShimPlatform, FS: ShimFS> {
+    link: Arc<ConnLink<Platform, FS>>,
+    /// This socket's side of the slot: `true` reads `server_to_client` and writes
+    /// `client_to_server`.
+    is_client: bool,
+    /// The peer name `getpeername` reports once the local `connected_send_channel` is no longer
+    /// the transport.
+    peer: UnixSocketAddr,
+    /// Whether the peer end shares this `link` and lives in THIS host process -- only a
+    /// `socketpair(2)` peer does. Promotion counts a holder for the peer side only then: a named
+    /// peer is reached through the per-process address table, which no other process can see, so a
+    /// hold taken on its behalf would never be released.
+    peer_here: bool,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> DatagramSlot<Platform, FS> {
+    /// This socket's end of the slot, once the pair has actually been promoted (`ConnLink::slot`
+    /// set); `None` while it is still `u32::MAX`.
+    fn view(&self) -> Option<SharedView<'_, Platform, FS>> {
+        let slot = self.link.slot.load(Ordering::Acquire);
+        if slot == u32::MAX {
+            return None;
+        }
+        Some(SharedView {
+            global: self.link.global.get()?,
+            slot,
+            is_client: self.is_client,
+        })
+    }
+}
+
 struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     /// The local address this socket is bound to, if any.
     addr: Option<BoundDatagramAddr<Platform, FS>>,
@@ -2811,6 +2847,9 @@ struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     /// a stream, a datagram socket has no single peer to fall back on, so nothing is reported
     /// until something is actually received -- which is also all Linux can do.
     last_sender: Option<Ucred>,
+    /// Set for a `socketpair(2)` end and for a socket rebuilt from a `G` carry spec; `None` for a
+    /// socket nothing has asked to carry yet.
+    slot: Option<DatagramSlot<Platform, FS>>,
 }
 /// Represents a Unix datagram socket.
 struct UnixDatagram<Platform: ShimPlatform, FS: ShimFS> {
@@ -2819,6 +2858,11 @@ struct UnixDatagram<Platform: ShimPlatform, FS: ShimFS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixDatagramInner<Platform, FS> {
     fn drop(&mut self) {
+        if let Some(carried) = &self.slot
+            && let Some(view) = carried.view()
+        {
+            view.release_holder();
+        }
         if let Some((addr, global, owner_pid)) = self.addr.take() {
             let key = addr.to_key();
             let mut table = global.unix_addr_table.write();
@@ -2848,6 +2892,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
         }
 
         let bound_addr = addr.bind(task, true)?;
+        self.attach(task, bound_addr);
+        Ok(())
+    }
+
+    /// Registers an ALREADY-bound name on this socket: opens this socket's own receive channel and
+    /// puts it in this process's address table so senders here can reach it. Shared by `bind`
+    /// (which creates the name) and by a carried datagram's rebuild (which only re-opens it).
+    fn attach(&mut self, task: &Task<Platform, FS>, bound_addr: UnixBoundSocketAddr<FS>) {
         let key = bound_addr.to_key();
         let owner_pid = task.pid.get() as u32;
         let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
@@ -2868,7 +2920,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
             recv_channel.shutdown();
         }
         self.recv_channel = Some(recv_channel);
-        Ok(())
     }
 
     fn shutdown(&mut self, how: ShutdownHow) {
@@ -2884,6 +2935,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
             self.write_shutdown = true;
             if let Some((connected_send_channel, _)) = &self.connected_send_channel {
                 connected_send_channel.shutdown();
+            }
+            if let Some(view) = self.slot.as_ref().and_then(|carried| carried.view()) {
+                let (_, write_ring) = view.rings();
+                if !write_ring.is_shutdown() {
+                    write_ring.shutdown();
+                    view.poke_peer();
+                }
             }
             events |= Events::OUT | Events::HUP;
         }
@@ -2911,6 +2969,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                 write_shutdown: false,
                 pollee: Arc::new(Pollee::new()),
                 last_sender: None,
+                slot: None,
             }),
         }
     }
@@ -2922,6 +2981,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
         let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
+        // Both ends share one link, so promoting either for a fork moves BOTH off their local
+        // channels onto the same slot -- the only way a fork child's end can still exchange
+        // datagrams with the end its parent kept.
+        let link = Arc::new(ConnLink::new());
         (
             // Cross-wire: each socket keeps the other side's send channel.
             UnixDatagram {
@@ -2933,6 +2996,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     write_shutdown: false,
                     pollee: pollee1,
                     last_sender: None,
+                    slot: Some(DatagramSlot {
+                        link: link.clone(),
+                        is_client: true,
+                        peer: UnixSocketAddr::Unnamed,
+                        peer_here: true,
+                    }),
                 }),
             },
             UnixDatagram {
@@ -2944,9 +3013,210 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     write_shutdown: false,
                     pollee: pollee2,
                     last_sender: None,
+                    slot: Some(DatagramSlot {
+                        link,
+                        is_client: false,
+                        peer: UnixSocketAddr::Unnamed,
+                        peer_here: true,
+                    }),
                 }),
             },
         )
+    }
+
+    /// Whether this socket holds nothing a fork child could lose -- no bound name, no receive
+    /// queue, no connected peer -- and so still travels as the featureless `D` spec.
+    fn is_plain(&self) -> bool {
+        let inner = self.inner.read();
+        inner.addr.is_none()
+            && inner.recv_channel.is_none()
+            && inner.connected_send_channel.is_none()
+    }
+
+    /// Rebuilds, in a fork child, the socket a parent's `G` spec described: one end of the slot
+    /// the parent promoted its pair onto, plus the name the parent had bound, re-opened here
+    /// rather than created.
+    fn new_shared(
+        task: &Task<Platform, FS>,
+        slot: u32,
+        is_client: bool,
+        local_addr: UnixSocketAddr,
+        peer_addr: UnixSocketAddr,
+    ) -> Self {
+        let link = Arc::new(ConnLink::new());
+        link.slot.store(slot, Ordering::Release);
+        let _ = link.global.set(alloc::boxed::Box::new(task.global.clone()));
+        SharedView {
+            global: &task.global,
+            slot,
+            is_client,
+        }
+        .hold();
+        let mut inner = UnixDatagramInner {
+            addr: None,
+            recv_channel: None,
+            connected_send_channel: None,
+            read_shutdown: false,
+            write_shutdown: false,
+            pollee: Arc::new(Pollee::new()),
+            last_sender: None,
+            slot: Some(DatagramSlot {
+                link,
+                is_client,
+                peer: peer_addr,
+                peer_here: false,
+            }),
+        };
+        if !local_addr.is_unnamed() {
+            match local_addr.bind(task, false) {
+                Ok(bound) => inner.attach(task, bound),
+                Err(err) => litebox_util_log::warn!(
+                    err:? = err;
+                    "carried unix datagram socket: could not open its socket file; rebuilding it \
+                     unnamed"
+                ),
+            }
+        }
+        Self {
+            inner: RwLock::new(inner),
+        }
+    }
+
+    /// Rebuilds the socket a `G` spec's remaining fields (`slot,is_client,host,local,peer`)
+    /// describe, and releases the holder the parent counted for this process on adoption.
+    fn from_fork_spec_g(
+        task: &Task<Platform, FS>,
+        fields: &mut core::str::Split<'_, char>,
+    ) -> Option<Self> {
+        let slot: u32 = fields.next()?.parse().ok()?;
+        let is_client = fields.next()? == "1";
+        let parent_host: u32 = fields.next()?.parse().ok()?;
+        let local_addr = decode_unix_addr(fields.next()?)?;
+        let peer_addr = decode_unix_addr(fields.next()?)?;
+        if slot as usize >= SHARED_UNIX_CONN_CAPACITY {
+            return None;
+        }
+        let datagram = Self::new_shared(task, slot, is_client, local_addr, peer_addr);
+        // The holder the parent counted for this child now lives here. A spawned child's spec
+        // names no parent pid (`fork_carry` writes 0 there) because the hold was moved onto the
+        // child's own pid the moment the child existed.
+        let release_host = if parent_host == 0 {
+            task.global.platform.current_host_pid()
+        } else {
+            parent_host
+        };
+        task.global
+            .unix_shared_conn_table
+            .get(slot)
+            .release(is_client, release_host);
+        Some(datagram)
+    }
+
+    /// Moves this datagram socket onto a [`SharedUnixConnTable`] slot so a cross-process fork child
+    /// can hold this end too, and returns `(slot, is_client)`.
+    ///
+    /// The first promotion allocates the slot, marks it record-framed (one ring record per
+    /// datagram), counts this end -- and, for a `socketpair(2)` peer in this same host process, the
+    /// peer's side -- as holders here, and drains this socket's queued messages into the ring so
+    /// the child's copy reads them too. Refused, so the caller keeps the fork on the thread-based
+    /// path, when more unread data is queued than the ring holds or the table is full.
+    fn promote_for_fork(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+        own_cred: Ucred,
+    ) -> Result<(u32, bool), &'static str> {
+        {
+            let mut inner = self.inner.write();
+            if inner.slot.is_none() {
+                let peer = inner
+                    .connected_send_channel
+                    .as_ref()
+                    .map_or(UnixSocketAddr::Unnamed, |(_, addr)| addr.clone());
+                inner.slot = Some(DatagramSlot {
+                    link: Arc::new(ConnLink::new()),
+                    is_client: true,
+                    peer,
+                    peer_here: false,
+                });
+            }
+        }
+        let inner = self.inner.read();
+        let Some(carried) = inner.slot.as_ref() else {
+            return Err("unix datagram socket has no shared slot");
+        };
+        let link = carried.link.clone();
+        let is_client = carried.is_client;
+        let peer_here = carried.peer_here;
+        let recv = inner.recv_channel.as_ref();
+        let _guard = link.lock.lock();
+        let (bytes, messages) = match recv {
+            Some(channel) => channel.fold_queued((0usize, 0usize), |(b, n), m| {
+                (b + m.data.len(), n + 1)
+            }),
+            None => (0, 0),
+        };
+        // One 4-byte length prefix per datagram on top of the bytes themselves.
+        let need = bytes + 4 * messages;
+        let me = global.platform.current_host_pid();
+        let existing = link.slot.load(Ordering::Acquire);
+        let peer_shutdown = recv.map_or(false, |channel| channel.is_peer_shutdown());
+        let slot = if existing == u32::MAX {
+            if need > SHARED_UNIX_CONN_BUF {
+                return Err(
+                    "more unread data queued on a unix datagram socket than a shared ring holds",
+                );
+            }
+            let slot = global
+                .unix_shared_conn_table
+                .alloc(global.platform, &own_cred, &own_cred)
+                .ok_or("shared unix connection table full")?;
+            let slot_ref = global.unix_shared_conn_table.get(slot);
+            slot_ref.framed.store(true, Ordering::Release);
+            let _ = link.global.set(alloc::boxed::Box::new(global.clone()));
+            link.slot.store(slot, Ordering::Release);
+            slot_ref.hold(is_client, me, global.platform);
+            if peer_here && !peer_shutdown {
+                slot_ref.hold(!is_client, me, global.platform);
+            }
+            slot
+        } else {
+            let existing_view = SharedView {
+                global,
+                slot: existing,
+                is_client,
+            };
+            let (read_ring, _) = existing_view.rings();
+            if need > read_ring.free_space() {
+                return Err(
+                    "more unread data queued on a unix datagram socket than its shared ring holds",
+                );
+            }
+            existing
+        };
+        let view = SharedView {
+            global,
+            slot,
+            is_client,
+        };
+        let (read_ring, _) = view.rings();
+        if let Some(channel) = recv {
+            while let Ok(data) =
+                channel.peek_and_consume_one(|m| Ok((true, core::mem::take(&mut m.data))))
+            {
+                if !read_ring.try_write_record(&data) {
+                    // `need` was bounded against the ring's capacity above, so refusing here would
+                    // silently drop the rest of the peer's queued datagrams -- worse than refusing
+                    // the promotion and leaving the fork on the thread-based path.
+                    return Err(
+                        "more unread data queued on a unix datagram socket than a shared ring holds",
+                    );
+                }
+            }
+            if existing == u32::MAX && peer_shutdown {
+                read_ring.shutdown();
+            }
+        }
+        Ok((slot, is_client))
     }
 
     /// Remembers the credentials of the task that sent the last message this socket read, for
@@ -3010,24 +3280,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         mut sender_cred: Option<&mut Option<Ucred>>,
     ) -> Result<usize, Errno> {
-        let res = cx
-            .with_timeout(timeout)
-            .wait_on_events(
-                is_nonblocking,
-                Events::IN,
-                |observer, mask| {
-                    self.inner.read().pollee.register_observer(observer, mask);
-                    Ok(())
-                },
-                || {
-                    let guard = self.inner.read();
-                    let Some(recv_channel) = &guard.recv_channel else {
-                        return Err(TryOpError::Other(Errno::ENOTCONN));
+        let res = wait_on_events_polling(
+            &cx.with_timeout(timeout),
+            is_nonblocking,
+            Events::IN,
+            |observer, mask| {
+                self.inner.read().pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let guard = self.inner.read();
+                // A promoted socket's own channel still holds whatever its peer queued BEFORE the
+                // promotion, and the ring holds everything after it, so the channel drains first.
+                if let Some(recv_channel) = &guard.recv_channel
+                    && !recv_channel.is_empty()
+                {
+                    return recv_channel.try_read(
+                        buf,
+                        source_addr.as_deref_mut(),
+                        peek,
+                        sender_cred.as_deref_mut(),
+                    );
+                }
+                if let Some(view) = guard.slot.as_ref().and_then(|carried| carried.view()) {
+                    if guard.read_shutdown {
+                        return Err(TryOpError::Other(Errno::ESHUTDOWN));
+                    }
+                    // A slot's ring is bytes only: a carried datagram loses its sender address and
+                    // its per-message credentials (a slot keeps one credential per direction), so
+                    // neither is reported here.
+                    if let Some(source_addr) = source_addr.as_deref_mut() {
+                        *source_addr = None;
+                    }
+                    let (read_ring, _) = view.rings();
+                    let got = if peek {
+                        read_ring.try_peek_record(buf)
+                    } else {
+                        read_ring.try_read_record(buf)
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut(), peek, sender_cred.as_deref_mut())
-                },
-            )
-            .map_err(Errno::from);
+                    if let Some(n) = got {
+                        view.poke_peer();
+                        return Ok(n);
+                    }
+                    if view.peer_gone() && read_ring.is_empty() {
+                        return Err(TryOpError::Other(Errno::ESHUTDOWN));
+                    }
+                    return Err(TryOpError::TryAgain);
+                }
+                let Some(recv_channel) = &guard.recv_channel else {
+                    return Err(TryOpError::Other(Errno::ENOTCONN));
+                };
+                recv_channel.try_read(buf, source_addr.as_deref_mut(), peek, sender_cred.as_deref_mut())
+            },
+        )
+        .map_err(Errno::from);
         // - Non-blocking + self-shutdown(SHUT_RD) with empty queue: Linux returns EAGAIN
         //   instead of EOF (datagram boundaries; no message synthesized for the absent peer).
         // - SO_RCVTIMEO expiry on a blocking recv: Linux returns EAGAIN, not ETIMEDOUT
@@ -3052,6 +3358,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
+        let promoted = {
+            let inner = self.inner.read();
+            if inner.write_shutdown {
+                return Err(Errno::EPIPE);
+            }
+            inner
+                .slot
+                .as_ref()
+                .map(|carried| carried.link.slot.load(Ordering::Acquire) != u32::MAX)
+                .unwrap_or(false)
+        };
+        if addr.is_none() && promoted {
+            return self.sendto_slot(task, timeout, buf, is_nonblocking);
+        }
         let connected_send_channel = {
             let inner = self.inner.read();
             if inner.write_shutdown {
@@ -3084,6 +3404,54 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         Ok(buf.len())
     }
 
+    /// [`Self::sendto`] for a promoted socket: one record into the slot's ring, which is what makes
+    /// the datagram reach a fork child holding the other end. Re-polled rather than really waited
+    /// on, exactly as a shared stream connection is: nothing can wake a blocked reader in another
+    /// host process.
+    fn sendto_slot(
+        &self,
+        task: &Task<Platform, FS>,
+        timeout: Option<Duration>,
+        buf: &[u8],
+        is_nonblocking: bool,
+    ) -> Result<usize, Errno> {
+        let cx = task.wait_cx();
+        let cx = cx.with_timeout(timeout);
+        wait_on_events_polling(
+            &cx,
+            is_nonblocking,
+            Events::OUT,
+            |observer, mask| {
+                self.inner.read().pollee.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let inner = self.inner.read();
+                let Some(view) = inner.slot.as_ref().and_then(|carried| carried.view()) else {
+                    return Err(TryOpError::Other(Errno::ENOTCONN));
+                };
+                if inner.write_shutdown {
+                    return Err(TryOpError::Other(Errno::EPIPE));
+                }
+                let (_, write_ring) = view.rings();
+                if write_ring.is_shutdown() || view.slot_ref().side_gone(!view.is_client, view.platform())
+                {
+                    return Err(TryOpError::Other(Errno::EPIPE));
+                }
+                if buf.len() + 4 > SHARED_UNIX_CONN_BUF {
+                    return Err(TryOpError::Other(Errno::EMSGSIZE));
+                }
+                if write_ring.try_write_record(buf) {
+                    view.poke_peer();
+                    Ok(buf.len())
+                } else {
+                    Err(TryOpError::TryAgain)
+                }
+            },
+        )
+        .map_err(Errno::from)
+    }
+
     fn get_local_addr(&self) -> UnixSocketAddr {
         self.inner
             .read()
@@ -3094,18 +3462,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             })
     }
     fn get_peer_addr(&self) -> Option<UnixSocketAddr> {
-        self.inner
-            .read()
+        let inner = self.inner.read();
+        if let Some(carried) = &inner.slot
+            && carried.link.slot.load(Ordering::Acquire) != u32::MAX
+        {
+            return Some(carried.peer.clone());
+        }
+        inner
             .connected_send_channel
             .as_ref()
             .map(|(_, addr)| addr.clone())
     }
 
     fn check_io_events(&self) -> Events {
-        let mut events = Events::empty();
         let inner = self.inner.read();
         let recv_shutdown = inner.read_shutdown;
         let send_shutdown = inner.write_shutdown;
+        if let Some(view) = inner.slot.as_ref().and_then(|carried| carried.view()) {
+            let mut events = view.events(recv_shutdown);
+            if let Some(recv_channel) = &inner.recv_channel
+                && !recv_channel.is_empty()
+            {
+                events |= Events::IN;
+            }
+            return events;
+        }
+        let mut events = Events::empty();
 
         if recv_shutdown {
             events |= Events::IN | Events::RDHUP;
@@ -5724,7 +6106,10 @@ pub(crate) enum UnixCarryHold {
 impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     /// Whether [`Self::fork_carry`] can carry this socket; the reason when it cannot. Changes
     /// nothing.
-    pub(super) fn fork_carry_check(&self) -> Result<(), &'static str> {
+    pub(super) fn fork_carry_check(
+        &self,
+        global: &GlobalStateHandle<Platform, FS>,
+    ) -> Result<(), &'static str> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
                 // A bound-but-unconnected socket carries as `B`: the address is all the state it
@@ -5735,15 +6120,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 UnixStreamState::Listen(_) | UnixStreamState::Connected(_) => Ok(()),
                 UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
             }),
+            // A bound-or-connected datagram carries by promoting its pair onto a shared,
+            // record-framed slot (`fork_carry`'s `G`), which is what keeps a `socketpair(2)` peer
+            // reachable across the fork. `LITEBOX_UNIX_DGRAM_CARRY_OFF=1` restores the refusal
+            // that sent such a fork down the in-process relocating path instead.
             UnixSocketInner::Datagram(datagram) => {
-                let inner = datagram.inner.read();
-                if inner.addr.is_none()
-                    && inner.recv_channel.is_none()
-                    && inner.connected_send_channel.is_none()
+                if !datagram.is_plain()
+                    && global.platform.env_flag("LITEBOX_UNIX_DGRAM_CARRY_OFF")
                 {
-                    Ok(())
-                } else {
                     Err("unix-datagram(bound-or-connected)")
+                } else {
+                    Ok(())
                 }
             }
         }
@@ -5773,10 +6160,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         child_pid: i32,
         for_spawn: bool,
     ) -> Result<(String, Option<UnixCarryHold>), &'static str> {
-        self.fork_carry_check()?;
+        self.fork_carry_check(global)?;
         let status = self.get_status().bits();
         let body = match &self.inner {
-            UnixSocketInner::Datagram(_) => return Ok((alloc::format!("{status:x};D"), None)),
+            UnixSocketInner::Datagram(datagram) => {
+                // Nothing bound, queued or connected: a fresh empty socket in the child is the
+                // whole state, exactly as before.
+                if datagram.is_plain() {
+                    return Ok((alloc::format!("{status:x};D"), None));
+                }
+                let (slot, is_client) = datagram.promote_for_fork(global, own_cred)?;
+                let me = global.platform.current_host_pid();
+                // Same launcher-exits-first window the `C` arm below closes: the child's hold is
+                // moved onto its own pid as soon as the child exists
+                // (`Self::fork_carry_move_to_child`), so until then the spec names no pid.
+                let carried_me = if for_spawn { 0 } else { me };
+                global
+                    .unix_shared_conn_table
+                    .get(slot)
+                    .hold(is_client, me, global.platform);
+                (
+                    alloc::format!(
+                        "G,{slot},{},{carried_me},{},{}",
+                        u8::from(is_client),
+                        encode_unix_addr(&datagram.get_local_addr()),
+                        encode_unix_addr(
+                            &datagram
+                                .get_peer_addr()
+                                .unwrap_or(UnixSocketAddr::Unnamed)
+                        )
+                    ),
+                    Some(UnixCarryHold::Conn {
+                        slot,
+                        is_client,
+                        host: me,
+                    }),
+                )
+            }
             UnixSocketInner::Stream(stream) => {
                 let seq = u8::from(stream.preserve_boundaries);
                 stream.with_state_ref(|state| match state {
@@ -5957,12 +6377,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let Some(kind) = fields.next() else {
             return;
         };
-        // `D` (datagram) has no seq field and no connection; `I`/`L` (init/listen) hold nothing
-        // but presence, which `fork_carry_abandon` undoes.
-        if kind != "C" {
+        // `D` (datagram) has no connection; `I`/`L` (init/listen) hold nothing but presence, which
+        // `fork_carry_abandon` undoes. `C` and `G` both write `slot,is_client,host` first -- `C`
+        // with a `seq` in front of them, `G` without one (a datagram socket is always
+        // record-framed, so it has nothing to encode).
+        if kind != "C" && kind != "G" {
             return;
         }
-        let _seq = fields.next();
+        if kind == "C" {
+            let _seq = fields.next();
+        }
         let (Some(slot), Some(is_client), Some(host)) = (
             fields.next().and_then(|s| s.parse::<u32>().ok()),
             fields.next().map(|s| s == "1"),
@@ -6018,6 +6442,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let kind = fields.next()?;
         let inner = if kind == "D" {
             UnixSocketInner::Datagram(UnixDatagram::new())
+        } else if kind == "G" {
+            // A carried bound-or-connected datagram: one end of the slot the parent promoted its
+            // pair onto, plus the name the parent had bound, re-opened here rather than created --
+            // the only way the child's copy still exchanges datagrams with the end its parent kept.
+            let Some(datagram) = UnixDatagram::<Platform, FS>::from_fork_spec_g(task, &mut fields)
+            else {
+                return None;
+            };
+            UnixSocketInner::Datagram(datagram)
         } else {
             let seq = fields.next()? == "1";
             let state = match kind {

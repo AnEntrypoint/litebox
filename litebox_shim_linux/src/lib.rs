@@ -2498,6 +2498,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .platform
                 .env_value("LITEBOX_DIAG_SYSCALL_TIMELINE_PID")
         });
+        crate::diag::init_child_exit_trail(
+            || {
+                self.global
+                    .platform
+                    .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL")
+            },
+            self.global.platform,
+        );
+        crate::diag::init_child_exit_last_trail(
+            || {
+                self.global
+                    .platform
+                    .env_value("LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST")
+            },
+            self.global.platform,
+        );
+        crate::diag::init_child_ipc(
+            || self.global.platform.env_value("LITEBOX_DIAG_CHILD_IPC"),
+            self.global.platform,
+            self.pid.get(),
+            self.ppid.get(),
+            &self.comm.get(),
+        );
         let comm_bytes = self.comm.get();
         crate::diag::record_syscall_trail(
             syscall_number,
@@ -2543,6 +2566,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
+        crate::diag::record_first_trail(
+            syscall_number,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
+        // `syscall_number`-based, before dispatch, because a `CreateProcessW`-spawned fork child
+        // never reaches the `IS_NATIVE_FORK_CHILD` exit sites -- see
+        // `diag::maybe_dump_child_exit_trail`. A no-op unless that diagnostic is armed.
+        crate::diag::maybe_dump_child_exit_trail(
+            self.global.platform,
+            syscall_number,
+            self.pid.get(),
+            self.tid.get(),
+            &comm_bytes,
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
+        );
         let is_target = crate::diag::syscall_timeline_enabled()
             && (crate::diag::is_syscall_timeline_target_comm(&comm_bytes)
                 || crate::diag::is_syscall_timeline_target_pid(self.pid.get())
@@ -2768,6 +2814,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
+        // After dispatch: this is the only place the guest's own view of the result exists, and a
+        // channel that answered 0 bytes is a different bug from one that answered -ECONNRESET --
+        // see `diag::maybe_trace_child_ipc`. A no-op unless that diagnostic is armed.
+        crate::diag::maybe_trace_child_ipc(
+            self.global.platform,
+            syscall_number,
+            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            return_value as u64,
+            self.pid.get(),
+            self.tid.get(),
+            &self.comm.get(),
+        );
+        // Same placement, for the same reason: the ring keeps the value the guest saw, which only
+        // exists after dispatch. One atomic load per syscall when the knob is unset.
+        crate::diag::record_last_trail(
+            syscall_number,
+            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            return_value as u64,
+        );
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;

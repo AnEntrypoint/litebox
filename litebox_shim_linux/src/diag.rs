@@ -1425,6 +1425,126 @@ pub fn record_syscall_trail(number: usize, args: [u64; 3]) {
     }
 }
 
+/// How many of a process's FIRST syscalls the child-exit diagnostic keeps.
+///
+/// The ring above is the right shape for a crash (what was it doing when it died) and the wrong
+/// shape for a fork child's LIFE: a chromium child ends on `clock_gettime`/`futex`/`epoll_wait`,
+/// which says nothing about what it did after the `fork()`. Measured on chrF44: 333
+/// `Chrome_ChildIOT` children, all exit 0, whose last-24 trails contain NOT ONE `execve`,
+/// `clone`, `socket`, `mmap` or `prctl` (148 had `read`, 130 `write`, 46 `sendto`). This buffer
+/// stops recording once it is full, so what it holds is always the beginning.
+const FIRST_TRAIL_LEN: usize = 512;
+
+struct FirstTrail {
+    entries: [SyscallTrailEntry; FIRST_TRAIL_LEN],
+    next: usize,
+}
+
+impl FirstTrail {
+    const EMPTY: SyscallTrailEntry = SyscallTrailEntry {
+        number: 0,
+        args: [0; 3],
+    };
+    const NEW: Self = Self {
+        entries: [Self::EMPTY; FIRST_TRAIL_LEN],
+        next: 0,
+    };
+}
+
+/// See [`FIRST_TRAIL_LEN`]. Also one per host process, also read at a fork child's exit.
+static FIRST_TRAIL: spin::Mutex<FirstTrail> = spin::Mutex::new(FirstTrail::NEW);
+
+/// Remembers a process's earliest syscalls, until [`FIRST_TRAIL_LEN`] of them have been seen.
+pub fn record_first_trail(number: usize, args: [u64; 3]) {
+    let mut trail = FIRST_TRAIL.lock();
+    if trail.next >= FIRST_TRAIL_LEN {
+        return;
+    }
+    let slot = trail.next;
+    trail.entries[slot] = SyscallTrailEntry { number, args };
+    trail.next = slot + 1;
+}
+
+/// The recorded prefix of this process's syscall history, oldest first.
+pub fn first_trail_oldest_first() -> Vec<SyscallTrailEntry> {
+    let trail = FIRST_TRAIL.lock();
+    trail.entries[..trail.next].to_vec()
+}
+
+/// How many of a process's LAST syscalls the last-trail child-exit diagnostic keeps.
+///
+/// The mirror of [`FIRST_TRAIL_LEN`]: a chromium churn child's first 512 are the zygote
+/// SPECIALIZE sequence every child shares, while its last 512 are whatever it did immediately
+/// before its `exit_group(0)` -- which is where "its channel answered 0 bytes" and "it shut
+/// itself down" stop looking alike.
+const LAST_TRAIL_LEN: usize = 512;
+
+#[derive(Clone, Copy)]
+struct LastTrailEntry {
+    number: usize,
+    args: [u64; 3],
+    /// The value the guest got back in `rax`: a byte count, or `-errno` (`Errno` is encoded that
+    /// way), or 0 for a channel read that hit EOF.
+    ret: u64,
+}
+
+impl LastTrailEntry {
+    const EMPTY: Self = Self {
+        number: 0,
+        args: [0; 3],
+        ret: 0,
+    };
+}
+
+struct LastTrail {
+    entries: [LastTrailEntry; LAST_TRAIL_LEN],
+    next: usize,
+    filled: usize,
+}
+
+impl LastTrail {
+    const NEW: Self = Self {
+        entries: [LastTrailEntry::EMPTY; LAST_TRAIL_LEN],
+        next: 0,
+        filled: 0,
+    };
+}
+
+/// See [`LAST_TRAIL_LEN`]. One per host process, like [`FIRST_TRAIL`], read at the same exit.
+static LAST_TRAIL: spin::Mutex<LastTrail> = spin::Mutex::new(LastTrail::NEW);
+
+/// Remembers a process's most recent syscalls, overwriting the oldest once [`LAST_TRAIL_LEN`] of
+/// them have been seen. Called after dispatch, so `ret` is the value the guest saw.
+///
+/// Gated on the knob's budget, because unlike [`record_first_trail`] this one never fills up and
+/// stops: ungated it would spin-lock and write on every syscall of every process forever, and the
+/// budget is nonzero exactly when the knob is armed.
+pub fn record_last_trail(number: usize, args: [u64; 3], ret: u64) {
+    if CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut trail = LAST_TRAIL.lock();
+    let slot = trail.next;
+    trail.entries[slot] = LastTrailEntry { number, args, ret };
+    trail.next = (slot + 1) % LAST_TRAIL_LEN;
+    if trail.filled < LAST_TRAIL_LEN {
+        trail.filled += 1;
+    }
+}
+
+/// The recorded suffix of this process's syscall history, oldest first.
+pub fn last_trail_oldest_first() -> Vec<LastTrailEntry> {
+    let trail = LAST_TRAIL.lock();
+    let start = if trail.filled == LAST_TRAIL_LEN {
+        trail.next
+    } else {
+        0
+    };
+    (0..trail.filled)
+        .map(|i| trail.entries[(start + i) % LAST_TRAIL_LEN])
+        .collect()
+}
+
 /// The trail's entries, oldest first, for the fatal-exception diagnostic.
 pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     let trail = SYSCALL_TRAIL.lock();
@@ -1436,6 +1556,486 @@ pub fn syscall_trail_oldest_first() -> Vec<SyscallTrailEntry> {
     (0..trail.filled)
         .map(|i| trail.entries[(start + i) % SYSCALL_TRAIL_LEN])
         .collect()
+}
+
+/// How many cross-process fork children get their exit trail dumped when
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL` is armed without an explicit count.
+///
+/// A cross-process fork child is its own host process, so [`SYSCALL_TRAIL`] is unambiguously that
+/// child's own (see that static's comment), and the child's exit is the only moment its whole life
+/// is still in the trail. That is the one shape nothing else in this file can observe: chromium's
+/// ~1/s fork children exit 0 having apparently run the browser's thread-startup code without ever
+/// `execve`ing, they are not named in advance (so the comm and pid filters above cannot be aimed
+/// at them), and an unfiltered every-syscall timeline OOM'd the host once already. The budget
+/// bounds it the same way those filters do -- an explicit count, never "every child".
+const DEFAULT_CHILD_EXIT_TRAIL_BUDGET: usize = 40;
+
+/// The child `comm` `LITEBOX_DIAG_CHILD_EXIT_TRAIL=<name>` aims at, empty when the value was a
+/// count. A boot spends its first few hundred forks on `sh`/`python3`/`Xvfb`, so a plain count
+/// spends its whole budget long before the process under investigation ever forks; naming the
+/// comm skips straight to it. Same prefix rule as [`is_syscall_timeline_target_comm`], for the
+/// same 15-byte-`comm`-truncation reason.
+static CHILD_EXIT_TRAIL_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+
+/// The cap a comm-selected trail dump still runs under -- "every `chromium` child" is not
+/// unboundedly many, for the same reason an unfiltered every-syscall timeline is not.
+const CHILD_EXIT_TRAIL_COMM_BUDGET: usize = 4096;
+
+static CHILD_EXIT_TRAIL_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_EXIT_TRAIL_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Dumps the trail of a cross-process fork child that is about to exit, called from the generic
+/// syscall-entry hook rather than from the shim's own `sys_exit`/`sys_exit_group`.
+///
+/// WHY A SECOND ENTRY POINT: those two call sites are gated on
+/// `syscalls::process::IS_NATIVE_FORK_CHILD`, which only the in-place-resume branch of a native
+/// fork sets. The children a real workload actually produces are not that branch -- they are
+/// `CreateProcessW`-spawned re-execs of the runner that resume a rebuilt `Task` from a register
+/// snapshot (the runner's `task-resume-probe` path), they never re-run the `clone` call stack, and
+/// their guest exit is encoded and ended by the runner. Measured: 649 chromium children and 4
+/// python children, every one armed with a budget of 40, produced ZERO trails through the
+/// `IS_NATIVE_FORK_CHILD` sites.
+///
+/// So this one identifies a fork child the way the child itself does -- the presence of the
+/// register snapshot in its own environment (`LITEBOX_INTERNAL_FORK_CHILD_GPRS`, read once) --
+/// and fires on the `exit`/`exit_group` SYSCALL NUMBER, before dispatch, so it cannot be bypassed
+/// by whatever the exit path turns out to be.
+pub fn maybe_dump_child_exit_trail<Platform>(platform: &Platform, syscall_number: usize, pid: i32, tid: i32, comm: &[u8], args: [u64; 3])
+where
+    Platform: litebox::platform::StdioProvider + litebox::platform::SystemInfoProvider,
+{
+    if !matches!(
+        ::syscalls::Sysno::new(syscall_number),
+        Some(::syscalls::Sysno::exit | ::syscalls::Sysno::exit_group)
+    ) {
+        return;
+    }
+    let first_armed = !(CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire) == 0
+        && CHILD_EXIT_TRAIL_COMM.lock().is_empty());
+    if !first_armed && !child_exit_last_trail_armed() {
+        return;
+    }
+    if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
+        if platform
+            .env_value("LITEBOX_INTERNAL_FORK_CHILD_GPRS")
+            .is_none()
+        {
+            return;
+        }
+        IS_FORK_CHILD_HOST.store(true, Ordering::Release);
+    }
+    if first_armed {
+        emit_child_exit_trail(platform, pid, tid, args[0] as i32, comm, "hook");
+    }
+    emit_child_exit_last_trail(platform, pid, tid, args[0] as i32, comm, "hook");
+}
+
+/// True once this host process has been seen to carry the cross-process fork child's register
+/// snapshot environment variable -- see [`maybe_dump_child_exit_trail`] for why that, and not
+/// `IS_NATIVE_FORK_CHILD`, is what makes a process a fork child here.
+static IS_FORK_CHILD_HOST: AtomicBool = AtomicBool::new(false);
+
+/// One trail per child, whichever exit site gets there first -- a child's `sys_exit_group` and its
+/// later `prepare_for_exit` would otherwise dump the same life twice.
+static CHILD_EXIT_TRAIL_DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// The `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST` knob's own latch, budget, comm filter and one-dump
+/// flag: the two knobs are independent, so a child is worth its last syscalls whether or not its
+/// first ones were asked for.
+static CHILD_EXIT_TRAIL_LAST_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+static CHILD_EXIT_TRAIL_LAST_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_EXIT_TRAIL_LAST_INIT: AtomicBool = AtomicBool::new(false);
+static CHILD_EXIT_TRAIL_LAST_DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last-trail knob is armed in this host process. Read on every syscall by
+/// [`record_last_trail`], so it stays one atomic load in the common case.
+pub fn child_exit_last_trail_armed() -> bool {
+    !(CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire) == 0
+        && CHILD_EXIT_TRAIL_LAST_COMM.lock().is_empty())
+}
+
+/// Parses the value grammar the per-child diagnostics share -- `<n>`, `<comm>` or `<comm>:<n>`,
+/// plus the `1`/`true`/`yes`/`on` spellings of "on" -- into a child budget and a comm prefix
+/// (empty means "any child").
+fn parse_child_trail_target(
+    value: Option<String>,
+    default_budget: usize,
+    comm_budget: usize,
+) -> (usize, Vec<u8>) {
+    match value {
+        None => (0, Vec::new()),
+        Some(v) if matches!(v.trim(), "1" | "true" | "yes" | "on") => (default_budget, Vec::new()),
+        Some(v) => {
+            let v = v.trim();
+            match v.parse::<usize>() {
+                Ok(n) => (n, Vec::new()),
+                // `<comm>` or `<comm>:<count>` -- the count is what bounds a comm that matches
+                // hundreds of children (chromium's churn), since the default comm budget does not.
+                Err(_) => match v.rsplit_once(':') {
+                    Some((comm, n)) if !comm.is_empty() => (
+                        n.trim().parse::<usize>().unwrap_or(comm_budget),
+                        comm.as_bytes().to_vec(),
+                    ),
+                    _ => (comm_budget, v.as_bytes().to_vec()),
+                },
+            }
+        }
+    }
+}
+
+/// Call once, early, with a closure performing the platform's `env_value` lookup for
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL`. Idempotent, same lazy-latch pattern as
+/// [`init_syscall_timeline`], including why the argument is a closure.
+///
+/// - unset or empty -> off
+/// - `1` / `true` / `yes` / `on` -> [`DEFAULT_CHILD_EXIT_TRAIL_BUDGET`] children
+/// - a number -> that many children (any child, in exit order)
+/// - `<comm>` -> that `comm`, under [`CHILD_EXIT_TRAIL_COMM_BUDGET`]
+/// - `<comm>:<count>` -> that `comm`, at most `count` of them
+///
+/// Prints one `[diag-child-exit-init]` line per host process when it arms itself, so a run that
+/// produces no trails can be read as "the child never saw this variable" rather than "the child
+/// never exited". Silent when unarmed, so an ordinary run pays nothing for it.
+pub fn init_child_exit_trail<Platform: litebox::platform::StdioProvider>(
+    value: impl FnOnce() -> Option<String>,
+    platform: &Platform,
+) {
+    // This one DOES allocate (the comm is kept as bytes); `PrivateAllocGuard` keeps its nodes in
+    // private memory so a native-`fork()` child's copy of the static never aliases the parent's.
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    if CHILD_EXIT_TRAIL_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        DEFAULT_CHILD_EXIT_TRAIL_BUDGET,
+        CHILD_EXIT_TRAIL_COMM_BUDGET,
+    );
+    *CHILD_EXIT_TRAIL_COMM.lock() = comm;
+    CHILD_EXIT_TRAIL_BUDGET.store(budget, Ordering::Release);
+    CHILD_EXIT_TRAIL_INIT.store(true, Ordering::Release);
+    if budget != 0 {
+        let comm = String::from_utf8_lossy(&CHILD_EXIT_TRAIL_COMM.lock()).into_owned();
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!("[diag-child-exit-init] budget={budget} comm={comm}\n").as_bytes(),
+        );
+    }
+}
+
+/// Arms the LAST-syscalls variant, from `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST`. Same value grammar
+/// as [`init_child_exit_trail`] (`<n>`, `<comm>` or `<comm>:<n>`), read through the same parser,
+/// and prints one `[diag-child-exit-init] trail=last` line per host process for the same reason:
+/// so a run with no last-trails reads as "the child never saw this variable" rather than "the
+/// child never exited".
+///
+/// Independent of the other knob: either may be set alone, and setting both prints both trails.
+pub fn init_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
+    value: impl FnOnce() -> Option<String>,
+    platform: &Platform,
+) {
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    if CHILD_EXIT_TRAIL_LAST_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        DEFAULT_CHILD_EXIT_TRAIL_BUDGET,
+        CHILD_EXIT_TRAIL_COMM_BUDGET,
+    );
+    *CHILD_EXIT_TRAIL_LAST_COMM.lock() = comm;
+    CHILD_EXIT_TRAIL_LAST_BUDGET.store(budget, Ordering::Release);
+    CHILD_EXIT_TRAIL_LAST_INIT.store(true, Ordering::Release);
+    if budget != 0 {
+        let comm = String::from_utf8_lossy(&CHILD_EXIT_TRAIL_LAST_COMM.lock()).into_owned();
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!("[diag-child-exit-init] trail=last budget={budget} comm={comm}\n")
+                .as_bytes(),
+        );
+    }
+}
+
+/// Prints this task's syscall trail to stderr, if [`init_child_exit_trail`] armed this diagnostic
+/// and a budget slot is still available.
+///
+/// Straight to stderr through the platform's stdio, not through `litebox_util_log`, for exactly
+/// the reason [`emit_timeline_line`] documents: an instrument gated by its own environment
+/// variable must not go silent because an unrelated one filtered its lines away.
+pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    pid: i32,
+    tid: i32,
+    status: i32,
+    comm: &[u8],
+    site: &str,
+) {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    let wanted = CHILD_EXIT_TRAIL_COMM.lock();
+    let comm_ok = wanted.is_empty()
+        || trimmed == wanted.as_slice()
+        || wanted.starts_with(trimmed);
+    let budget = CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire);
+    let entries = first_trail_oldest_first();
+    // One header per call, emitted BEFORE every gate on purpose: a header with `budget=0` means
+    // the variable never reached this child, `comm_ok=false` means the comm filter rejected it,
+    // `entries=0` means the trail was empty, and NO header at all means this child's exit never
+    // reached this function -- four different-looking "the instrument printed nothing" failures
+    // that are otherwise indistinguishable from the log.
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        alloc::format!(
+            "[diag-child-exit] site={site} pid={pid} tid={tid} comm={} status={status} budget={budget} comm_ok={comm_ok} entries={}\n",
+            String::from_utf8_lossy(trimmed),
+            entries.len(),
+        )
+        .as_bytes(),
+    );
+    if !comm_ok {
+        return;
+    }
+    if CHILD_EXIT_TRAIL_DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut budget = budget;
+    while budget != 0 {
+        match CHILD_EXIT_TRAIL_BUDGET.compare_exchange_weak(
+            budget,
+            budget - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => budget = current,
+        }
+    }
+    if budget == 0 {
+        return;
+    }
+    let comm = String::from_utf8_lossy(trimmed);
+    for (i, entry) in entries.iter().enumerate() {
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-exit] pid={pid} tid={tid} comm={comm} status={status} i={i} syscall={} arg0={:#x} arg1={:#x} arg2={:#x}\n",
+                syscall_name(entry.number),
+                entry.args[0],
+                entry.args[1],
+                entry.args[2],
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Takes one child slot out of `slot`, false once the budget is spent.
+fn spend_child_trail_budget(slot: &AtomicUsize) -> bool {
+    let mut budget = slot.load(Ordering::Acquire);
+    while budget != 0 {
+        match slot.compare_exchange_weak(budget, budget - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => budget = current,
+        }
+    }
+    false
+}
+
+/// Prints this task's LAST syscalls to stderr, each one with the value the guest got back, if
+/// `LITEBOX_DIAG_CHILD_EXIT_TRAIL_LAST` armed this diagnostic and a budget slot is still
+/// available. Completely inert when that knob is unset, so a run that armed only the FIRST trail
+/// is byte-identical to what it printed before this existed.
+///
+/// THE RETURN VALUE IS THE POINT: `read(21, buf, 8)` is one line whether it got 8 bytes, hit EOF
+/// or got `-ECONNRESET`, and those are three different answers to "why did this child stop".
+/// Same [`emit_child_exit_trail`] header convention plus `trail=last`, so the two trails stay
+/// separable in a log where both knobs are set.
+pub fn emit_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
+    platform: &Platform,
+    pid: i32,
+    tid: i32,
+    status: i32,
+    comm: &[u8],
+    site: &str,
+) {
+    if !child_exit_last_trail_armed() {
+        return;
+    }
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    let wanted = CHILD_EXIT_TRAIL_LAST_COMM.lock();
+    let comm_ok = wanted.is_empty()
+        || trimmed == wanted.as_slice()
+        || wanted.starts_with(trimmed);
+    let budget = CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire);
+    let entries = last_trail_oldest_first();
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        alloc::format!(
+            "[diag-child-exit] trail=last site={site} pid={pid} tid={tid} comm={} status={status} budget={budget} comm_ok={comm_ok} entries={}\n",
+            String::from_utf8_lossy(trimmed),
+            entries.len(),
+        )
+        .as_bytes(),
+    );
+    if !comm_ok {
+        return;
+    }
+    if CHILD_EXIT_TRAIL_LAST_DUMPED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !spend_child_trail_budget(&CHILD_EXIT_TRAIL_LAST_BUDGET) {
+        return;
+    }
+    let comm = String::from_utf8_lossy(trimmed);
+    for (i, entry) in entries.iter().enumerate() {
+        let signed = entry.ret as i64;
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-exit] trail=last pid={pid} tid={tid} comm={comm} status={status} i={i} syscall={} arg0={:#x} arg1={:#x} arg2={:#x} ret={signed}\n",
+                syscall_name(entry.number),
+                entry.args[0],
+                entry.args[1],
+                entry.args[2],
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// How many IPC lines `LITEBOX_DIAG_CHILD_IPC` prints per child host process.
+const CHILD_IPC_DEFAULT_BUDGET: usize = 200;
+
+static CHILD_IPC_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static CHILD_IPC_INIT: AtomicBool = AtomicBool::new(false);
+static CHILD_IPC_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+
+/// Arms the fork-child IPC tracer, same lazy-latch and value grammar as
+/// [`init_child_exit_trail`] (`<n>`, `<comm>` or `<comm>:<n>`), and prints one
+/// `[diag-child-ipc-init]` line per host process so a silent instrument is distinguishable from a
+/// child that never made an IPC syscall.
+pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
+    value: impl FnOnce() -> Option<String>,
+    platform: &Platform,
+    pid: i32,
+    ppid: i32,
+    comm: &[u8],
+) {
+    let _private = litebox_util_log::PrivateAllocGuard::new();
+    if CHILD_IPC_INIT.load(Ordering::Acquire) {
+        return;
+    }
+    let (budget, comm) = parse_child_trail_target(
+        value(),
+        CHILD_IPC_DEFAULT_BUDGET,
+        CHILD_IPC_DEFAULT_BUDGET,
+    );
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let own = String::from_utf8_lossy(&comm[..end]).into_owned();
+    *CHILD_IPC_COMM.lock() = comm;
+    CHILD_IPC_BUDGET.store(budget, Ordering::Release);
+    CHILD_IPC_INIT.store(true, Ordering::Release);
+    if budget != 0 {
+        // `ppid` is here because "which process is forking 700 times a minute" is the question
+        // this instrument exists to answer, and a child's own pid cannot name its parent.
+        let _ = platform.write_to(
+            litebox::platform::StdioOutStream::Stderr,
+            alloc::format!(
+                "[diag-child-ipc-init] pid={pid} ppid={ppid} budget={budget} comm={own}\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+/// Prints one line per IPC-shaped syscall a cross-process fork child makes, WITH ITS RETURN VALUE.
+///
+/// A trail of arguments alone cannot answer the question the churn poses: `read(21, buf, 4)` looks
+/// identical whether it got its 4 bytes, got EOF, or got `-ECONNRESET`, and a child whose command
+/// channel answered 0 bytes explains itself (`exit 0` right after) while one that got 4 does not.
+/// Called after dispatch, so `ret` is the value the guest actually sees: positive for a byte count,
+/// `-errno` for a failure (`Errno` is encoded that way into `rax`).
+///
+/// Restricted to a fork child (same `LITEBOX_INTERNAL_FORK_CHILD_GPRS` test
+/// [`maybe_dump_child_exit_trail`] uses) and to syscalls that carry a channel: the root process
+/// makes thousands of these per second and would drown the log.
+pub fn maybe_trace_child_ipc<Platform>(
+    platform: &Platform,
+    syscall_number: usize,
+    args: [u64; 3],
+    ret: u64,
+    pid: i32,
+    tid: i32,
+    comm: &[u8],
+) where
+    Platform: litebox::platform::StdioProvider + litebox::platform::SystemInfoProvider,
+{
+    if CHILD_IPC_BUDGET.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if !matches!(
+        ::syscalls::Sysno::new(syscall_number),
+        Some(
+            ::syscalls::Sysno::read
+                | ::syscalls::Sysno::readv
+                | ::syscalls::Sysno::recvmsg
+                | ::syscalls::Sysno::recvfrom
+                | ::syscalls::Sysno::write
+                | ::syscalls::Sysno::writev
+                | ::syscalls::Sysno::sendto
+                | ::syscalls::Sysno::sendmsg
+                | ::syscalls::Sysno::socket
+                | ::syscalls::Sysno::socketpair
+                | ::syscalls::Sysno::connect
+                | ::syscalls::Sysno::bind
+                | ::syscalls::Sysno::execve
+        )
+    ) {
+        return;
+    }
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let trimmed = &comm[..end];
+    let wanted = CHILD_IPC_COMM.lock();
+    if !wanted.is_empty()
+        && !(trimmed == wanted.as_slice() || wanted.starts_with(trimmed))
+    {
+        return;
+    }
+    if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
+        if platform.env_value("LITEBOX_INTERNAL_FORK_CHILD_GPRS").is_none() {
+            return;
+        }
+        IS_FORK_CHILD_HOST.store(true, Ordering::Release);
+    }
+    let mut budget = CHILD_IPC_BUDGET.load(Ordering::Acquire);
+    while budget != 0 {
+        match CHILD_IPC_BUDGET.compare_exchange_weak(
+            budget,
+            budget - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => budget = current,
+        }
+    }
+    if budget == 0 {
+        return;
+    }
+    let signed = ret as i64;
+    let _ = platform.write_to(
+        litebox::platform::StdioOutStream::Stderr,
+        alloc::format!(
+            "[diag-child-ipc] pid={pid} tid={tid} comm={} syscall={} arg0={:#x} arg1={:#x} arg2={:#x} ret={signed}\n",
+            String::from_utf8_lossy(trimmed),
+            syscall_name(syscall_number),
+            args[0],
+            args[1],
+            args[2],
+        )
+        .as_bytes(),
+    );
 }
 
 fn syscall_name(number: usize) -> String {

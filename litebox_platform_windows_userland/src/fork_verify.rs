@@ -117,7 +117,9 @@
 
 use iced_x86::{Decoder, DecoderOptions, Instruction, OpAccess, OpKind, Register};
 use windows_sys::Win32::Foundation as Win32_Foundation;
-use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_RECORD};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CONTEXT, CONTEXT_FLOATING_POINT_AMD64, EXCEPTION_RECORD,
+};
 
 use crate::TlsState;
 
@@ -1157,10 +1159,22 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
                     );
                 }
             }
-            litebox_util_log::warn!(
-                host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
-                "fork_verify: stale CODE pointer detected, translating and resuming"
-            );
+            // A translation that leaves `rip` where it was is not a heal -- it is the identity map
+            // (or a range that happens to map to itself), and this case then fires on essentially
+            // every instruction the child executes. chrF51: 3.6M of these in one 300 s run, every
+            // single one with `translated_rip == rip`, 823 MB of log. Raise only a real heal to
+            // warn; a no-op is debug, which `LITEBOX_LOG=warn` then never prints.
+            if translated_rip == rip {
+                litebox_util_log::debug!(
+                    host_tid:? = std::thread::current().id(), rip:? = rip;
+                    "fork_verify: rip in a source range whose translation is a no-op, resuming"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    host_tid:? = std::thread::current().id(), rip:? = rip, translated_rip:? = translated_rip;
+                    "fork_verify: stale CODE pointer detected, translating and resuming"
+                );
+            }
             context.Rip = translated_rip as u64;
             #[allow(clippy::cast_possible_truncation)]
             let rbp = context.Rbp as usize;
@@ -1272,10 +1286,22 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
         if relocations.is_in_source(rcx)
             && let Some(translated_rcx) = relocations.translate(rcx)
         {
-            litebox_util_log::warn!(
-                rcx:? = rcx, translated_rcx:? = translated_rcx;
-                "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
-            );
+            // Same rule as case (1): a translation that leaves the value where it was is not a
+            // heal. chrF55 (identity map, verification forced back on) emitted 4,847 of these in
+            // 150 s and NOT ONE of them changed `rcx` -- `translated_rcx == rcx` in 4847/4847 --
+            // because on an identity map `translate` is the identity function. Calling that
+            // "stale pointer detected" is a lie that buries the cases that really do move.
+            if translated_rcx == rcx {
+                litebox_util_log::debug!(
+                    rcx:? = rcx;
+                    "fork_verify: rcx is a source-range return address whose translation is a no-op, resuming"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    rcx:? = rcx, translated_rcx:? = translated_rcx;
+                    "fork_verify: stale RETURN-ADDRESS pointer detected in rcx at syscall-trampoline boundary, translating"
+                );
+            }
             context.Rcx = translated_rcx as u64;
         }
         context.EFlags &= !eflags_tf;
@@ -1304,6 +1330,18 @@ pub(crate) fn on_single_step(tls: &TlsState, context: &mut CONTEXT) -> StepOutco
     let instruction = decoder.decode();
     if instruction.is_invalid() {
         return StepOutcome::Continue;
+    }
+
+    // (2e) Stale DATA about to be stored by an SSE store. Every other case here heals an ADDRESS --
+    // `rip`, or a memory operand's base/index register -- and a `movups [rax], xmm0` has a perfectly
+    // valid address and stale DATA, so it faults nowhere and heals nowhere. See
+    // `translate_stale_xmm_store_lanes` for the full argument; it fires before the store executes,
+    // so healing the `xmm` lane here is what makes the store write the translated pointer.
+    if translate_stale_xmm_store_lanes(&instruction, context, relocations) {
+        litebox_util_log::warn!(
+            host_tid:? = std::thread::current().id(), rip:? = rip;
+            "fork_verify: stale DATA pointer detected in an SSE store's xmm source, lane translated"
+        );
     }
 
     // (1b) Register-to-register propagation of a stale CODE/DATA pointer: a plain `mov reg, reg`
@@ -1866,6 +1904,148 @@ fn write_register_value(register: Register, value: usize, context: &mut CONTEXT)
         // registers` never calls this with any other register.
         _ => {}
     }
+}
+
+/// The two 64-bit halves of `xmm[index]`, or `None` when `context` carries no floating-point state.
+///
+/// The `CONTEXT` a trap hands this module is the OS's own `EXCEPTION_POINTERS::ContextRecord`, which
+/// `vectored_exception_handler` passes through verbatim and which Windows fills with
+/// `CONTEXT_FLOATING_POINT` -- so in practice the XMM state is there. The flag is what says so, and
+/// inventing an XMM value from a context that never captured one would silently corrupt the guest's
+/// SIMD state, which is worse than the stale pointer this exists to heal. `ctxwatch.rs` reads the
+/// same union field the same way.
+fn xmm_lanes(context: &CONTEXT, index: usize) -> Option<[usize; 2]> {
+    if context.ContextFlags & CONTEXT_FLOATING_POINT_AMD64 == 0 {
+        return None;
+    }
+    // SAFETY: `FltSave` is only meaningful when `CONTEXT_FLOATING_POINT` is set, which the check
+    // above just established; `XmmRegisters` is a fixed 16-element array of `M128A`.
+    let registers = unsafe { context.Anonymous.FltSave.XmmRegisters };
+    let lane = registers.get(index)?;
+    // `M128A::High` is signed in `windows-sys`; the bit pattern is what matters, and `usize` is 64
+    // bits wide on this crate's only target.
+    #[allow(clippy::cast_sign_loss)]
+    Some([lane.Low as usize, lane.High as usize])
+}
+
+/// Writes `value` into one 64-bit half of `xmm[index]`, returning `false` (and writing nothing) when
+/// `context` carries no floating-point state -- see [`xmm_lanes`].
+fn write_xmm_lane(context: &mut CONTEXT, index: usize, lane: usize, value: usize) -> bool {
+    if context.ContextFlags & CONTEXT_FLOATING_POINT_AMD64 == 0 {
+        return false;
+    }
+    // SAFETY: same union-field argument as [`xmm_lanes`], plus `get_mut` bounds-checking `index`.
+    let target = unsafe {
+        let registers = &mut context.Anonymous.FltSave.XmmRegisters;
+        match registers.get_mut(index) {
+            Some(lane) => lane,
+            None => return false,
+        }
+    };
+    if lane == 0 {
+        target.Low = value as _;
+    } else {
+        target.High = value as _;
+    }
+    true
+}
+
+/// Heals the stale source-range pointers an SSE *store* is about to write into memory -- the one
+/// stale-pointer shape every other case in this module is structurally unable to reach.
+///
+/// Cases (1)/(1b)/(2)/(2b)/(2c)/(2d)/(3)/(4) all key off `rip` or off a *memory operand's*
+/// base/index register: they heal the ADDRESS an instruction is about to use. A
+/// `movups [rax], xmm0` has an already-valid address and stale DATA -- the 16 bytes in `xmm0` can
+/// hold a pointer copied out of the pre-`fork()` source range, and the store writes it into the
+/// child's memory without faulting at all. The corruption only surfaces later, when something
+/// dereferences it: far past any single-step bound, and at a `rip` that is itself already
+/// translated, so no AV-path healer recognises it either.
+///
+/// A `#DB` from `EFLAGS.TF` fires *before* the trapped instruction executes, so correcting `xmm0`
+/// here means the store then writes the translated value.
+///
+/// Soundness is the same narrow argument case (1)'s register translation uses: a lane is rewritten
+/// only when it is byte-for-byte a value inside the relocation map's own source range AND the map
+/// sends it somewhere else -- the identical test [`translate_memory_operand_registers`] applies to a
+/// GPR, applied per 64-bit lane. Returns `true` iff at least one lane was healed.
+fn translate_stale_xmm_store_lanes(
+    instruction: &Instruction,
+    context: &mut CONTEXT,
+    relocations: &litebox::mm::AddressRelocations,
+) -> bool {
+    if crate::veh_gates().forkverify_xmm_off {
+        return false;
+    }
+    heal_xmm_store_lanes(instruction, context, |value| {
+        if relocations.is_in_source(value) {
+            relocations.translate(value)
+        } else {
+            None
+        }
+    })
+}
+
+/// The policy-free half of [`translate_stale_xmm_store_lanes`]: everything about the shape (which
+/// mnemonics, which lanes) with the "is this lane a stale pointer, and where does it go" decision
+/// injected as `translate`. Keeping the gate and the address-space map out of it is what makes the
+/// shape unit-testable without a real `AddressRelocations`.
+fn heal_xmm_store_lanes(
+    instruction: &Instruction,
+    context: &mut CONTEXT,
+    translate: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    use iced_x86::Mnemonic;
+    // Store-shaped only: memory destination, register source.
+    if instruction.op0_kind() != OpKind::Memory || instruction.op1_kind() != OpKind::Register {
+        return false;
+    }
+    let lane_count = match instruction.mnemonic() {
+        Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa
+        | Mnemonic::Movupd | Mnemonic::Movapd => 2,
+        Mnemonic::Movq => 1,
+        _ => return false,
+    };
+    // `op1_register()`, NOT `.full_register()`: for an SSE store iced reports the *full* register
+    // as `ZMM0`, so a match on `XMM0..XMM15` after `full_register()` never matches and the healer
+    // silently never fires. The mnemonics matched above are the 128-bit forms (an EVEX-encoded
+    // store decodes as `Vmovups`/`Vmovaps` and is deliberately not handled here), so the operand's
+    // own register is the `xmm` one.
+    let index = match instruction.op1_register() {
+        Register::XMM0 => 0,
+        Register::XMM1 => 1,
+        Register::XMM2 => 2,
+        Register::XMM3 => 3,
+        Register::XMM4 => 4,
+        Register::XMM5 => 5,
+        Register::XMM6 => 6,
+        Register::XMM7 => 7,
+        Register::XMM8 => 8,
+        Register::XMM9 => 9,
+        Register::XMM10 => 10,
+        Register::XMM11 => 11,
+        Register::XMM12 => 12,
+        Register::XMM13 => 13,
+        Register::XMM14 => 14,
+        Register::XMM15 => 15,
+        _ => return false,
+    };
+    let Some(lanes) = xmm_lanes(context, index) else {
+        return false;
+    };
+    let mut healed_any = false;
+    for lane in 0..lane_count {
+        let value = lanes[lane];
+        let Some(translated) = translate(value) else {
+            continue;
+        };
+        // A translation that leaves the value where it was is not a heal, exactly as case (1)
+        // treats a no-op `rip` translation.
+        if translated == value {
+            continue;
+        }
+        healed_any |= write_xmm_lane(context, index, lane, translated);
+    }
+    healed_any
 }
 
 /// Reads up to `buf.len()` bytes of instruction encoding at `rip`, stopping at the first byte
@@ -2854,7 +3034,31 @@ pub(crate) fn begin(
     if let Some(tls) = crate::get_tls_ptr() {
         // SAFETY: `get_tls_ptr` returns this thread's live `TlsState`.
         let tls = unsafe { &*tls };
-        if !crate::veh_gates().forkverify_off {
+        // A cross-process fork child is handed an IDENTITY relocation map
+        // (`AddressRelocations::identity_for_cross_process`, see the call site in
+        // `platform_fork`: the child's real memory always lives at SOURCE coordinates). For such a
+        // map `translate` is the identity function, so there is no stale pointer to heal -- yet
+        // verification still re-armed `TF` on every instruction and case (1) below still fired,
+        // "healing" `rip` to itself: chrF51 measured 823 MB of `rip == translated_rip` warn lines
+        // in one 300 s chromium run, one per single-step, capped at
+        // `MAX_IDENTITY_VERIFICATION_STEPS` (4096) per child -- ~940 KB of log and 4096 Windows
+        // exception round-trips per fork, buying nothing. Arming verification on a map that
+        // cannot relocate anything is the whole cost and none of the benefit, so don't.
+        // `LITEBOX_FORKVERIFY_IDENTITY=1` restores the old behaviour (the OFF switch for this).
+        let identity_is_vacuous =
+            relocations.is_identity() && !crate::veh_gates().forkverify_identity;
+        let armed = !crate::veh_gates().forkverify_off && !identity_is_vacuous;
+        // Without this line the two paths are indistinguishable from outside: `fvid1` read
+        // ok=30 in both arms with near-identical .err, and the only way to tell WHY was to guess.
+        // `identity=true` says the child came through the cross-process fork (the sole
+        // `identity_for_cross_process` call site, `lib.rs:14720`); `armed` says whether this fix
+        // let it skip verification. Run with
+        // `LITEBOX_LOG=warn,litebox_platform_windows_userland::fork_verify=debug` to see it.
+        litebox_util_log::debug!(
+            host_tid:? = std::thread::current().id(), identity:? = relocations.is_identity(), armed:? = armed;
+            "fork_verify: begin"
+        );
+        if armed {
             tls.fork_verify_step_count.set(0);
             tls.fork_verify_av_heal_count.set(0);
             tls.fork_verify_step_rip_repeat.set(None);
@@ -2932,5 +3136,124 @@ pub(crate) fn end() {
                 "diag-fv-lifecycle: end (SKIPPED clear -- already borrowed, map left live)"
             );
         }
+    }
+}
+
+
+#[cfg(test)]
+mod xmm_store_heal_tests {
+    use super::{heal_xmm_store_lanes, CONTEXT, CONTEXT_FLOATING_POINT_AMD64};
+    use iced_x86::{Decoder, DecoderOptions, Instruction};
+
+    const PARENT: usize = 0x1a03_639a_6a0;
+    const CHILD: usize = 0x15af_aeda_6a0;
+    const NON_POINTER: usize = 0x1122_3344_5566_7788;
+
+    fn decode(code: &[u8]) -> Instruction {
+        let mut decoder = Decoder::with_ip(64, code, 0x1000, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert!(!instruction.is_invalid(), "test code must assemble");
+        instruction
+    }
+
+    fn context_with_xmm0(low: usize, high: usize) -> CONTEXT {
+        let mut context: CONTEXT = unsafe { core::mem::zeroed() };
+        context.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
+        unsafe {
+            context.Anonymous.FltSave.XmmRegisters[0].Low = low as _;
+            context.Anonymous.FltSave.XmmRegisters[0].High = high as _;
+        }
+        context
+    }
+
+    fn xmm0(context: &CONTEXT) -> [usize; 2] {
+        let low = unsafe { context.Anonymous.FltSave.XmmRegisters[0].Low } as usize;
+        #[allow(clippy::cast_sign_loss)]
+        let high = unsafe { context.Anonymous.FltSave.XmmRegisters[0].High } as usize;
+        [low, high]
+    }
+
+    /// The healing policy a real fork supplies: a lane that names the source range is moved to
+    /// where that range landed in the child, anything else is left for the guest to interpret.
+    fn translate_parent_to_child(value: usize) -> Option<usize> {
+        (value == PARENT).then_some(CHILD)
+    }
+
+    /// The shape this whole module could not reach before: `movups [rsi], xmm0` -- a valid address,
+    /// stale DATA. Both 64-bit lanes of a 16-byte store must be translated.
+    #[test]
+    fn a_16_byte_store_translates_both_lanes() {
+        let instruction = decode(&[0x0f, 0x11, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+
+        assert!(heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert_eq!(xmm0(&context), [CHILD, CHILD]);
+    }
+
+    /// `movq [rsi], xmm0` writes 8 bytes: only the low lane reaches memory, so only the low lane may
+    /// be rewritten -- healing the high lane would corrupt a value the guest never stores.
+    #[test]
+    fn an_8_byte_store_translates_only_the_low_lane() {
+        let instruction = decode(&[0x66, 0x0f, 0xd6, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+
+        assert!(heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert_eq!(xmm0(&context), [CHILD, PARENT]);
+    }
+
+    /// The control that has to hold with the fix ON and OFF alike: an SSE lane carrying something
+    /// that is not a pointer the map knows about must come out byte-identical.
+    #[test]
+    fn a_non_pointer_lane_is_never_rewritten() {
+        let instruction = decode(&[0x0f, 0x11, 0x06]);
+        let mut context = context_with_xmm0(NON_POINTER, NON_POINTER);
+
+        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert_eq!(xmm0(&context), [NON_POINTER, NON_POINTER]);
+    }
+
+    /// The OFF arm's observable behaviour: with no translation on offer (`LITEBOX_FORKVERIFY_XMM_
+    /// OFF=1` short-circuits to exactly this) the store keeps the stale pointer.
+    #[test]
+    fn a_policy_that_translates_nothing_leaves_the_stale_pointer_alone() {
+        let instruction = decode(&[0x0f, 0x11, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+
+        assert!(!heal_xmm_store_lanes(&instruction, &mut context, |_| None));
+        assert_eq!(xmm0(&context), [PARENT, PARENT]);
+    }
+
+    /// A translation that does not move the value is not a heal, and must not claim one.
+    #[test]
+    fn an_identity_translation_is_not_counted_as_a_heal() {
+        let instruction = decode(&[0x0f, 0x11, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+
+        assert!(!heal_xmm_store_lanes(&instruction, &mut context, Some));
+        assert_eq!(xmm0(&context), [PARENT, PARENT]);
+    }
+
+    /// `mov [rsi], rax` is a GPR store and cannot carry stale SIMD state; the healer must not touch
+    /// `xmm0` just because it happens to hold a source-range value.
+    #[test]
+    fn a_general_purpose_store_is_not_touched() {
+        let instruction = decode(&[0x48, 0x89, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+
+        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert_eq!(xmm0(&context), [PARENT, PARENT]);
+    }
+
+    /// A trap context that never captured floating-point state has no XMM value to correct; reading
+    /// the union anyway would invent guest SIMD state out of nothing.
+    #[test]
+    fn a_context_without_floating_point_state_is_left_untouched() {
+        let instruction = decode(&[0x0f, 0x11, 0x06]);
+        let mut context = context_with_xmm0(PARENT, PARENT);
+        context.ContextFlags = 0;
+
+        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        context.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
+        assert_eq!(xmm0(&context), [PARENT, PARENT]);
     }
 }

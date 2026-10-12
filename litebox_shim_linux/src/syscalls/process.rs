@@ -1795,6 +1795,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     *byte = b;
                 }
                 self.set_task_comm(&name_buf);
+                // A fork child that never `execve`s keeps its PARENT's `cmdline`, so every
+                // chromium zygote child reads `--type=zygote` in `/proc` and `ps` - the one place
+                // a child says what it became is `prctl(PR_SET_NAME)`, which is what separates a
+                // legitimate spawn from a crash loop among the ~1.6/s fork churn.
+                let end = name_buf.iter().position(|b| *b == 0).unwrap_or(name_buf.len());
+                if let Ok(set_name) = core::str::from_utf8(&name_buf[..end]) {
+                    litebox_util_log::warn!(
+                        pid:% = self.pid.get(), tid:% = self.tid.get(), name = set_name;
+                        "diag-prctl-name: a task renamed itself");
+                }
                 Ok(0)
             }
             PrctlArg::GetSecureBits => Ok(0),
@@ -2822,6 +2832,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if ends_host_process {
             // Shell convention: a signal death reads back as `128 + signo`; a raw host exit code
             // cannot carry `WIFSIGNALED`, which the parent's `wait4` would otherwise report.
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                -1,
+                &self.comm.get(),
+                "prepare",
+            );
+            crate::diag::emit_child_exit_last_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                -1,
+                &self.comm.get(),
+                "prepare",
+            );
             let code = match self.process().wait_for_exit() {
                 ExitStatus::Exit(code) => i32::from(code) & 0xff,
                 ExitStatus::Signal(sig) => 128 + sig.as_i32(),
@@ -2845,6 +2871,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "DIAG_TIMELINE exit"
         );
         self.print_diag_reports_if_bootstrap_process();
+        if IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit",
+            );
+            crate::diag::emit_child_exit_last_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit",
+            );
+        }
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
         self.global.platform.end_fork_child_verification();
@@ -2862,6 +2906,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "DIAG_TIMELINE exit_group"
         );
         self.print_diag_reports_if_bootstrap_process();
+        if IS_NATIVE_FORK_CHILD.load(Ordering::Relaxed) {
+            crate::diag::emit_child_exit_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit_group",
+            );
+            crate::diag::emit_child_exit_last_trail(
+                self.global.platform,
+                self.pid.get(),
+                self.tid.get(),
+                status,
+                &self.comm.get(),
+                "exit_group",
+            );
+        }
         // Tear down occurs similarly to `sys_exit`.
         self.global.platform.end_fork_child_verification();
         self.exit_group(ExitStatus::Exit(status.trunc()));
@@ -3596,7 +3658,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
     ) -> Result<usize, Errno> {
-        self.do_clone(ctx, args, false)
+        Self::report_fork_failure(args, self.do_clone(ctx, args, false), self)
     }
 
     pub(crate) fn sys_clone3(
@@ -3605,7 +3667,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         args: UserPtr<litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
         let args = args.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        self.do_clone(ctx, &args, true)
+        Self::report_fork_failure(&args, self.do_clone(ctx, &args, true), self)
+    }
+
+    /// WHY a `fork()` a guest asked for was refused, named once per refusal.
+    ///
+    /// Chromium's zygote reports `Zygote could not fork: ... child_pid -1` with no errno, and a
+    /// fork that is simply refused is invisible everywhere else: the guest sees -1, `do_clone`'s
+    /// dozens of `Err` returns each look locally obvious, and nothing ever says which one fired or
+    /// whether the reason was a cap, an argument, or an allocation. Only a FORK-shaped clone is
+    /// logged (`CLONE_VM` absent): a thread clone's refusals are the ordinary `pthread_create`
+    /// path, and chromium alone calls enough of those to bury this line.
+    fn report_fork_failure(
+        args: &litebox_common_linux::CloneArgs,
+        result: Result<usize, Errno>,
+        task: &Self,
+    ) -> Result<usize, Errno> {
+        let Err(errno) = result else {
+            return result;
+        };
+        if args.flags.contains(CloneFlags::VM) {
+            return result;
+        }
+        // Throttled: a fork storm must not turn into a log storm. The first refusals are the
+        // informative ones, then one in 500 so a long storm is still countable.
+        static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let seen = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if seen > 50 && seen % 500 != 0 {
+            return result;
+        }
+        let (in_use, sealed, members) = task.global.pid_namespaces.occupancy();
+        litebox_util_log::warn!(
+            errno = errno.as_str(),
+            flags:% = args.flags.bits(),
+            newpid = args.flags.contains(CloneFlags::NEWPID),
+            newuser = args.flags.contains(CloneFlags::NEWUSER),
+            pid_rows = members,
+            namespaces = in_use,
+            sealed = sealed,
+            tid:% = task.tid.get(),
+            seen = seen;
+            "diag-clone-fail: a fork-shaped clone was refused");
+        result
     }
 
     /// Handle syscall `unshare`. `CLONE_NEWUSER` is the one flag with a real implementation: the
@@ -3919,6 +4022,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     };
                     let eof_probe = alloc::sync::Arc::clone(&end);
                     let pending_probe = alloc::sync::Arc::clone(&end);
+                    let peek_probe = alloc::sync::Arc::clone(&end);
+                    let shutdown_probe = alloc::sync::Arc::clone(&end);
                     let mut bridge = match half {
                         litebox::pipes::HalfPipeType::SenderHalf => {
                             litebox::platform::ForkPipeBridge::Sink(
@@ -3931,6 +4036,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     || false,
                                     || 0,
+                                    |_buf: &mut [u8]| 0,
+                                    || false,
                                     false,
                                 ),
                             )
@@ -3969,6 +4076,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     owners,
                                     move || eof_probe.at_eof(),
                                     move || pending_probe.buffered_bytes(),
+                                    move |buf: &mut [u8]| peek_probe.peek(buf),
+                                    move || shutdown_probe.peer_shutdown(),
                                     // Only the child's stdin has a buffer that is waiting for the
                                     // child; every other inherited read end the parent may still
                                     // read itself, and a pump that drains it silently takes the
@@ -5644,17 +5753,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // ancestor too, which is what lets the parent still `wait4` for it).
         let child_ns_id = if flags.contains(CloneFlags::NEWPID) {
             crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:pidns-create");
-            // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (dead namespace slots are
-            // never recycled) so one binary proves both sides of the leak, see
+            // A namespace slot is held as long as a task in it exists, so it has to be recyclable
+            // or `MAX_NAMESPACES` `CLONE_NEWPID` clones is a whole session's budget. `alive` is
+            // host-pid liveness, the same test every other shared table reclaims a dead holder by.
+            let platform = self.global.platform;
+            let alive = |internal: i32| {
+                self.global
+                    .process_table
+                    .lookup(internal)
+                    .map_or(false, |view| platform.is_process_alive(view.host_pid))
+            };
+            // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (a slot is allocated
+            // once and never freed) so one binary proves both sides of this, see
             // `PidNamespaceTable::create`.
-            let reclaim_dead = !self
+            let reclaim = !self
                 .global
                 .platform
                 .env_flag("LITEBOX_PIDNS_RECLAIM_OFF");
             let created = self
                 .global
                 .pid_namespaces
-                .create(self.pid_ns.get(), reclaim_dead);
+                .create(self.pid_ns.get(), &alive, reclaim);
             if created.is_none() {
                 litebox_util_log::warn!(
                     tid:% = self.tid.get(), comm:? = self.comm.get(), flags:? = flags;

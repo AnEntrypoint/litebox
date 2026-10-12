@@ -172,7 +172,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
             global,
             raw_fd,
             |_inet| Err(Errno::ENOTSOCK),
-            |unix| Ok(unix.fork_carry_check()),
+            |unix| Ok(unix.fork_carry_check(global)),
             |_netlink| Err(Errno::ENOTSOCK),
         )
         .ok()

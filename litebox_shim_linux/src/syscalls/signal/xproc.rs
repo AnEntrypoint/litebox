@@ -48,6 +48,12 @@ const CMDLINE_MAX: usize = 512;
 const SLOT_FREE: i32 = 0;
 const SLOT_CLAIMING: i32 = -1;
 
+/// How many registrations the table takes between two sweeps for rows nobody reaped. One sweep
+/// walks 512 slots and asks the host about each live one, so it is worth doing often enough that
+/// a fork-heavy workload cannot fill the table (a few hundred forks), and rarely enough that it
+/// is not per-fork work.
+const SWEEP_EVERY_REGISTRATIONS: u32 = 32;
+
 struct ProcessSlot {
     pid: AtomicI32,
     host_pid: AtomicU32,
@@ -355,26 +361,41 @@ impl SharedProcessTable {
         self.members().count()
     }
 
-    fn reclaim_dead_hosts(&self, host_alive: &impl Fn(u32) -> bool) {
+    pub(crate) fn occupancy(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.pid.load(Ordering::Acquire) > 0)
+            .count()
+    }
+
+    /// Frees every row `is_ghost` says no live process still needs, and returns how many.
+    pub(crate) fn reclaim_where(&self, is_ghost: impl Fn(u32, i32) -> bool) -> usize {
+        let mut reclaimed = 0;
         for (i, slot) in self.slots.iter().enumerate() {
             let pid = slot.pid.load(Ordering::Acquire);
-            // A slot registered with host 0 ("no cross-process signal delivery on this platform")
-            // carries no host to test: reclaiming it would drop a live process from `/proc/<pid>`.
-            // It is released by `unregister` when that process exits, like any other.
-            if pid > 0
-                && slot.host_pid.load(Ordering::Acquire) != 0
-                && !host_alive(slot.host_pid.load(Ordering::Acquire))
+            if pid <= 0 || !is_ghost(slot.host_pid.load(Ordering::Acquire), pid) {
+                continue;
+            }
+            // Only on success: a failed CAS means another host process owns this slot now, and
+            // clearing it would drop a live process's identity.
+            if slot
+                .pid
+                .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                let reclaimed =
-                    slot.pid
-                        .compare_exchange(pid, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire);
-                // Only on success: a failed CAS means someone else owns this slot now, and
-                // clearing it would drop a live process's identity.
-                if reclaimed.is_ok() {
-                    self.clear_identity(i as u32);
-                }
+                slot.pending.store(0, Ordering::Relaxed);
+                self.clear_identity(i as u32);
+                reclaimed += 1;
             }
         }
+        reclaimed
+    }
+
+    /// A slot registered with host 0 ("no cross-process signal delivery on this platform") carries
+    /// no host to test: reclaiming it would drop a live process from `/proc/<pid>`. It is released
+    /// by `unregister` when that process exits, like any other.
+    fn reclaim_dead_hosts(&self, host_alive: &impl Fn(u32) -> bool) {
+        self.reclaim_where(|host_pid, _| host_pid != 0 && !host_alive(host_pid));
     }
 
     pub(crate) fn set_host(&self, index: u32, pid: i32, host_pid: u32, owns_host: bool) {
@@ -581,6 +602,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .start_signal_wake_listener(alloc::boxed::Box::new(move || drain_host(&global)));
     }
 
+    /// Releases rows no live process still needs, every [`SWEEP_EVERY_REGISTRATIONS`] calls.
+    ///
+    /// A row is otherwise released only when its parent reaps it (`xproc_unregister`) and, failing
+    /// that, by `register`'s reclaim under allocation PRESSURE -- so a child nobody reaps keeps its
+    /// row until all 512 are taken, `/proc` and `ps` accumulate one ghost per fork (426 of 512 in a
+    /// 400 s chromium run) and a RECYCLED pid can `find()` a dead process's row. A row is a ghost
+    /// here when its host process is gone -- a cross-process fork child IS its own host process, so
+    /// its exit is enough -- or when this host process registered that pid and the `Process` it
+    /// pointed at has since been dropped.
+    ///
+    /// `LITEBOX_PROCTAB_SWEEP_OFF=1` restores the pre-fix behaviour (rows released only under
+    /// pressure) so one binary proves both sides of this.
+    fn xproc_sweep_if_due(&self, host: u32) {
+        static REGISTRATIONS: AtomicU32 = AtomicU32::new(0);
+        if REGISTRATIONS
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_rem(SWEEP_EVERY_REGISTRATIONS)
+            != 0
+        {
+            return;
+        }
+        if self.global.platform.env_flag("LITEBOX_PROCTAB_SWEEP_OFF") {
+            return;
+        }
+        let dead_here: alloc::vec::Vec<i32> = {
+            let mut local = self.global.xproc_local.lock();
+            let dead = local
+                .iter()
+                .filter(|(_, process)| process.strong_count() == 0)
+                .map(|(pid, _)| *pid)
+                .collect();
+            local.retain(|_, process| process.strong_count() > 0);
+            dead
+        };
+        let reclaimed = self.global.process_table.reclaim_where(|host_pid, pid| {
+            !self.global.platform.is_process_alive(host_pid)
+                || (host_pid == host && dead_here.contains(&pid))
+        });
+        litebox_util_log::warn!(
+            host:% = host, rows:% = self.global.process_table.occupancy(), reclaimed:% = reclaimed;
+            "diag-proctab: swept the shared process table"
+        );
+    }
+
     /// Registers a process that runs in this host process under guest pid `pid`.
     pub(crate) fn xproc_register_local(
         &self,
@@ -589,6 +654,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         host: u32,
         owns_host: bool,
     ) {
+        self.xproc_sweep_if_due(host);
         let platform = self.global.platform;
         let Some(index) = self.global.process_table.register(
             pid,
