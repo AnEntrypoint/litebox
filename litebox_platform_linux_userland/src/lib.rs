@@ -2907,7 +2907,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 ));
                 litebox::platform::page_mgmt::AllocationError::AddressInUse
             }
-            _ => panic!("unhandled mmap error {err}"),
+            // The arguments come from the guest's mmap, so any other kernel refusal is an errno
+            // for the guest, not a host panic. AllocationError has no variant that carries a raw
+            // errno, so each refusal maps to the nearest variant the shim turns back into an errno:
+            // EINVAL -> EINVAL, EACCES/EPERM -> EPERM, everything else (resource refusals) -> ENOMEM.
+            syscalls::Errno::EINVAL => litebox::platform::page_mgmt::AllocationError::Unaligned,
+            syscalls::Errno::EACCES | syscalls::Errno::EPERM => {
+                litebox::platform::page_mgmt::AllocationError::BelowMinAddress
+            }
+            _ => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
         })?;
         Ok(UserMutPtr::from_usize(ptr))
     }
