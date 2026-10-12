@@ -121,3 +121,8 @@ Candidate refuted (2026-10-12): background subsystems off (`--disable-background
 --disable-component-update --disable-sync --disable-extensions --disable-default-apps` plus
 translate/optimization-hints/media-router features). IO zero-event polls 2806 of 3956 (71%), baseline 70%;
 chromium window still uniform grey. Background work is not the spin or the paint blocker.
+
+Candidate refuted (2026-10-12): `--disable-features=VizDisplayCompositor`, plain multi-process, 150 s hold.
+The desktop paints (203 colours) and chromium's window stays uniform grey (`cececeff`, 9 captures). The
+compositor-selection flag does not change the paint result. (A first run at a 60 s hold showed no desktop
+yet, so only the 150 s run is the valid comparison.)
