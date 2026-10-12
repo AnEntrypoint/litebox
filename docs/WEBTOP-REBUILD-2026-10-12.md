@@ -99,3 +99,7 @@ desktop paints (201 colours), chromium window stays uniform grey. The striped ba
 Syscall summary (`LITEBOX_STRACE_SUMMARY=1`, plain multi-process): the table reports only the guest
 shell (`comm=sh`), not chromium's processes, so it cannot show the browser main-thread poll loop. Per-process
 summaries are needed before the busy-loop can be attributed. No `epoll_wait`/`ppoll` appears in this table.
+
+ppoll spin (`LITEBOX_SPIN_STACK=271`, every 8192nd ppoll): multi-process 13 entries, single-process
+(which paints) 12 entries. The hot ppoll loop is present in both, so it is NOT the paint blocker. It is a
+separate defect; the multi-process renderer's missing frames are a different problem.
