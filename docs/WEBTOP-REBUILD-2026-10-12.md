@@ -116,3 +116,8 @@ chromium debug package is in the local apt cache (xtradeb PPA build 154.0.8037.9
 `--vmodule` runs for message_pump and sequence_manager produced no task-level log lines in this build.
 Remaining routes: a symbolized build (needs apt index update, root, network), or litebox-side per-task
 instrumentation.
+
+Candidate refuted (2026-10-12): background subsystems off (`--disable-background-networking
+--disable-component-update --disable-sync --disable-extensions --disable-default-apps` plus
+translate/optimization-hints/media-router features). IO zero-event polls 2806 of 3956 (71%), baseline 70%;
+chromium window still uniform grey. Background work is not the spin or the paint blocker.
