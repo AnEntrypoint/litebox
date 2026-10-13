@@ -39,6 +39,54 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
 /// as number of CPUs.
 const HASH_TABLE_ENTRIES: usize = 256;
 
+/// Diagnostic: waits currently parked in `FutexManager::wait`, process-wide. A wait claims a slot
+/// on entry and releases it on return, so a dump lists the whole wait-for set.
+const DIAG_WAIT_SLOTS: usize = 256;
+
+static DIAG_WAIT_ADDR: [core::sync::atomic::AtomicUsize; DIAG_WAIT_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; DIAG_WAIT_SLOTS];
+
+/// Packs the waiter's expected value (high 32 bits) and bitset (low 32 bits).
+static DIAG_WAIT_INFO: [core::sync::atomic::AtomicU64; DIAG_WAIT_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_WAIT_SLOTS];
+
+fn diag_claim(addr: usize, expected: u32, bitset: u32) -> Option<usize> {
+    for (slot, (addr_slot, info_slot)) in DIAG_WAIT_ADDR.iter().zip(&DIAG_WAIT_INFO).enumerate() {
+        if addr_slot
+            .compare_exchange(0, addr, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let packed = (u64::from(expected) << 32) | u64::from(bitset);
+            info_slot.store(packed, Ordering::Release);
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn diag_release(slot: Option<usize>) {
+    if let Some(slot) = slot {
+        DIAG_WAIT_ADDR[slot].store(0, Ordering::Release);
+    }
+}
+
+fn diag_dump_parked(reporter_addr: usize) {
+    for (addr_slot, info_slot) in DIAG_WAIT_ADDR.iter().zip(&DIAG_WAIT_INFO) {
+        let addr = addr_slot.load(Ordering::Acquire);
+        if addr == 0 {
+            continue;
+        }
+        let info = info_slot.load(Ordering::Acquire);
+        litebox_util_log::warn!(
+            addr:% = addr,
+            expected:% = info >> 32,
+            bitset:% = info & 0xffff_ffff,
+            reporter:% = addr == reporter_addr;
+            "diag-futex-parked: a FUTEX_WAIT is parked"
+        );
+    }
+}
+
 struct FutexEntry<Platform: RawSyncPrimitivesProvider> {
     addr: usize,
     waker: Waker<Platform>,
@@ -130,7 +178,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // keeps re-parking. Report the guest word once it passes 1024 re-parks, with `done` and
         // the value a FUTEX_WAKE would have to change.
         let polls = core::cell::Cell::new(0u32);
-        match cx.wait_until(|| {
+        let diag_slot = diag_claim(addr, expected_value, bitset);
+        let waited = cx.wait_until(|| {
             let n = polls.get().wrapping_add(1);
             polls.set(n);
             let done = entry.get().done.load(Ordering::Acquire);
@@ -144,8 +193,15 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                     "diag-futex-spin: guest FUTEX_WAIT re-polled 1024 times without done"
                 );
             }
+            // At 65536 re-parks the wait is past any healthy one: dump every parked waiter, so a
+            // stall shows the wait-for set rather than a single entry.
+            if n == 65_536 && !done {
+                diag_dump_parked(addr);
+            }
             done
-        }) {
+        });
+        diag_release(diag_slot);
+        match waited {
             Ok(()) => Ok(()),
             // A wake that raced our timeout or interrupt has already consumed this entry: report
             // success (as Linux does when the waker wins), otherwise the wake is silently lost.
