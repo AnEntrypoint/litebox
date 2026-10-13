@@ -149,3 +149,17 @@ Failures (6): 4 guest stalls before the first capture (`ingpu2`, `ig4`, `sa3`, `
 with `LITEBOX_DIAG_STUCK_SECS=45`) and 2 completed runs where the XFCE desktop never came up (`sa2`, `sa5`:
 root stays the bare weave, chromium window 0 bytes). The session-log dump was added to `wt.sh`; the four
 `lg*` runs all painted, so no failure was captured with its logs yet.
+
+## Failure causes found (2026-10-13)
+
+1. XFCE desktop never up (`bw5`): the session log says `No window manager registered on screen 0`
+   and xfwm4 exits with `Could not find a screen to manage, exiting` (after `Previous window manager
+   (unknown) ... is not exiting`, which also appears in passing runs). So xfwm4 loses a startup race
+   on the screen query. Passing runs register xfwm4 and paint.
+2. Guest stall (`ss1`, `ss8`, `w46`, `hb1`, `hb5`, `hb7`, `tl5`): the guest shell (vfork'd `sleep 30`)
+   blocks in `wait4(-1)` after its child has exited (`tl5` trace: child `exit_group` ok, parent's last
+   syscall is `wait4` with no return). The repoll diagnostic (`LITEBOX_DIAG_WAIT4`) did not fire in
+   the runs where the stall was traced, so the parent is not stuck in that repoll loop.
+
+Xvfb in this rootfs is XLibre: it rejects `-noreset`, but its default already keeps the server running
+after the last client disconnects, so server reset is NOT the cause.
