@@ -163,3 +163,11 @@ root stays the bare weave, chromium window 0 bytes). The session-log dump was ad
 
 Xvfb in this rootfs is XLibre: it rejects `-noreset`, but its default already keeps the server running
 after the last client disconnects, so server reset is NOT the cause.
+
+## Reliability on current main (2026-10-13)
+
+Current `main` (711072df, build-verified, with the env-gated diagnostics): 8 of 8 full runs painted and
+completed (`cu1`-`cu8`), no stalls, no `wait4` diagnostic records.
+
+Latest five batches combined (`fb`, `fc`, `ss`, `bw`, `cu`): 35 of 40 painted. The 5 failures were 2 guest
+stalls, 2 stalls, and 1 XFCE window-manager startup race (`bw5`: xfwm4 `Could not find a screen`).
