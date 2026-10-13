@@ -480,7 +480,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         );
         let _end_wait = crate::utils::defer(|| self.end_wait());
         let caller = core::panic::Location::caller();
+        let started = self.waker.0.platform.now();
         let mut reparks: u64 = 0;
+        let mut reported = false;
         loop {
             self.start_wait();
             if ready() {
@@ -505,17 +507,28 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
                 }
                 Err(e) => return Err(e),
             }
-            // A wait that returns without its condition and parks again is the livelock shape
-            // (a hot spin with no progress). Name the caller once, at a threshold a healthy wait
-            // never reaches, so the log points at the loop rather than at the futex.
+            // A wait that returns without its condition and parks again is the livelock shape. A
+            // count threshold misses a slow one (hs2 re-parked about 60k times in 420 s), so name
+            // the caller once when one wait has looped for 30 s of wall clock.
             reparks += 1;
-            if reparks == WAIT_SPIN_REPORT_AT {
-                litebox_util_log::warn!(
-                    file:% = caller.file(),
-                    line = caller.line(),
-                    reparks = reparks;
-                    "diag-wait-spin: wait_until re-parked without its condition"
-                );
+            if !reported && reparks % REPARK_CLOCK_CHECK_EVERY == 0 {
+                let looped = self
+                    .waker
+                    .0
+                    .platform
+                    .now()
+                    .checked_duration_since(&started)
+                    .unwrap_or_default();
+                if looped >= REPARK_REPORT_AFTER {
+                    reported = true;
+                    litebox_util_log::warn!(
+                        file:% = caller.file(),
+                        line = caller.line(),
+                        reparks = reparks,
+                        looped_s = looped.as_secs();
+                        "diag-wait-spin: wait_until re-parked without its condition"
+                    );
+                }
             }
         }
     }
@@ -526,7 +539,14 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     }
 }
 
-/// Re-parks one `wait_until` may make before it reports its caller as spinning.
+/// Re-parks between wall-clock checks in `wait_until`; a clock read per park would cost more than
+/// the spin it measures.
+const REPARK_CLOCK_CHECK_EVERY: u64 = 1024;
+
+/// Wall-clock time one `wait_until` may loop before it reports its caller as spinning.
+const REPARK_REPORT_AFTER: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// Interrupted waits one process may take before the wait that crosses it reports its caller.
 const WAIT_SPIN_REPORT_AT: u64 = 200_000;
 
 /// Waits, process-wide, that returned `Interrupted` (see `wait_until`).
