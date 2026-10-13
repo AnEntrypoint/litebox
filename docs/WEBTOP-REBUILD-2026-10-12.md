@@ -187,3 +187,14 @@ Timed futex parks of 10 s or more (every such entry/exit logged to stderr by the
 
 Next: find which guest timer re-arm or futex caller produces the instant returns, and why one timed park
 in `lw5` outlived its timeout.
+
+## Window-manager race: fixed by letting the session start xfwm4 (2026-10-13)
+
+The boot script used to start `xfwm4 --replace` itself at rung 2 and then `xfce4-session` started
+its own window manager, so the two raced on the screen (`No window manager registered` /
+`Could not find a screen to manage`). The script now starts xfwm4 only at rung 2 (`-lt 3`), and rung 3+
+lets the session start it.
+
+Result: batch `nw1`-`nw8`, current main, 8 of 8 painted, no window-manager failure.
+The boot script is saved as `docs/tools/webtop-wt.sh`.
+Remaining known failure: the guest stall (3 of the last 40 runs stalled before the first capture; cause still open).

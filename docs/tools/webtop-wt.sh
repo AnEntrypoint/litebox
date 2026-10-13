@@ -17,14 +17,17 @@ guard() {
   return 0
 }
 echo "[wt] rung=$R hold=$HOLD extra=[$EXTRA]"
+echo "[hb] boot" >&2
 /usr/bin/Xvfb :0 -screen 0 1024x768x24 -nolisten tcp -ac -retro -noreset -extension MIT-SHM >/tmp/home/xvfb.log 2>&1 &
 sleep 60
 echo "[wt] X0 assumed up after 60s"
-if [ $R -ge 2 ]; then /usr/bin/xfwm4 --display :0 --replace --compositor=off >/tmp/home/xfwm4.log 2>&1 & echo "[wt] xfwm4 spawned"; sleep 5; fi
+echo "[wt] X0 assumed up after 60s"
+if [ $R -ge 2 ] && [ $R -lt 3 ]; then /usr/bin/xfwm4 --display :0 --replace --compositor=off >/tmp/home/xfwm4.log 2>&1 & echo "[wt] xfwm4 spawned"; sleep 5; fi
 if [ $R -ge 3 ]; then /usr/bin/xfce4-session >/tmp/home/session.log 2>&1 & echo "[wt] xfce4-session spawned"; fi
 if [ $R -ge 4 ]; then sleep 20; /usr/lib/chromium/chromium $EXTRA --ozone-platform=x11 --no-first-run --disable-breakpad --disable-crash-reporter --no-default-browser-check --user-data-dir=/tmp/home/udd --window-size=1024,768 --enable-logging=stderr file:///page.html >/tmp/home/chrome.out 2>/tmp/home/chrome.err & echo "[wt] chromium spawned"; fi
 t=0
 while [ $t -lt $HOLD ]; do
+  echo "[hb] loop t=$t" >&2
   sleep 30; t=$((t+30))
   guard xwd -root -silent -out /tmp/home/root.xwd
   n=$(wc -c < /tmp/home/root.xwd 2>/dev/null || echo 0)
@@ -39,4 +42,7 @@ while [ $t -lt $HOLD ]; do
   if [ -n "$cid" ]; then guard xwd -id "$cid" -silent -out /tmp/home/c.xwd; m=$(wc -c < /tmp/home/c.xwd 2>/dev/null || echo 0); echo "[wt] chromium bytes=$m"; if [ "$m" -gt 0 ]; then echo "CXWD$m"; cat /tmp/home/c.xwd; echo; echo "END-CXWD"; fi; fi
 done
 echo "[wt] done t=$t"
-echo "[wt] chrome.err begin"; head -n 220 /tmp/home/chrome.err 2>/dev/null | head -c 60000; echo "[wt] chrome.err end"
+echo "[wt] session.log tail:"; head -c 6000 /tmp/home/session.log 2>/dev/null; echo
+echo "[wt] xfwm4.log tail:"; head -c 3000 /tmp/home/xfwm4.log 2>/dev/null; echo
+echo "[wt] xvfb.log tail:"; head -c 1500 /tmp/home/xvfb.log 2>/dev/null; echo
+echo "[wt] chrome.err begin"; grep -a -v -E "Import Map|dbus|DBus|scheduler_loop|script_context|modulator|Created context|frame: |Num tracked|vaapi|libva|Desktop Identity|signin|token_service|idle_linux|CONSOLE" /tmp/home/chrome.err 2>/dev/null | tail -n 400 | head -c 90000; echo "[wt] chrome.err end"
