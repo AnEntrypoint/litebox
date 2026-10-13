@@ -494,7 +494,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         let started = self.waker.0.platform.now();
         let mut reparks: u64 = 0;
         let mut reported = false;
-        loop {
+        let result = loop {
             self.start_wait();
             if ready() {
                 break Ok(());
@@ -514,9 +514,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
                             "diag-wait-spin: waits keep returning Interrupted"
                         );
                     }
-                    return Err(WaitError::Interrupted);
+                    break Err(WaitError::Interrupted);
                 }
-                Err(e) => return Err(e),
+                Err(e) => break Err(e),
             }
             // A wait that returns without its condition and parks again is the livelock shape. A
             // count threshold misses a slow one (hs2 re-parked about 60k times in 420 s), so name
@@ -541,7 +541,26 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
                     );
                 }
             }
+        };
+        // A flagged wait that never returns is the stall; one that returns shows how long it spun.
+        if reported {
+            let looped = self
+                .waker
+                .0
+                .platform
+                .now()
+                .checked_duration_since(&started)
+                .unwrap_or_default();
+            litebox_util_log::warn!(
+                file:% = caller.file(),
+                line = caller.line(),
+                reparks = reparks,
+                looped_s = looped.as_secs(),
+                outcome:% = if result.is_ok() { "ok" } else { "err" };
+                "diag-wait-spin-end: a flagged wait returned"
+            );
         }
+        result
     }
 
     /// Returns the waker associated with this wait context.
