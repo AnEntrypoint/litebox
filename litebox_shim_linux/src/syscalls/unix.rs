@@ -1079,6 +1079,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         }
         if self.slot_ref().framed.load(Ordering::Acquire) {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
+                if self.platform().env_flag("LITEBOX_DIAG_BIGMSG") {
+                    litebox_util_log::warn!(
+                        len:% = msg.data.len(), slot:% = self.slot;
+                        "[diag-bigmsg] framed send refused EMSGSIZE"
+                    );
+                }
                 UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
                 return Err((msg, Errno::EMSGSIZE));
             }
@@ -1097,6 +1103,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         }
         if msg.data.len() > SHARED_UNIX_CONN_BUF {
             let n = write_ring.try_write_with_fds(&msg.data[..SHARED_UNIX_CONN_BUF], fd_specs);
+            if self.platform().env_flag("LITEBOX_DIAG_BIGMSG") {
+                litebox_util_log::warn!(
+                    len:% = msg.data.len(), wrote:% = n, slot:% = self.slot;
+                    "[diag-bigmsg] stream send partial write"
+                );
+            }
             return if n == 0 {
                 Err((msg, Errno::EAGAIN))
             } else {
@@ -3108,7 +3120,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         task.global
             .unix_shared_conn_table
             .get(slot)
-            .release(is_client, release_host);
+            .release(is_client, release_host, task.global.platform);
         Some(datagram)
     }
 

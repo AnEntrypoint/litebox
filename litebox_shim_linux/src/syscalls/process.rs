@@ -3418,6 +3418,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(Errno::ECHILD);
             }
             let mut found: Option<AnyChildExit> = None;
+            let mut wait4_spins: usize = 0;
             let mut poll_once = || {
                 // Cross-process children first: `try_wait_for_cross_process_exit` is a cheap,
                 // side-effect-free poll (the real reap happens below, once, after the loop), so
@@ -3476,6 +3477,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         Err(litebox::event::wait::WaitError::TimedOut) => {
                             // Our own repoll bound elapsed with no wake -- loop back and re-scan
                             // both registries directly instead of waiting on the notify again.
+                            wait4_spins += 1;
+                            if wait4_spins % 2000 == 0 && self.global.platform.env_flag("LITEBOX_DIAG_WAIT4") {
+                                let children = process.children.lock();
+                                let cross = process.cross_process_children.lock();
+                                litebox_util_log::warn!(
+                                    tid:% = self.tid.get(), spins:% = wait4_spins,
+                                    children:% = children.len(), cross:% = cross.len();
+                                    "[diag-wait4-stuck] parent still blocked in wait4(-1)"
+                                );
+                                for (p, c) in children.iter() {
+                                    litebox_util_log::warn!(
+                                        child:% = *p, done:% = c.try_wait_for_exit().is_some();
+                                        "[diag-wait4-stuck] thread child"
+                                    );
+                                }
+                                for (p, h) in cross.iter() {
+                                    litebox_util_log::warn!(
+                                        child:% = *p,
+                                        done:% = self.global.platform.try_wait_for_cross_process_exit(*h).is_some();
+                                        "[diag-wait4-stuck] cross child"
+                                    );
+                                }
+                            }
                             continue;
                         }
                         Err(litebox::event::wait::WaitError::Interrupted) => {
