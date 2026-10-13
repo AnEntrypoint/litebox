@@ -126,7 +126,26 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Only return when woken--don't reevaluate the futex word. This
         // ensures that the rate control mechanisms provided by the futex
         // interface are effective.
-        match cx.wait_until(|| entry.get().done.load(Ordering::Acquire)) {
+        // Diagnostic: the readiness check runs once per re-park, so the count names a wait that
+        // keeps re-parking. Report the guest word once it passes 1024 re-parks, with `done` and
+        // the value a FUTEX_WAKE would have to change.
+        let polls = core::cell::Cell::new(0u32);
+        match cx.wait_until(|| {
+            let n = polls.get().wrapping_add(1);
+            polls.set(n);
+            let done = entry.get().done.load(Ordering::Acquire);
+            if n == 1024 && !done {
+                let word = futex_addr.read_at_offset(0).unwrap_or(u32::MAX);
+                litebox_util_log::warn!(
+                    addr:% = addr,
+                    expected:% = expected_value,
+                    word:% = word,
+                    bitset:% = bitset;
+                    "diag-futex-spin: guest FUTEX_WAIT re-polled 1024 times without done"
+                );
+            }
+            done
+        }) {
             Ok(()) => Ok(()),
             // A wake that raced our timeout or interrupt has already consumed this entry: report
             // success (as Linux does when the waker wins), otherwise the wake is silently lost.
