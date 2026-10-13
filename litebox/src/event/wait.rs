@@ -480,6 +480,17 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         );
         let _end_wait = crate::utils::defer(|| self.end_wait());
         let caller = core::panic::Location::caller();
+        // A fresh call from a spinning site never loops inside one wait, so sample the entries
+        // themselves: the site that dominates a stalled log is the one that spins.
+        let entries = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
+        if entries % WAIT_ENTRY_SAMPLE_EVERY == 0 {
+            litebox_util_log::warn!(
+                file:% = caller.file(),
+                line = caller.line(),
+                entries = entries;
+                "diag-wait-sample: every 100k wait entries names the caller"
+            );
+        }
         let started = self.waker.0.platform.now();
         let mut reparks: u64 = 0;
         let mut reported = false;
@@ -548,6 +559,12 @@ const REPARK_REPORT_AFTER: core::time::Duration = core::time::Duration::from_sec
 
 /// Interrupted waits one process may take before the wait that crosses it reports its caller.
 const WAIT_SPIN_REPORT_AT: u64 = 200_000;
+
+/// `wait_until` entries between samples that name their caller.
+const WAIT_ENTRY_SAMPLE_EVERY: u64 = 100_000;
+
+/// `wait_until` entries, process-wide (see `WAIT_ENTRY_SAMPLE_EVERY`).
+static WAIT_ENTRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Waits, process-wide, that returned `Interrupted` (see `wait_until`).
 static INTERRUPTED_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
