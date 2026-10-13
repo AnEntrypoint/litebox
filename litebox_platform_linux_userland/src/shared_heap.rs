@@ -356,6 +356,74 @@ fn report_big_alloc(size: usize) {
     unsafe { libc::write(2, buf.as_ptr().cast(), n) };
 }
 
+fn put_bytes(out: &mut [u8], n: &mut usize, b: &[u8]) {
+    for &c in b {
+        if *n < out.len() {
+            out[*n] = c;
+            *n += 1;
+        }
+    }
+}
+
+fn put_dec(mut v: usize, out: &mut [u8], n: &mut usize) {
+    let mut digits = [0u8; 20];
+    let mut k = 0;
+    loop {
+        digits[k] = b'0' + (v % 10) as u8;
+        k += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while k > 0 {
+        k -= 1;
+        put_bytes(out, n, &digits[k..=k]);
+    }
+}
+
+/// `LITEBOX_DIAG_HEAPLOCK=1`: a waiter that has spun long records the lock owner's host scheduler
+/// state (`/proc/<tid>/{stat,wchan,syscall}`) on stderr, so a stuck heap lock shows whether its
+/// holder is running, parked in the kernel, or stopped. Runs inside the allocator: it touches only
+/// stack buffers and raw syscalls.
+#[inline(never)]
+fn report_lock_owner(owner: usize, me: usize) {
+    for name in [&b"stat"[..], b"wchan", b"syscall"] {
+        let mut path = [0u8; 64];
+        let mut pn = 0;
+        put_bytes(&mut path, &mut pn, b"/proc/");
+        put_dec(owner, &mut path, &mut pn);
+        put_bytes(&mut path, &mut pn, b"/");
+        put_bytes(&mut path, &mut pn, name);
+        path[pn] = 0;
+        // SAFETY: `path` is NUL-terminated and lives across the call.
+        let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
+        let mut body = [0u8; 256];
+        let got = if fd >= 0 {
+            // SAFETY: `body` is a valid writable buffer of `body.len()` bytes.
+            let r = unsafe { libc::read(fd, body.as_mut_ptr().cast(), body.len()) };
+            // SAFETY: `fd` is a descriptor this call just opened.
+            unsafe { libc::close(fd) };
+            r.max(0) as usize
+        } else {
+            0
+        };
+        let mut line = [0u8; 512];
+        let mut ln = 0;
+        put_bytes(&mut line, &mut ln, b"[diag-heaplock] owner=");
+        put_dec(owner, &mut line, &mut ln);
+        put_bytes(&mut line, &mut ln, b" me=");
+        put_dec(me, &mut line, &mut ln);
+        put_bytes(&mut line, &mut ln, b" ");
+        put_bytes(&mut line, &mut ln, name);
+        put_bytes(&mut line, &mut ln, b": ");
+        put_bytes(&mut line, &mut ln, &body[..got]);
+        put_bytes(&mut line, &mut ln, b"\n");
+        // SAFETY: raw write of a stack buffer to stderr.
+        unsafe { libc::write(2, line.as_ptr().cast(), ln) };
+    }
+}
+
 struct Guard<'a>(&'a Header);
 
 impl<'a> Guard<'a> {
@@ -387,6 +455,14 @@ impl<'a> Guard<'a> {
                     {
                         return Self(h);
                     }
+                }
+            }
+            if spins == 20_000_000 {
+                let owner = h.lock.load(Ordering::Relaxed);
+                // SAFETY: getenv with a NUL-terminated literal name; no allocation.
+                let diag = unsafe { libc::getenv(b"LITEBOX_DIAG_HEAPLOCK\0".as_ptr().cast()) };
+                if owner != 0 && owner != me && !diag.is_null() {
+                    report_lock_owner(owner, me);
                 }
             }
             if spins == 200_000_000 {
