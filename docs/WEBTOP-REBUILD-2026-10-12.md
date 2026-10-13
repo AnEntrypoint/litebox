@@ -171,3 +171,19 @@ completed (`cu1`-`cu8`), no stalls, no `wait4` diagnostic records.
 
 Latest five batches combined (`fb`, `fc`, `ss`, `bw`, `cu`): 35 of 40 painted. The 5 failures were 2 guest
 stalls, 2 stalls, and 1 XFCE window-manager startup race (`bw5`: xfwm4 `Could not find a screen`).
+
+## Spin and long-wait measurements (2026-10-13, LITEBOX_DIAG_LONGWAIT=1)
+
+Timed futex parks of 10 s or more (every such entry/exit logged to stderr by the platform's
+`block_or_timeout`):
+- A healthy run (`lw1`) enters about 600,000 long waits in 270 s. Nearly all of them exit in 0 ms:
+  about 182,000 return "already woken" (futex EAGAIN) and about 416,000 return Ok at once (EINTR from a
+  signal). That is the busy loop: callers re-wait immediately, burning CPU.
+- The stalled run (`lw5`) has 20 long waits (timeout about 167 s) that entered and never exited before
+  the run cap, so a timed futex wait did not return within its own timeout in that run.
+- The platform's timer is one-shot (`it_interval` zero) and delivers SIGALRM to the arming thread, so an
+  interrupt storm would come from guest timers armed in a loop (for example timerfd re-arms), not from a
+  periodic timer.
+
+Next: find which guest timer re-arm or futex caller produces the instant returns, and why one timed park
+in `lw5` outlived its timeout.

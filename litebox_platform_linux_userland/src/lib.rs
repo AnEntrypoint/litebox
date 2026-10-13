@@ -2531,6 +2531,15 @@ impl litebox::platform::RawMutex for RawMutex {
         val: u32,
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // Diagnostic (LITEBOX_DIAG_LONGWAIT): record every long timed park on entry and exit, so a
+        // stalled run shows whether its long sleeps are entered and whether they ever return.
+        if timeout >= Duration::from_secs(10) && std::env::var_os("LITEBOX_DIAG_LONGWAIT").is_some() {
+            std::eprintln!("[diag-longwait] enter timeout_ms={}", timeout.as_millis());
+            let start = std::time::Instant::now();
+            let r = self.block_or_maybe_timeout(val, Some(timeout));
+            std::eprintln!("[diag-longwait] exit elapsed_ms={} ok={}", start.elapsed().as_millis(), r.is_ok());
+            return r;
+        }
         self.block_or_maybe_timeout(val, Some(timeout))
     }
 
