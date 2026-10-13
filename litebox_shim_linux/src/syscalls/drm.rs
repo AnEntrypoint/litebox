@@ -1098,7 +1098,6 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
                     )
                 })
             })
-            })
         }) else {
             return;
         };
