@@ -486,7 +486,25 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
             if ready() {
                 break Ok(());
             }
-            self.commit_wait()?;
+            match self.commit_wait() {
+                Ok(()) => {}
+                Err(WaitError::Interrupted) => {
+                    // A guest that re-issues an interrupted call with a fresh timeout never
+                    // re-parks inside one wait, so count the interrupts process-wide and name the
+                    // wait that crosses the threshold.
+                    let n = INTERRUPTED_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == WAIT_SPIN_REPORT_AT {
+                        litebox_util_log::warn!(
+                            file:% = caller.file(),
+                            line = caller.line(),
+                            interrupted = n;
+                            "diag-wait-spin: waits keep returning Interrupted"
+                        );
+                    }
+                    return Err(WaitError::Interrupted);
+                }
+                Err(e) => return Err(e),
+            }
             // A wait that returns without its condition and parks again is the livelock shape
             // (a hot spin with no progress). Name the caller once, at a threshold a healthy wait
             // never reaches, so the log points at the loop rather than at the futex.
@@ -510,6 +528,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
 
 /// Re-parks one `wait_until` may make before it reports its caller as spinning.
 const WAIT_SPIN_REPORT_AT: u64 = 200_000;
+
+/// Waits, process-wide, that returned `Interrupted` (see `wait_until`).
+static INTERRUPTED_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// An error that can occur during a wait.
 #[derive(Debug, Error)]
