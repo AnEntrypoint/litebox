@@ -39,6 +39,9 @@ pub struct FutexManager<Platform: RawSyncPrimitivesProvider> {
 /// as number of CPUs.
 const HASH_TABLE_ENTRIES: usize = 256;
 
+/// How often a parked futex wait re-reads its word, to catch a lost wakeup (see `wait`).
+const FUTEX_WORD_CHECK_SLICE: core::time::Duration = core::time::Duration::from_secs(2);
+
 /// Diagnostic: waits currently parked in `FutexManager::wait`, process-wide. A wait claims a slot
 /// on entry and releases it on return, so a dump lists the whole wait-for set.
 const DIAG_WAIT_SLOTS: usize = 256;
@@ -179,7 +182,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // the value a FUTEX_WAKE would have to change.
         let polls = core::cell::Cell::new(0u32);
         let diag_slot = diag_claim(addr, expected_value, bitset);
-        let waited = cx.wait_until(|| {
+        let mut ready = || {
             let n = polls.get().wrapping_add(1);
             polls.set(n);
             let done = entry.get().done.load(Ordering::Acquire);
@@ -199,7 +202,29 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
                 diag_dump_parked(addr);
             }
             done
-        });
+        };
+        // Wait in slices. A slice that times out (not the caller's own deadline) re-reads the
+        // word: if it has changed while `done` is still false, the wake this waiter needs was
+        // never delivered (a lost wakeup), and the log says so.
+        let waited = loop {
+            match cx.with_timeout(FUTEX_WORD_CHECK_SLICE).wait_until(&mut ready) {
+                Err(WaitError::TimedOut)
+                    if !(cx.deadline().is_some() && cx.remaining_timeout().is_none()) =>
+                {
+                    let word = futex_addr.read_at_offset(0).unwrap_or(u32::MAX);
+                    if word != expected_value && !entry.get().done.load(Ordering::Acquire) {
+                        litebox_util_log::warn!(
+                            addr:% = addr,
+                            expected:% = expected_value,
+                            word:% = word,
+                            bitset:% = bitset;
+                            "diag-futex-lost-wake: the word changed and no wake reached this waiter"
+                        );
+                    }
+                }
+                result => break result,
+            }
+        };
         diag_release(diag_slot);
         match waited {
             Ok(()) => Ok(()),
