@@ -478,16 +478,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 has_bounded_repoll_interest:% = has_bounded_repoll_interest;
                 "DIAG EpollFile::wait: loop iteration"
             );
-            // A cross-process AF_UNIX interest is woken through its wake word, never through this
-            // condvar (`poke_peer` is a no-op on Linux). An unbounded park on the condvar therefore
-            // never sees the peer's write: a write landing between the scan above and the park is
-            // lost, and the waiter sleeps forever. Bound the park for those interests too, so the
-            // word is re-checked every slice. `LITEBOX_EPOLL_WORD_REPOLL_OFF=1` restores the
-            // unbounded park for an A/B run.
-            let word_repoll = !wake_words.is_empty()
-                && !global.platform.env_flag("LITEBOX_EPOLL_WORD_REPOLL_OFF");
-            let bounded_repoll = has_bounded_repoll_interest || word_repoll;
-            let iteration_cx = match (bounded_repoll, wake_words.is_empty()) {
+            let iteration_cx = match (has_bounded_repoll_interest, wake_words.is_empty()) {
                 // A wake word is in hand: this park can only ever be interrupted by an IN-process
                 // event, so keep it short and spend the rest of the interval parked on the words
                 // (see `PollSet::wait`'s matching comment).
@@ -508,7 +499,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 Ok(()) => return Ok(events),
                 Err(TryOpError::TryAgain) => unreachable!(),
                 Err(TryOpError::WaitError(WaitError::TimedOut)) => {
-                    if !bounded_repoll
+                    if !has_bounded_repoll_interest
                         || (cx.deadline().is_some() && cx.remaining_timeout().is_none())
                     {
                         return Err(WaitError::TimedOut);
@@ -1369,15 +1360,10 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
             }),
         );
         let mut register = true;
-        // A cross-process word is woken only by the peer's bump, never by this condvar (`poke_peer`
-        // is a no-op on Linux), so the single unbounded park below would miss a peer's write made
-        // after the scan. Send such a set through the bounded loop instead.
-        let word_bounded = !wake_words.is_empty()
-            && !global.platform.env_flag("LITEBOX_EPOLL_WORD_REPOLL_OFF");
-        if !has_unwakeable_fd && !word_bounded {
-            // Fast/common path: no stdin/evdev fd in the set and no cross-process word, so wait
-            // exactly as before -- a single `wait_until` call using the caller's own context and
-            // deadline unmodified, woken only by real `Observer` notifications.
+        if !has_unwakeable_fd {
+            // Fast/common path: no stdin/evdev fd in the set at all, so wait exactly as before -- a
+            // single `wait_until` call using the caller's own context and deadline unmodified,
+            // woken only by real `Observer` notifications.
             return cx.wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())));
         }
         loop {
