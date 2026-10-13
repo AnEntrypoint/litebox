@@ -47,6 +47,9 @@ const POLL_WORD_PARK_SLICE: core::time::Duration = core::time::Duration::from_mi
 /// cross-process sockets still re-checks the whole set often enough to notice any one of them.
 const POLL_WORD_MIN_SLICE: core::time::Duration = core::time::Duration::from_millis(1);
 
+/// How often a parked poll rescans without registering, to catch a readiness whose wakeup was lost.
+const POLL_DIAG_SLICE: core::time::Duration = core::time::Duration::from_secs(2);
+
 /// Parks until any of `words` has moved away from its `seen` snapshot, or `budget` elapses --
 /// whichever comes first.
 ///
@@ -1361,10 +1364,29 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
         );
         let mut register = true;
         if !has_unwakeable_fd {
-            // Fast/common path: no stdin/evdev fd in the set at all, so wait exactly as before -- a
-            // single `wait_until` call using the caller's own context and deadline unmodified,
-            // woken only by real `Observer` notifications.
-            return cx.wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())));
+            // Fast/common path: no stdin/evdev fd in the set at all. Park in slices. A slice that
+            // times out (not the caller's own deadline) rescans without registering: readiness
+            // found there was never signalled to this waiter, a lost wakeup. The log names it and
+            // the call returns ready, so a stall that clears on repair confirms the lost wakeup.
+            loop {
+                match cx
+                    .with_timeout(POLL_DIAG_SLICE)
+                    .wait_until(|| self.scan_once(global, files, register.then_some(cx.waker())))
+                {
+                    Err(WaitError::TimedOut)
+                        if !(cx.deadline().is_some() && cx.remaining_timeout().is_none()) =>
+                    {
+                        if self.scan_once(global, files, None) {
+                            litebox_util_log::warn!(
+                                entries:% = self.entries.len();
+                                "diag-poll-lost-wake: a poll set was ready after a timed-out slice"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    result => return result,
+                }
+            }
         }
         loop {
             // Snapshot the wake words BEFORE the scan below: a peer's bump racing that scan then
