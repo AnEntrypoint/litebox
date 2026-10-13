@@ -472,18 +472,33 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// [`prepare_to_run_guest`](WaitState::prepare_to_run_guest) was called
     /// without a subsequent call to
     /// [`finish_running_guest`](WaitState::finish_running_guest).
+    #[track_caller]
     pub fn wait_until(&self, mut ready: impl FnMut() -> bool) -> Result<(), WaitError> {
         assert_eq!(
             self.waker.0.state_for_assert(),
             ThreadState::RUNNING_IN_HOST
         );
         let _end_wait = crate::utils::defer(|| self.end_wait());
+        let caller = core::panic::Location::caller();
+        let mut reparks: u64 = 0;
         loop {
             self.start_wait();
             if ready() {
                 break Ok(());
             }
             self.commit_wait()?;
+            // A wait that returns without its condition and parks again is the livelock shape
+            // (a hot spin with no progress). Name the caller once, at a threshold a healthy wait
+            // never reaches, so the log points at the loop rather than at the futex.
+            reparks += 1;
+            if reparks == WAIT_SPIN_REPORT_AT {
+                litebox_util_log::warn!(
+                    file:% = caller.file(),
+                    line = caller.line(),
+                    reparks = reparks;
+                    "diag-wait-spin: wait_until re-parked without its condition"
+                );
+            }
         }
     }
 
@@ -492,6 +507,9 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         self.waker
     }
 }
+
+/// Re-parks one `wait_until` may make before it reports its caller as spinning.
+const WAIT_SPIN_REPORT_AT: u64 = 200_000;
 
 /// An error that can occur during a wait.
 #[derive(Debug, Error)]
