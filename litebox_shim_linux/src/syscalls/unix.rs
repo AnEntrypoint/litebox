@@ -2219,8 +2219,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         // check if we can bind to the address
         let _ = addr.clone().bind(task, false)?;
         let client_cred = task.peer_cred();
+        // A blocking connect waits for the listener's accept. Bounded (unless the A/B switch
+        // `LITEBOX_UNIX_CONNECT_BOUND_OFF=1` restores the old unbounded park): a listener that never
+        // accepts holds the caller forever, so the stalled connect in the webtop run never
+        // returned. A timed-out connect reports ETIMEDOUT, the POSIX result for a connect that
+        // never completes.
+        let connect_cx = if task.global.platform.env_flag("LITEBOX_UNIX_CONNECT_BOUND_OFF") {
+            task.wait_cx()
+        } else {
+            task.wait_cx().with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT)
+        };
         let result = wait_on_events_polling(
-            &task.wait_cx(),
+            &connect_cx,
             is_nonblocking,
             Events::OUT,
             |observer, mask| {
@@ -2240,6 +2250,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         // override for the TCP path; this mirrors it for AF_UNIX.
         .map_err(|err| match err {
             TryOpError::TryAgain => Errno::EINPROGRESS,
+            TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut) => Errno::ETIMEDOUT,
             other => Errno::from(other),
         });
         litebox_util_log::debug!(addr:? = addr, ok:% = result.is_ok(); "TRACE unix_connect: result");
