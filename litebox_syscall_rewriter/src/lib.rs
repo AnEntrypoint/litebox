@@ -742,7 +742,7 @@ fn hook_syscalls_in_section(
                     trampoline_base_addr,
                     syscall_entry_addr,
                     trampoline_data,
-                    &instructions,
+                    instructions,
                     i,
                 ) {
                     Ok(()) => {}

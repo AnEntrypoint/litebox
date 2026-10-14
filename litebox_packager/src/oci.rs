@@ -400,7 +400,7 @@ pub mod cache {
     /// decompress+rewrite is observed to take at most a few minutes even for a very large layer,
     /// so anything older than that is safe to treat as abandoned.
     pub fn sweep_orphaned_temp_files(verbose: bool) {
-        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_mins(15);
         let dir = Path::new(CACHE_DIR);
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -1276,25 +1276,22 @@ fn pull_layers_in_memory_impl(
                             num_layers
                         );
                     }
-                    match cache::finalize_temp_into_cache(
+                    if let Ok(mmapped) = cache::finalize_temp_into_cache(
                         &tmp_path,
                         &layer_desc.digest,
                         rewriter_version,
                         verbose,
-                    ) {
-                        Ok(mmapped) => mmapped,
-                        Err(_) => {
-                            // The streamed file couldn't be published as the cache entry (rename,
-                            // reopen, or mmap failed). Fall back to an in-memory rewrite so
-                            // correctness is preserved regardless -- this re-runs the (pure,
-                            // in-memory) rewrite once more, which is the same cost the old
-                            // always-in-memory path always paid, not a regression.
-                            let mut out = Vec::new();
-                            rewrite_layer_elfs(decompressed_slice, &mut out, verbose).with_context(|| {
-                                format!("failed to rewrite ELFs in layer {} (fallback)", i + 1)
-                            })?;
-                            cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
-                        }
+                    ) { mmapped } else {
+                        // The streamed file couldn't be published as the cache entry (rename,
+                        // reopen, or mmap failed). Fall back to an in-memory rewrite so
+                        // correctness is preserved regardless -- this re-runs the (pure,
+                        // in-memory) rewrite once more, which is the same cost the old
+                        // always-in-memory path always paid, not a regression.
+                        let mut out = Vec::new();
+                        rewrite_layer_elfs(decompressed_slice, &mut out, verbose).with_context(|| {
+                            format!("failed to rewrite ELFs in layer {} (fallback)", i + 1)
+                        })?;
+                        cache::write_and_map_cached_layer(&layer_desc.digest, rewriter_version, out, verbose)
                     }
                 }
                 Err(e) => {
