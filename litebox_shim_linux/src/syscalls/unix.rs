@@ -5636,7 +5636,7 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
                     client_pid:% = slot.client_pid.load(Ordering::Relaxed),
                     server_pid:% = slot.server_pid.load(Ordering::Relaxed),
                     hosts_n:% = hosts_n,
-                    holders = slot.holder_dump();
+                    holders:% = slot.holder_dump();
                     "shared unix connection table full: occupied slot sample"
                 );
             }

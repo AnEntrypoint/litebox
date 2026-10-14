@@ -4573,6 +4573,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if let Ok(n) = result
                         && crate::diag::is_socket_read_target_comm(&self.comm.get())
                     {
+                        let _ = n;
                         litebox_util_log::__private::tracing::event!(
                             target: "litebox_diag::socket_read",
                             litebox_util_log::__private::tracing::Level::DEBUG,
@@ -4639,6 +4640,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if let Ok(n) = &result
                         && crate::diag::is_socket_read_target_comm(&self.comm.get())
                     {
+                        let _ = n;
                         litebox_util_log::__private::tracing::event!(
                             target: "litebox_diag::socket_read",
                             litebox_util_log::__private::tracing::Level::DEBUG,

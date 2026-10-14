@@ -145,6 +145,30 @@ pub mod __private {
     pub use tracing;
     #[cfg(feature = "backend_tracing")]
     pub use tracing::Level;
+
+    /// Without a tracing backend (a `no_std` build has none), the direct `tracing::event!` calls
+    /// that callers make compile to nothing. Their arguments are diagnostics, not inputs to any
+    /// result, so discarding them changes no behaviour a build without `tracing` could have had.
+    #[cfg(not(feature = "backend_tracing"))]
+    pub mod tracing {
+        #[derive(Clone, Copy)]
+        #[allow(dead_code, non_camel_case_types, clippy::upper_case_acronyms)]
+        pub enum Level {
+            ERROR,
+            WARN,
+            INFO,
+            DEBUG,
+            TRACE,
+        }
+        pub use crate::__discard_tracing_event as event;
+    }
+}
+
+/// Stand-in for `tracing::event!` when no tracing backend is compiled in; see `__private::tracing`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __discard_tracing_event {
+    ($($tokens:tt)*) => {{}};
 }
 
 /// Registers the function used to enter (`true`) / leave (`false`) a scope in which the calling

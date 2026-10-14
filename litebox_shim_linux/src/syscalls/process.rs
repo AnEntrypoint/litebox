@@ -1316,7 +1316,6 @@ pub(crate) struct Credentials {
 /// Every capability the kernel defines (0..=40).
 const CAP_FULL: u64 = (1 << 41) - 1;
 const CAP_SETUID_BIT: u64 = 1 << 7;
-const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
 
 impl Credentials {
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
@@ -1426,14 +1425,6 @@ impl Credentials {
     /// capability there. This is what the task keeps in the namespace IT goes on to create.
     fn holds_setuid_here(&self) -> bool {
         self.cap_eff & CAP_SETUID_BIT != 0 || (self.uid_map.is_none() && self.euid == 0)
-    }
-
-    /// Whether the caller holds one specific capability in the namespace it is in right now --
-    /// root in the initial namespace has all of them; inside a user namespace it is whatever
-    /// `cap_eff` grants there, which is what `capset` sets and what a sandbox keeps (`CAP_SYS_ADMIN`
-    /// to go on creating PID namespaces, `CAP_SYS_CHROOT` to `chroot`).
-    pub(crate) fn holds_capability(&self, bit: u64) -> bool {
-        self.cap_eff & bit != 0 || (self.uid_map.is_none() && self.euid == 0)
     }
 
     /// Whether this task is privileged WHERE CAPABILITIES ARE DECIDED: root in the initial
@@ -1807,8 +1798,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 Ok(0)
             }
-            PrctlArg::GetSecureBits => Ok(0),
-            PrctlArg::SetSecureBits(_) => Ok(0),
             // Ambient capabilities: none are ever raised, so IS_SET reads 0 and the rest succeed.
             PrctlArg::CapAmbient(op) => match op {
                 1 | 2 | 4 => Ok(0), // PR_CAP_AMBIENT_IS_SET | LOWER | CLEAR_ALL: nothing raised
@@ -1884,9 +1873,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.set_creds(c);
                 Ok(0)
             }
-            // Capabilities are not modelled (see `CapBSetRead`): no ambient capability is ever
-            // set, and lowering/clearing one is trivially satisfied.
-            PrctlArg::CapAmbient(_) => Ok(0),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -4003,7 +3989,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // thread-based relocating fallback is not -- that path faults the child before one
         // instruction (`575f0e2`).
         let mut dropped_inet = 0usize;
-        let mut dropped_process_local = 0usize;
         // Epoll sets to carry: an epoll instance is process-local state (its interests hold `Arc`s
         // into this process's descriptor table), so what crosses is the INTEREST LIST, which the
         // child re-registers against its own rebuilt descriptors -- see
@@ -4014,7 +3999,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             alloc::vec::Vec::new();
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
-                dropped_process_local += 1;
                 continue;
             }
             let carried = i32::try_from(*raw_fd)
@@ -4332,7 +4316,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         match self.raw_fd_epoll_carry(*raw_fd) {
                             Some(spec) => epoll_to_carry.push((*raw_fd, spec)),
                             None => {
-                                dropped_process_local += 1;
                                 litebox_util_log::debug!(
                                     tid:% = self.tid.get(), fd:% = raw_fd;
                                     "clone: dropping an epoll fd this process cannot describe rather than refusing the fork; the child sees EBADF on it"
@@ -4341,7 +4324,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         }
                     }
                     None if self.raw_fd_subsystem_name(*raw_fd) == "netlink" => {
-                        dropped_process_local += 1;
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(),
                             fd:% = raw_fd,
@@ -7813,26 +7795,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process()
             .find_child(pid)
             .or_else(|| self.global.registry_get(pid))
-    }
-
-    /// Every live process (other than the caller's own) in process group `group`.
-    pub(crate) fn processes_in_group(&self, group: i32) -> alloc::vec::Vec<Arc<Process<Platform>>> {
-        let me = self.process();
-        let mut out: alloc::vec::Vec<Arc<Process<Platform>>> = self
-            .process()
-            .children_in_group(group)
-            .into_iter()
-            .map(|(_, child)| child)
-            .collect();
-        for (_, p) in &self.global.registry_entries() {
-            if !Arc::ptr_eq(p, &me)
-                && p.pgid.load(Ordering::Relaxed) == group
-                && !out.iter().any(|o| Arc::ptr_eq(o, p))
-            {
-                out.push(p.clone());
-            }
-        }
-        out
     }
 
     /// Handle syscall `setpgid`.
