@@ -2224,10 +2224,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         // accepts holds the caller forever, so the stalled connect in the webtop run never
         // returned. A timed-out connect reports ETIMEDOUT, the POSIX result for a connect that
         // never completes.
-        let connect_cx = if task.global.platform.env_flag("LITEBOX_UNIX_CONNECT_BOUND_OFF") {
+        let connect_cx = if task
+            .global
+            .platform
+            .env_flag("LITEBOX_UNIX_CONNECT_BOUND_OFF")
+        {
             task.wait_cx()
         } else {
-            task.wait_cx().with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT)
+            task.wait_cx()
+                .with_timeout(SHARED_UNIX_CROSS_CONNECT_TIMEOUT)
         };
         let result = wait_on_events_polling(
             &connect_cx,
