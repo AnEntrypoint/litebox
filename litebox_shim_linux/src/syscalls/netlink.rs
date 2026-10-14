@@ -130,6 +130,12 @@ impl NetlinkSocket {
         self.queue(reply);
     }
 
+    /// Only the tests receive without flags.
+    #[cfg(test)]
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        self.receive(buf, litebox_common_linux::ReceiveFlags::empty())
+    }
+
     /// `recvmsg`/`read`-family: pops one queued reply datagram into `buf` (`MSG_PEEK` leaves it
     /// queued, `MSG_DONTWAIT` turns an empty queue into `EAGAIN`).
     pub(crate) fn receive(
