@@ -449,7 +449,16 @@ fn report_lock_owner(owner: usize, me: usize) {
     }
 }
 
-struct Guard<'a>(&'a Header);
+/// Spins after which a waiter may take over a lock whose holder is alive, under
+/// `LITEBOX_HEAPLOCK_STEAL`. Kept below the 200M-spin abort so the takeover is what fires first.
+const HEAPLOCK_STEAL_SPINS: u64 = 100_000_000;
+/// Failed attempts a waiter spins before it starts sleeping between them (see `Guard::lock`).
+const HEAPLOCK_SPIN_BEFORE_BACKOFF: u64 = 4_096;
+const HEAPLOCK_BACKOFF_NANOS: libc::c_long = 20_000;
+
+/// The shared-heap lock held by this thread. It records its own tid so that releasing it cannot
+/// free a lock that a waiter has since taken over.
+struct Guard<'a>(&'a Header, usize);
 
 impl<'a> Guard<'a> {
     fn lock(h: &'a Header) -> Self {
@@ -478,7 +487,27 @@ impl<'a> Guard<'a> {
                             .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
                             .is_ok()
                     {
-                        return Self(h);
+                        return Self(h, me);
+                    }
+                }
+            }
+            // Experiment (`LITEBOX_HEAPLOCK_STEAL=1`, off by default): a holder that is alive but
+            // has held the lock through this many spins is taken over, and the log says so. If a
+            // stalled run passes after a takeover, the holder had abandoned the lock.
+            if spins == HEAPLOCK_STEAL_SPINS
+                // SAFETY: getenv with a NUL-terminated literal name; no allocation.
+                && !unsafe { libc::getenv(b"LITEBOX_HEAPLOCK_STEAL\0".as_ptr().cast()) }.is_null()
+            {
+                let owner = h.lock.load(Ordering::Relaxed);
+                if owner != 0 && owner != me {
+                    let msg = b"shared heap lock steal: taking over from a holder that never released\n";
+                    // SAFETY: raw write of a static buffer to stderr.
+                    unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+                    if h.lock
+                        .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        return Self(h, me);
                     }
                 }
             }
@@ -499,15 +528,35 @@ impl<'a> Guard<'a> {
                 // SAFETY: abort never returns.
                 unsafe { libc::abort() };
             }
-            core::hint::spin_loop();
+            // Experiment switch (`LITEBOX_HEAPLOCK_BACKOFF=1`, off by default): sleeping waiters did
+            // not change the stall rate, so the default keeps the measured spin behaviour.
+            if spins > HEAPLOCK_SPIN_BEFORE_BACKOFF
+                // SAFETY: getenv with a NUL-terminated literal name; no allocation.
+                && !unsafe { libc::getenv(b"LITEBOX_HEAPLOCK_BACKOFF\0".as_ptr().cast()) }.is_null()
+            {
+                // Past a short spin, sleep instead: on an oversubscribed host, waiters that keep
+                // every core busy starve the holder, which then never finishes its critical section.
+                // `ppoll` with no fds is on the seccomp allow-list, unlike `sched_yield`.
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: HEAPLOCK_BACKOFF_NANOS,
+                };
+                // SAFETY: zero fds with a valid timespec only sleeps for it.
+                unsafe { libc::ppoll(core::ptr::null_mut(), 0, &ts, core::ptr::null()) };
+            } else {
+                core::hint::spin_loop();
+            }
         }
-        Self(h)
+        Self(h, me)
     }
 }
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        self.0.lock.store(0, Ordering::Release);
+        let _ = self
+            .0
+            .lock
+            .compare_exchange(self.1, 0, Ordering::Release, Ordering::Relaxed);
     }
 }
 
