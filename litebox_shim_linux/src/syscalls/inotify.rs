@@ -21,12 +21,10 @@ use litebox_common_linux::errno::Errno;
 
 use crate::{ShimFS, ShimPlatform, Task, UserPtr};
 
-pub(crate) const IN_ACCESS: u32 = 0x0000_0001;
 pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
 pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 pub(crate) const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
-pub(crate) const IN_OPEN: u32 = 0x0000_0020;
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
 pub(crate) const IN_CREATE: u32 = 0x0000_0100;

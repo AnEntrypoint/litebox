@@ -53,10 +53,6 @@ const NETLINK_AUDIT: u8 = 9;
 const NLMSG_HEADER_BYTES: usize = 16;
 
 impl NetlinkSocket {
-    pub(crate) fn new(flags: litebox_common_linux::SockFlags) -> Self {
-        Self::new_with_protocol(flags, u8::MAX)
-    }
-
     pub(crate) fn new_with_protocol(flags: litebox_common_linux::SockFlags, protocol: u8) -> Self {
         let mut status = OFlags::RDWR;
         status.set(
@@ -126,10 +122,6 @@ impl NetlinkSocket {
         reply.extend_from_slice(&0i32.to_le_bytes());
         reply.extend_from_slice(&message[..NLMSG_HEADER_BYTES]);
         self.queue(reply);
-    }
-
-    pub(crate) fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        self.receive(buf, litebox_common_linux::ReceiveFlags::empty())
     }
 
     /// `recvmsg`/`read`-family: pops one queued reply datagram into `buf` (`MSG_PEEK` leaves it

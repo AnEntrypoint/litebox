@@ -11,7 +11,7 @@ use alloc::{
 use litebox::{
     event::{Events, wait::CheckForInterrupt, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{FileSystem as _, Mode, OFlags, SeekWhence},
+    fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path::{self, Arg as _},
     platform::{
@@ -1632,6 +1632,10 @@ enum SharedRecordLockOutcome {
     /// A live process holds an incompatible claim over the range.
     Conflict,
     /// This table cannot key the request: the caller falls back to its per-process table.
+    // Never constructed since merge 6a967c57 dropped its `return ...::Unavailable` lines; the
+    // fallback at the match on this variant is therefore unreachable. Restore the constructions
+    // (see `git log -m -G 'SharedRecordLockQuery::Unavailable'`) rather than deleting the fallback.
+    #[allow(dead_code)]
     Unavailable,
     /// This table is the live one but has no room for the split: the guest gets `ENOLCK`.
     Full,
@@ -3585,7 +3589,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     creator = Some(fd);
                     break;
                 }
-                Err(e @ Errno::EEXIST) if retry => {}
+                Err(Errno::EEXIST) if retry => {}
                 Err(e) => return Err(stage_log("carrier_create_openat", path.as_str(), e)),
             }
         }
@@ -4867,6 +4871,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
             .flatten();
         drop(files);
+        // Keeps MAP_SHARED mappings of this file coherent with the bytes just written (SQLite maps
+        // its database and writes it with pwrite). Dropped by merge 764fb303; restored here.
+        if let Some(n) = wrote_file {
+            self.propagate_write_to_shared_mapping(raw_fd, offset, &buf[..n.min(buf.len())]);
+        }
         if wrote_file.is_some() {
             self.inotify_fd(raw_fd, super::inotify::IN_MODIFY);
         }
@@ -11176,7 +11185,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// (`MSG_CMSG_CLOEXEC`) - the sender's bit describes the sender's fd, which this process does
     /// not have. The fork path passes the spec's own bit, where the child's fd is meant to be the
     /// same fd.
-    pub(crate) fn install_inet_carried(&self, spec: &str, cloexec: bool) -> Option<i32> {
+    pub(crate) fn install_inet_carried(&self, spec: &str, _cloexec: bool) -> Option<i32> {
         use litebox_common_linux::{SockFlags, SockType};
         let mut parts = spec.split('|');
         // Parsed in the order `FilesState::raw_fd_inet_carry` writes it (`<cloexec>|<v6>|<nonblock>|

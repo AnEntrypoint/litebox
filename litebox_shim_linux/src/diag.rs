@@ -392,7 +392,7 @@ pub fn inflight_enter(
     sysno: usize,
     args: [u64; 4],
     pid: i32,
-    tid: i32,
+    _tid: i32,
     comm: &[u8],
     now_ms: u64,
 ) {
@@ -1480,7 +1480,7 @@ pub fn first_trail_oldest_first() -> Vec<SyscallTrailEntry> {
 const LAST_TRAIL_LEN: usize = 512;
 
 #[derive(Clone, Copy)]
-struct LastTrailEntry {
+pub struct LastTrailEntry {
     number: usize,
     args: [u64; 3],
     /// The value the guest got back in `rax`: a byte count, or `-errno` (`Errno` is encoded that
@@ -1920,7 +1920,7 @@ pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
     platform: &Platform,
     pid: i32,
     ppid: i32,
-    comm: &[u8],
+    _comm: &[u8],
 ) {
     let _private = litebox_util_log::PrivateAllocGuard::new();
     if CHILD_IPC_INIT.load(Ordering::Acquire) {

@@ -1736,20 +1736,6 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(v6_addr)) => {
-            let c_addr = CSockInet6Addr {
-                family: AddressFamily::INET6 as i16,
-                port: v6_addr.port().to_be(),
-                flowinfo: 0,
-                addr: v6_addr.ip().octets(),
-                scope_id: 0,
-            };
-            let bytes: &[u8] = c_addr.as_bytes();
-            let copied = bytes.len().min(addrlen_val as usize);
-            addr.write_slice_at_offset::<Platform>(0, &bytes[..copied])
-                .ok_or(Errno::EFAULT)?;
-            size_of::<CSockInet6Addr>()
-        }
         SocketAddress::Netlink { pid, groups } => {
             let addrlen_val = size_of::<CSockNetlinkAddr>().min(addrlen_val as usize);
             let c_addr = CSockNetlinkAddr {

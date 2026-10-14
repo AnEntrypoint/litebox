@@ -22,7 +22,7 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
-    platform::{RawMutex as _, SharedKernelStateProvider as _},
+    platform::RawMutex as _,
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };

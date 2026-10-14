@@ -1042,13 +1042,6 @@ impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
         }
     }
 
-    pub(crate) fn packet_mode(&self) -> bool {
-        match self {
-            Self::Local(p) => p.packet_mode(),
-            Self::Shared(id, t) => t.packet_mode(*id),
-        }
-    }
-
     pub(crate) fn set_packet_mode(&self, v: bool) {
         match self {
             Self::Local(p) => p.set_packet_mode(v),

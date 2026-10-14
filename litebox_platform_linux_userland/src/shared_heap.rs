@@ -303,7 +303,7 @@ pub static BIG_DIAG: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 fn report_big_alloc(size: usize) {
     let mut buf = [0u8; 512];
     let mut n = 0;
-    let mut put = |b: &[u8], buf: &mut [u8; 512], n: &mut usize| {
+    let put = |b: &[u8], buf: &mut [u8; 512], n: &mut usize| {
         for &c in b {
             if *n < buf.len() {
                 buf[*n] = c;
@@ -388,6 +388,27 @@ fn put_dec(mut v: usize, out: &mut [u8], n: &mut usize) {
 /// stack buffers and raw syscalls.
 #[inline(never)]
 fn report_lock_owner(owner: usize, me: usize) {
+    // SAFETY: tkill with signal 0 only probes for the thread's existence.
+    let probe = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) };
+    let probe_err = if probe == -1 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as usize
+    } else {
+        0
+    };
+    let mut pl = [0u8; 128];
+    let mut pn = 0;
+    put_bytes(&mut pl, &mut pn, b"[diag-heaplock-probe] owner=");
+    put_dec(owner, &mut pl, &mut pn);
+    put_bytes(&mut pl, &mut pn, b" tkill=");
+    if probe == -1 {
+        put_bytes(&mut pl, &mut pn, b"err=");
+        put_dec(probe_err, &mut pl, &mut pn);
+    } else {
+        put_bytes(&mut pl, &mut pn, b"ok");
+    }
+    put_bytes(&mut pl, &mut pn, b"\n");
+    // SAFETY: raw write of a stack buffer to stderr.
+    unsafe { libc::write(2, pl.as_ptr().cast(), pn) };
     for name in [&b"stat"[..], b"wchan", b"syscall"] {
         let mut path = [0u8; 64];
         let mut pn = 0;
@@ -399,6 +420,7 @@ fn report_lock_owner(owner: usize, me: usize) {
         // SAFETY: `path` is NUL-terminated and lives across the call.
         let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
         let mut body = [0u8; 256];
+        let mut open_err = 0usize;
         let got = if fd >= 0 {
             // SAFETY: `body` is a valid writable buffer of `body.len()` bytes.
             let r = unsafe { libc::read(fd, body.as_mut_ptr().cast(), body.len()) };
@@ -406,6 +428,7 @@ fn report_lock_owner(owner: usize, me: usize) {
             unsafe { libc::close(fd) };
             r.max(0) as usize
         } else {
+            open_err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as usize;
             0
         };
         let mut line = [0u8; 512];
@@ -416,6 +439,8 @@ fn report_lock_owner(owner: usize, me: usize) {
         put_dec(me, &mut line, &mut ln);
         put_bytes(&mut line, &mut ln, b" ");
         put_bytes(&mut line, &mut ln, name);
+        put_bytes(&mut line, &mut ln, b" open_errno=");
+        put_dec(open_err, &mut line, &mut ln);
         put_bytes(&mut line, &mut ln, b": ");
         put_bytes(&mut line, &mut ln, &body[..got]);
         put_bytes(&mut line, &mut ln, b"\n");
@@ -590,13 +615,6 @@ unsafe impl GlobalAlloc for SharedHeap {
             }
         }
         new
-    }
-}
-
-impl SharedHeap {
-    /// Whether a block of `layout` would be served from the arena (as opposed to the system).
-    fn ready_for(&self, layout: Layout) -> bool {
-        self.ready() && Self::class_of(layout).is_some()
     }
 }
 

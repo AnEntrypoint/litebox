@@ -2748,7 +2748,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = self.do_syscall(ctx);
 
         if parked {
-            let host_pid = self.global.platform.current_host_pid() as i32;
             crate::diag::inflight_exit(core::ptr::addr_of!(*self) as u64);
             crate::diag::clear_thread_note(core::ptr::addr_of!(*self) as u64);
         }
@@ -4468,13 +4467,6 @@ impl<Platform: ShimPlatform> PipesHandle<'_, Platform> {
         self.pipes.half_pipe_type(self.litebox, fd)
     }
 
-    pub(crate) fn get_flags(
-        &self,
-        fd: &litebox::pipes::PipeFd<Platform>,
-    ) -> Result<litebox::pipes::Flags, litebox::pipes::errors::ClosedError> {
-        self.pipes.get_flags(self.litebox, fd)
-    }
-
     pub(crate) fn update_flags(
         &self,
         fd: &litebox::pipes::PipeFd<Platform>,
@@ -5023,12 +5015,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for Task<Platform, FS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// The PID namespace this task belongs to: [`syscalls::pidns::INITIAL_NS`] unless a
-    /// `clone(CLONE_NEWPID)` created the one it lives in.
-    pub(crate) fn pid_namespace(&self) -> u32 {
-        self.pid_ns.get()
-    }
-
     /// Linux's `getpid()`: the pid this task holds in its own PID namespace, not the internal pid.
     pub(crate) fn guest_pid(&self) -> i32 {
         self.ns_pid.get()
@@ -5053,11 +5039,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.global
             .pid_namespaces
             .pid_in(internal, self.pid_ns.get())
-    }
-
-    /// How `internal` (a thread id) is spelled in this task's namespace.
-    pub(crate) fn guest_tid_of(&self, internal: i32) -> Option<i32> {
-        self.guest_pid_of(internal)
     }
 }
 
