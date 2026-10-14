@@ -727,7 +727,8 @@ impl UserInfo {
 
 static EFFECTIVE_IDENTITY_ASSIGNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-static EFFECTIVE_IDENTITY_USER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static EFFECTIVE_IDENTITY_USER: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 static EFFECTIVE_IDENTITY_GROUP: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -748,7 +749,9 @@ pub(crate) fn effective_identity() -> Option<UserInfo> {
         .load(core::sync::atomic::Ordering::Acquire)
         .then(|| UserInfo {
             user: narrowed_id(EFFECTIVE_IDENTITY_USER.load(core::sync::atomic::Ordering::Relaxed)),
-            group: narrowed_id(EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed)),
+            group: narrowed_id(
+                EFFECTIVE_IDENTITY_GROUP.load(core::sync::atomic::Ordering::Relaxed),
+            ),
         })
 }
 

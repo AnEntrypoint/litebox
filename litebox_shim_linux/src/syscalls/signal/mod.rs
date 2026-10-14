@@ -1518,7 +1518,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.force_signal_with_info(signal, force_exit, siginfo);
     }
 
-    pub(crate) fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
+    pub(crate) fn force_signal_with_info(
+        &self,
+        signal: Signal,
+        force_exit: bool,
+        siginfo: Siginfo,
+    ) {
         // `handle_exception_request` maps every architectural trap (not just page faults) through
         // this path: SIGFPE (`#DE`), SIGTRAP (`#BP`), SIGILL (`#UD` -- notably reachable via
         // Windows' `STATUS_PRIVILEGED_INSTRUCTION`/`hlt` mapping in

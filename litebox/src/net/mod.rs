@@ -696,11 +696,7 @@ impl ListenQueue {
     }
 
     /// Arms the queue up to `backlog` sockets in LISTEN on [`Self::ip_listen_endpoint`].
-    fn refill(
-        &mut self,
-        socket_set: &mut smoltcp::iface::SocketSet,
-        buffers: &mut SocketBuffers,
-    ) {
+    fn refill(&mut self, socket_set: &mut smoltcp::iface::SocketSet, buffers: &mut SocketBuffers) {
         let backlog = usize::from(self.backlog);
         for _ in self.live_handles()..backlog {
             // `socket_set` is fixed-capacity now (see `MAX_SOCKETS`'s own doc comment): stop
@@ -775,7 +771,10 @@ fn socket_census(socket_set: &smoltcp::iface::SocketSet<'_>) -> (usize, alloc::s
                 };
                 let local = t.local_endpoint().map_or(0, |e| e.port);
                 let remote = t.remote_endpoint().map_or(0, |e| e.port);
-                let _ = core::fmt::Write::write_fmt(&mut census, format_args!(" {local}:{state}:{remote}"));
+                let _ = core::fmt::Write::write_fmt(
+                    &mut census,
+                    format_args!(" {local}:{state}:{remote}"),
+                );
             }
             smoltcp::socket::Socket::Udp(u) => {
                 let local = u.endpoint().port;
@@ -1802,9 +1801,12 @@ where
             // `remove_socket` is this file's only socket-removal path and it always releases, so a
             // socket that is gone was already released, while a slot still occupied belongs to its
             // CURRENT socket -- whose claims `buffers.release` would hand back out from under it.
-            let Some(socket) =
-                try_get_socket::<tcp::Socket>(socket_set, handle, None, "reclaim_finished_backlog_slots")
-            else {
+            let Some(socket) = try_get_socket::<tcp::Socket>(
+                socket_set,
+                handle,
+                None,
+                "reclaim_finished_backlog_slots",
+            ) else {
                 *slot = None;
                 continue;
             };
@@ -1931,7 +1933,9 @@ where
         let legacy_retire = refs_before <= 1 || me == owner || owner_is_gone;
         let live = remaining
             .iter()
-            .filter(|pid| **pid != 0 && (**pid == me || self.litebox.platform().is_process_alive(**pid)))
+            .filter(|pid| {
+                **pid != 0 && (**pid == me || self.litebox.platform().is_process_alive(**pid))
+            })
             .count();
         // Both signals must agree. `live == 0` alone would retire a port the closing process itself
         // still holds another descriptor to (one pid, two referents -- a second `listen()` on the
@@ -1985,13 +1989,8 @@ where
             // handle. Releasing either would be a double release or a foreign release, so the only
             // correct action is to drop this queue's reference to the handle -- which is happening
             // either way: `queue.handles` was already replaced with `[None; MAX_BACKLOG_SLOTS]`.
-            if try_get_socket::<tcp::Socket>(
-                &self.socket_set,
-                handle,
-                None,
-                "retire_listen_queue",
-            )
-            .is_none()
+            if try_get_socket::<tcp::Socket>(&self.socket_set, handle, None, "retire_listen_queue")
+                .is_none()
             {
                 continue;
             }
@@ -2042,11 +2041,11 @@ where
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
             if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
                 core::mem::forget(Self::remove_socket(
-                &mut self.socket_set,
-                &mut self.buffers,
-                &mut self.slot_generations,
-                handle,
-            ));
+                    &mut self.socket_set,
+                    &mut self.buffers,
+                    &mut self.slot_generations,
+                    handle,
+                ));
                 *slot = None;
             }
         }
@@ -2157,7 +2156,11 @@ where
         if self.is_shared_across_fork(handle) {
             return;
         }
-        if let Some(slot) = self.shared_across_fork.iter_mut().find(|slot| slot.is_none()) {
+        if let Some(slot) = self
+            .shared_across_fork
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
             *slot = Some(handle);
         }
     }
@@ -2329,7 +2332,8 @@ where
                 // than left for `is_accepted_in` to keep answering "not mine": a stale row is a row
                 // the table can never hand out again, and `MAX_SOCKETS` of them would stop `accept`
                 // from marking anything at all.
-                if !socket_generation_off() && slot_generation(slot_generations, *handle) != Some(*generation)
+                if !socket_generation_off()
+                    && slot_generation(slot_generations, *handle) != Some(*generation)
                 {
                     return true;
                 }
@@ -2353,7 +2357,11 @@ where
         // Stale accept claims would suppress BOTH the readiness sweep below and `accept` itself
         // (see `Network::reap_stale_claims`), and this is the one place that runs for every
         // process on every tick whether or not anything is accepted.
-        Self::reap_stale_claims_in(&self.socket_set, &mut self.accepted_slots, &self.slot_generations);
+        Self::reap_stale_claims_in(
+            &self.socket_set,
+            &mut self.accepted_slots,
+            &self.slot_generations,
+        );
         // Best-effort, same reason as `close_pending_sockets`: `net_lock` is held by the caller.
         // A table that stays unreadable tick after tick makes this whole sweep a no-op in one
         // process while every other process keeps going, which is indistinguishable in the log
@@ -2554,8 +2562,12 @@ where
             }
         }
         let went_fully_dead = queue.live_handles() == 0 && handles_before > 0;
-        let reclaimed =
-            Self::reclaim_finished_backlog_slots(socket_set, buffers, slot_generations, &mut queue.handles);
+        let reclaimed = Self::reclaim_finished_backlog_slots(
+            socket_set,
+            buffers,
+            slot_generations,
+            &mut queue.handles,
+        );
         if reclaimed > 0 {
             static RECLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             if RECLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
@@ -2600,9 +2612,11 @@ where
         // state at any failure can be read straight off the log. Throttled: this sweep runs every
         // tick, from every process of the fork family.
         {
-            static HEARTBEATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            static HEARTBEATS: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
             if HEARTBEATS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 == 0 {
-                let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
+                let (data_granted, data_used, meta_granted, meta_used, owners) =
+                    buffers.occupancy();
                 let (total, census) = socket_census(socket_set);
                 litebox_util_log::warn!(
                     tag = host_process_tag(),
@@ -2749,8 +2763,9 @@ where
                 // [`StreamSocketChannel::set_smoltcp_rx_pending`].
                 if !shared_across_fork || pull_rx {
                     while tcp_socket.can_recv() {
-                        let received = proxy
-                            .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
+                        let received = proxy.push_rx_data_with(|buf| {
+                            tcp_socket.recv_slice(buf).unwrap_or_default()
+                        });
                         if received == 0 {
                             break;
                         }
@@ -2807,9 +2822,10 @@ where
                                 Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
                                     (errors::SocketAsyncError::TimedOut, now - initiated_at)
                                 }
-                                Some(initiated_at) => {
-                                    (errors::SocketAsyncError::ConnectionRefused, now - initiated_at)
-                                }
+                                Some(initiated_at) => (
+                                    errors::SocketAsyncError::ConnectionRefused,
+                                    now - initiated_at,
+                                ),
                                 None => (
                                     errors::SocketAsyncError::ConnectionRefused,
                                     smoltcp::time::Duration::ZERO,
@@ -3148,7 +3164,11 @@ where
         let shared_across_fork = {
             let borrowed = table_entry.entry.borrowed;
             let handle = table_entry.entry.handle;
-            borrowed || self.shared_across_fork.iter().any(|marked| *marked == Some(handle))
+            borrowed
+                || self
+                    .shared_across_fork
+                    .iter()
+                    .any(|marked| *marked == Some(handle))
         };
         if shared_across_fork {
             match proxy.as_ref() {
@@ -3293,8 +3313,9 @@ where
                     let smoltcp::socket::Socket::Tcp(socket) = socket else {
                         return None;
                     };
-                    (socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote))
-                        .then_some(handle)
+                    (socket.local_endpoint() == Some(local)
+                        && socket.remote_endpoint() == Some(remote))
+                    .then_some(handle)
                 })?;
                 // From here on this socket has TWO referents, in two processes, and only the one
                 // that reads it may take its RX (see `drain_socket_channel_buffers`).
@@ -3748,11 +3769,11 @@ where
                 // socket ANOTHER process created (whose `PacketBuffer` vecs live on that process's
                 // private heap), while this one was added by this very process.
                 let _ = Self::remove_socket(
-                &mut self.socket_set,
-                &mut self.buffers,
-                &mut self.slot_generations,
-                handle,
-            );
+                    &mut self.socket_set,
+                    &mut self.buffers,
+                    &mut self.slot_generations,
+                    handle,
+                );
             }
             return;
         }
@@ -3778,11 +3799,11 @@ where
                 // There is no close/abort for raw and icmp sockets
                 if handle_is_live {
                     let _ = Self::remove_socket(
-                &mut self.socket_set,
-                &mut self.buffers,
-                &mut self.slot_generations,
-                handle,
-            );
+                        &mut self.socket_set,
+                        &mut self.buffers,
+                        &mut self.slot_generations,
+                        handle,
+                    );
                 }
             }
             Protocol::Udp => {
@@ -3900,9 +3921,7 @@ where
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                     match state {
-                        tcp::State::Established => {
-                            Ok(())
-                        }
+                        tcp::State::Established => Ok(()),
                         // The handshake completed and the peer is already shutting the connection
                         // down (or this side is): `connect(2)` has succeeded and the application
                         // learns the rest from `read`/`write`, so this is not a refusal.
@@ -4152,13 +4171,13 @@ where
                         Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, local_endpoint.port)))
                     }
                     None => {
-                        let source_address = socket_handle
-                            .udp()
-                            .remote_endpoint
-                            .map_or(Ipv4Addr::UNSPECIFIED, |remote| match remote.addr {
+                        let source_address = socket_handle.udp().remote_endpoint.map_or(
+                            Ipv4Addr::UNSPECIFIED,
+                            |remote| match remote.addr {
                                 smoltcp::wire::IpAddress::Ipv4(ip) if ip.is_loopback() => ip,
                                 smoltcp::wire::IpAddress::Ipv4(_) => INTERFACE_IP_ADDR,
-                            });
+                            },
+                        );
                         Ok(SocketAddr::V4(SocketAddrV4::new(
                             source_address,
                             local_endpoint.port,
@@ -4296,11 +4315,11 @@ where
                 // same as an invalid fd (the handle no longer names anything real to bind)
                 // instead of panicking deep in smoltcp's own `get_mut`.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     self.local_port_allocator.deallocate(lp);
                     return Err(BindError::InvalidFd);
                 }
@@ -4684,11 +4703,11 @@ where
                 // the same way smoltcp's own `tcp::SendError::InvalidState` already is just
                 // below, rather than panicking deep in its `get_mut`.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(SendError::SocketInInvalidState);
                 }
                 try_get_socket_mut::<tcp::Socket>(
@@ -4717,11 +4736,11 @@ where
                     return Err(SendError::DestinationAddressRequired);
                 };
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(SendError::SocketInInvalidState);
                 }
                 let Some(udp_socket) = try_get_socket_mut::<udp::Socket>(
@@ -4805,11 +4824,11 @@ where
                 // the same way smoltcp's own `tcp::RecvError::InvalidState` already is just
                 // below, rather than panicking deep in its `get_mut`.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(ReceiveError::SocketInInvalidState);
                 }
                 let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
@@ -4850,11 +4869,11 @@ where
             Protocol::Udp => {
                 // Stale-handle guard -- see the identical TCP-branch guard above.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(ReceiveError::SocketInInvalidState);
                 }
                 let Some(udp_socket) = try_get_socket_mut::<udp::Socket>(
@@ -4924,11 +4943,11 @@ where
                 // an invalid fd (the handle no longer names anything real) instead of panicking
                 // deep in smoltcp's own `get_mut`.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(errors::SetTcpOptionError::InvalidFd);
                 }
                 let Some(tcp_socket) = try_get_socket_mut::<tcp::Socket>(
@@ -4977,11 +4996,11 @@ where
             Protocol::Tcp => {
                 // Stale-handle guard -- see the identical guard in `set_tcp_option` above.
                 if !Self::handle_is_live(
-            &self.socket_set,
-            &self.slot_generations,
-            socket_handle.handle,
-            socket_handle.slot_gen,
-        ) {
+                    &self.socket_set,
+                    &self.slot_generations,
+                    socket_handle.handle,
+                    socket_handle.slot_gen,
+                ) {
                     return Err(errors::GetTcpOptionError::InvalidFd);
                 }
                 let Some(tcp_socket) = try_get_socket::<tcp::Socket>(

@@ -3447,7 +3447,10 @@ pub enum PrctlArg {
     GetNoNewPrivs,
     /// PR_SET_SECCOMP: `SECCOMP_MODE_STRICT` (1) or `SECCOMP_MODE_FILTER` (2) with a
     /// `struct sock_fprog *`. The legacy form of `seccomp(2)`: no flags, no `TSYNC`.
-    SetSeccomp { mode: u32, prog: usize },
+    SetSeccomp {
+        mode: u32,
+        prog: usize,
+    },
     /// PR_GET_SECCOMP: the calling thread's seccomp mode (0/1/2).
     GetSeccomp,
     /// `PR_SET_PDEATHSIG`: request a signal when the parent dies. Accepted, not delivered.

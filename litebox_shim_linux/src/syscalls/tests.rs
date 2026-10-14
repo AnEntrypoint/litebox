@@ -1034,10 +1034,7 @@ mod shared_flock_tests {
     /// `fork()` child's filesystem rebuild (see `SharedFlockSlot`'s own doc comment) -- so these
     /// tests key it the way production has to.
     fn key(n: usize) -> (usize, std::vec::Vec<u8>) {
-        (
-            0x00f1_00d0,
-            std::format!("/tmp/lock-{n}").into_bytes(),
-        )
+        (0x00f1_00d0, std::format!("/tmp/lock-{n}").into_bytes())
     }
 
     #[test]
@@ -1050,27 +1047,27 @@ mod shared_flock_tests {
         // "Process 1" holds `LOCK_EX`; "process 2" gets neither `LOCK_EX` nor `LOCK_SH`, and
         // non-blocking `flock(2)` reports that as EWOULDBLOCK.
         assert_eq!(
-            table.lock(platform, dev, &path,1, 100, true, true, &never),
+            table.lock(platform, dev, &path, 1, 100, true, true, &never),
             Some(Ok(()))
         );
         assert_eq!(
-            table.lock(platform, dev, &path,2, 200, true, true, &never),
+            table.lock(platform, dev, &path, 2, 200, true, true, &never),
             Some(Err(Errno::EWOULDBLOCK))
         );
         assert_eq!(
-            table.lock(platform, dev, &path,2, 200, false, true, &never),
+            table.lock(platform, dev, &path, 2, 200, false, true, &never),
             Some(Err(Errno::EWOULDBLOCK))
         );
 
         // Re-locking through the SAME holder is still a no-op conversion, not self-contention.
         assert_eq!(
-            table.lock(platform, dev, &path,1, 100, false, true, &never),
+            table.lock(platform, dev, &path, 1, 100, false, true, &never),
             Some(Ok(()))
         );
 
-        assert!(table.unlock(dev, &path,1, 100));
+        assert!(table.unlock(dev, &path, 1, 100));
         assert_eq!(
-            table.lock(platform, dev, &path,2, 200, true, true, &never),
+            table.lock(platform, dev, &path, 2, 200, true, true, &never),
             Some(Ok(()))
         );
     }
@@ -1084,28 +1081,28 @@ mod shared_flock_tests {
 
         for (host, id) in [(1u32, 100u64), (2, 200), (3, 300)] {
             assert_eq!(
-                table.lock(platform, dev, &path,host, id, false, true, &never),
+                table.lock(platform, dev, &path, host, id, false, true, &never),
                 Some(Ok(()))
             );
         }
         // `LOCK_SH` is compatible with `LOCK_SH`, but any of them blocks a fourth process's
         // `LOCK_EX`.
         assert_eq!(
-            table.lock(platform, dev, &path,4, 400, true, true, &never),
+            table.lock(platform, dev, &path, 4, 400, true, true, &never),
             Some(Err(Errno::EWOULDBLOCK))
         );
 
         // Releasing only SOME of them is not enough.
-        assert!(table.unlock(dev, &path,2, 200));
+        assert!(table.unlock(dev, &path, 2, 200));
         assert_eq!(
-            table.lock(platform, dev, &path,4, 400, true, true, &never),
+            table.lock(platform, dev, &path, 4, 400, true, true, &never),
             Some(Err(Errno::EWOULDBLOCK))
         );
 
-        assert!(table.unlock(dev, &path,1, 100));
-        assert!(table.unlock(dev, &path,3, 300));
+        assert!(table.unlock(dev, &path, 1, 100));
+        assert!(table.unlock(dev, &path, 3, 300));
         assert_eq!(
-            table.lock(platform, dev, &path,4, 400, true, true, &never),
+            table.lock(platform, dev, &path, 4, 400, true, true, &never),
             Some(Ok(()))
         );
     }
@@ -1121,19 +1118,19 @@ mod shared_flock_tests {
         let never = || false;
 
         assert_eq!(
-            table.lock(platform, dev, &path,1, 100, true, true, &never),
+            table.lock(platform, dev, &path, 1, 100, true, true, &never),
             Some(Ok(()))
         );
 
         let started = std::time::Instant::now();
         std::thread::scope(|scope| {
             let waiter =
-                scope.spawn(|| table.lock(platform, dev, &path,2, 200, true, false, &|| false));
+                scope.spawn(|| table.lock(platform, dev, &path, 2, 200, true, false, &|| false));
 
             // Give the waiter time to actually park, so this measures a wakeup and not a race the
             // waiter won by arriving after the unlock.
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(table.unlock(dev, &path,1, 100));
+            assert!(table.unlock(dev, &path, 1, 100));
 
             assert_eq!(waiter.join().expect("waiter thread panicked"), Some(Ok(())));
         });

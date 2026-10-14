@@ -109,7 +109,9 @@ fn parse_reference(image_ref: &str) -> anyhow::Result<Reference> {
         repository = format!("library/{repository}");
     }
     Ok(match (tag, digest) {
-        (Some(tag), Some(digest)) => Reference::with_tag_and_digest(registry, repository, tag, digest),
+        (Some(tag), Some(digest)) => {
+            Reference::with_tag_and_digest(registry, repository, tag, digest)
+        }
         (Some(tag), None) => Reference::with_tag(registry, repository, tag),
         (None, Some(digest)) => Reference::with_digest(registry, repository, digest),
         (None, None) => Reference::with_tag(registry, repository, "latest".to_owned()),
@@ -438,7 +440,13 @@ pub mod cache {
     fn safe_image_ref(image_ref: &str) -> String {
         image_ref
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 
@@ -856,7 +864,9 @@ pub fn pull_layers_in_memory_with_resolved_digests(
         })?;
         let known_layers = serde_json::from_str(&resolved_json)
             .context("failed to parse the recorded OCI layer list")?;
-        eprintln!("  LITEBOX_OCI_USE_LAST_RESOLVED: using the recorded layer list for {image_ref}, not contacting the registry");
+        eprintln!(
+            "  LITEBOX_OCI_USE_LAST_RESOLVED: using the recorded layer list for {image_ref}, not contacting the registry"
+        );
         return pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
             .map(|(pulled, _)| (pulled, resolved_json));
     }
@@ -882,7 +892,9 @@ pub fn pull_layers_in_memory_with_resolved_digests(
             );
             pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose)
                 .map(|(pulled, _)| (pulled, resolved_json))
-                .map_err(|offline_err| err.context(format!("offline fallback also failed: {offline_err:#}")))
+                .map_err(|offline_err| {
+                    err.context(format!("offline fallback also failed: {offline_err:#}"))
+                })
         }
     }
 }
@@ -917,7 +929,9 @@ pub fn pull_layers_with_known_digests(
         }
     }
     if cached_layers.len() == known_layers.len() {
-        return Ok(PulledLayers { layers: cached_layers });
+        return Ok(PulledLayers {
+            layers: cached_layers,
+        });
     }
     drop(cached_layers);
     pull_layers_in_memory_impl(image_ref, Some(known_layers), verbose).map(|(pulled, _)| pulled)
@@ -2373,11 +2387,15 @@ async fn pull_layer_resumable(
         let response = match requested {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
-                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} failed at {offset} bytes: {e}; retrying");
+                eprintln!(
+                    "  layer download attempt {attempt}/{MAX_ATTEMPTS} failed at {offset} bytes: {e}; retrying"
+                );
                 continue;
             }
             Err(_) => {
-                eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS}: no response in {CONNECT_TIMEOUT:?} at {offset} bytes; retrying");
+                eprintln!(
+                    "  layer download attempt {attempt}/{MAX_ATTEMPTS}: no response in {CONNECT_TIMEOUT:?} at {offset} bytes; retrying"
+                );
                 continue;
             }
         };
@@ -2409,7 +2427,9 @@ async fn pull_layer_resumable(
                     }
                 }
                 Ok(Some(Err(e))) => {
-                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} interrupted at {offset} bytes: {e}; resuming");
+                    eprintln!(
+                        "  layer download attempt {attempt}/{MAX_ATTEMPTS} interrupted at {offset} bytes: {e}; resuming"
+                    );
                     break;
                 }
                 Ok(None) => {
@@ -2419,7 +2439,9 @@ async fn pull_layer_resumable(
                     break;
                 }
                 Err(_) => {
-                    eprintln!("  layer download attempt {attempt}/{MAX_ATTEMPTS} stalled {STALL_TIMEOUT:?} at {offset} bytes; resuming");
+                    eprintln!(
+                        "  layer download attempt {attempt}/{MAX_ATTEMPTS} stalled {STALL_TIMEOUT:?} at {offset} bytes; resuming"
+                    );
                     break;
                 }
             }
@@ -2436,7 +2458,10 @@ async fn pull_layer_resumable(
         "layer download did not complete after {MAX_ATTEMPTS} attempts ({offset} of {total} bytes)"
     );
     if total != 0 {
-        anyhow::ensure!(offset == total, "layer download size mismatch: got {offset} bytes, expected {total}");
+        anyhow::ensure!(
+            offset == total,
+            "layer download size mismatch: got {offset} bytes, expected {total}"
+        );
     }
     if let Some(expected) = layer.digest.strip_prefix("sha256:") {
         let mut hasher = sha2::Sha256::new();
@@ -2449,7 +2474,11 @@ async fn pull_layer_resumable(
             }
             hasher.update(&buf[..n]);
         }
-        let actual: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         anyhow::ensure!(
             actual == expected,
             "layer digest mismatch after download: expected sha256:{expected}, got sha256:{actual}"

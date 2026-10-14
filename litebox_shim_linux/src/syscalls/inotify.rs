@@ -133,7 +133,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// system syscalls, so a cross-process fork child has nothing to receive on its copy and must
     /// not be given a pump for it.
     pub(crate) fn raw_fd_is_inotify(&self, raw_fd: usize) -> bool {
-        self.inotify_instance_of(i32::try_from(raw_fd).unwrap_or(-1)).is_ok()
+        self.inotify_instance_of(i32::try_from(raw_fd).unwrap_or(-1))
+            .is_ok()
     }
 
     /// The instance id behind `fd`, or `EINVAL` when `fd` is not an inotify descriptor.

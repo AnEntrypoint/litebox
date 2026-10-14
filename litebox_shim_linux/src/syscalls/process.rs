@@ -1790,7 +1790,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // chromium zygote child reads `--type=zygote` in `/proc` and `ps` - the one place
                 // a child says what it became is `prctl(PR_SET_NAME)`, which is what separates a
                 // legitimate spawn from a crash loop among the ~1.6/s fork churn.
-                let end = name_buf.iter().position(|b| *b == 0).unwrap_or(name_buf.len());
+                let end = name_buf
+                    .iter()
+                    .position(|b| *b == 0)
+                    .unwrap_or(name_buf.len());
                 if let Ok(set_name) = core::str::from_utf8(&name_buf[..end]) {
                     litebox_util_log::warn!(
                         pid:% = self.pid.get(), tid:% = self.tid.get(), name = set_name;
@@ -2733,10 +2736,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // happened to reap it, and the slot was never recycled.
             if ns != crate::syscalls::pidns::INITIAL_NS
                 && self.ns_pid.get() == 1
-                && !self
-                    .global
-                    .platform
-                    .env_flag("LITEBOX_PIDNS_RECLAIM_OFF")
+                && !self.global.platform.env_flag("LITEBOX_PIDNS_RECLAIM_OFF")
             {
                 self.global.pid_namespaces.init_exited(ns);
             }
@@ -3464,7 +3464,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // Our own repoll bound elapsed with no wake -- loop back and re-scan
                             // both registries directly instead of waiting on the notify again.
                             wait4_spins += 1;
-                            if wait4_spins % 2000 == 0 && self.global.platform.env_flag("LITEBOX_DIAG_WAIT4") {
+                            if wait4_spins % 2000 == 0
+                                && self.global.platform.env_flag("LITEBOX_DIAG_WAIT4")
+                            {
                                 let children = process.children.lock();
                                 let cross = process.cross_process_children.lock();
                                 litebox_util_log::warn!(
@@ -3537,7 +3539,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.import_cross_process_writable_layer(handle);
                     process.reap_cross_process_child(cross_pid);
                     self.xproc_unregister(cross_pid);
-                    if let Some(child_host) = self.global.platform.cross_process_child_host_pid(handle)
+                    if let Some(child_host) =
+                        self.global.platform.cross_process_child_host_pid(handle)
                     {
                         self.global
                             .release_cross_process_fork_slot_for_child(child_host);
@@ -4603,11 +4606,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // anything else with `ERROR_INVALID_PARAMETER`), and the <=64 KiB sliver left at each end
         // belongs to the neighbour's own widened span and cannot be reserved on its own.
         if !withheld.is_empty() {
-            let mut carved: alloc::vec::Vec<core::ops::Range<usize>> =
-                alloc::vec::Vec::new();
+            let mut carved: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
             for group in groups {
-                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> =
-                    alloc::vec::Vec::new();
+                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
                 pieces.push(group);
                 for w in &withheld {
                     let cut_start = w.start.next_multiple_of(GRANULE);
@@ -4615,8 +4616,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     if cut_start >= cut_end {
                         continue;
                     }
-                    let mut next: alloc::vec::Vec<core::ops::Range<usize>> =
-                        alloc::vec::Vec::new();
+                    let mut next: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
                     for p in pieces {
                         if cut_end <= p.start || cut_start >= p.end {
                             next.push(p);
@@ -5777,10 +5777,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (a slot is allocated
             // once and never freed) so one binary proves both sides of this, see
             // `PidNamespaceTable::create`.
-            let reclaim = !self
-                .global
-                .platform
-                .env_flag("LITEBOX_PIDNS_RECLAIM_OFF");
+            let reclaim = !self.global.platform.env_flag("LITEBOX_PIDNS_RECLAIM_OFF");
             let created = self
                 .global
                 .pid_namespaces
@@ -5906,14 +5903,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     return Ok(0);
                 }
-                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-register");
+                crate::diag::set_thread_note(
+                    core::ptr::addr_of!(*self) as u64,
+                    "parent:pre-register",
+                );
                 self.process()
                     .register_cross_process_child(child_tid, handle);
                 crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-xproc");
                 self.xproc_child_spawned(child_tid, handle);
-                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-notifier");
+                crate::diag::set_thread_note(
+                    core::ptr::addr_of!(*self) as u64,
+                    "parent:pre-notifier",
+                );
                 self.arm_cross_process_exit_notifier(child_tid, handle, cross_process_exit_signal);
-                crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "parent:pre-return");
+                crate::diag::set_thread_note(
+                    core::ptr::addr_of!(*self) as u64,
+                    "parent:pre-return",
+                );
                 litebox_util_log::debug!(
                     parent_tid:% = self.tid.get(), child_tid:% = child_tid;
                     "clone: spawned cross-process fork() child (no in-process duplicate made)"
@@ -7428,21 +7434,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // handed back ~1e18 ns, so such a deadline landed in the far future and the
                 // caller's wait loop never terminated. `LITEBOX_CPU_TIME_CLOCKS_OFF=1`
                 // restores the wall-time approximation.
-                let cpu = if self
-                    .global
-                    .platform
-                    .env_flag("LITEBOX_CPU_TIME_CLOCKS_OFF")
-                {
+                let cpu = if self.global.platform.env_flag("LITEBOX_CPU_TIME_CLOCKS_OFF") {
                     None
                 } else {
                     self.global.platform.cpu_time()
                 };
                 match cpu {
                     Some((process_cpu, thread_cpu)) => {
-                        if core::matches!(
-                            clockid,
-                            litebox_common_linux::ClockId::ThreadCputimeId
-                        ) {
+                        if core::matches!(clockid, litebox_common_linux::ClockId::ThreadCputimeId) {
                             thread_cpu
                         } else {
                             process_cpu
@@ -8384,7 +8383,8 @@ impl<Platform: ShimPlatform> SharedFutexWake<Platform> {
     }
 }
 
-static SHARED_FUTEX_WAKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static SHARED_FUTEX_WAKE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
 
 pub(crate) fn set_shared_futex_wake(enabled: bool) {
     SHARED_FUTEX_WAKE.store(enabled, core::sync::atomic::Ordering::Relaxed);
@@ -8446,7 +8446,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             })
             .map_err(|e| match e {
                 TryOpError::TryAgain => Errno::EAGAIN,
-                TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut) => Errno::ETIMEDOUT,
+                TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut) => {
+                    Errno::ETIMEDOUT
+                }
                 TryOpError::WaitError(_) => Errno::EINTR,
                 TryOpError::Other(e) => e,
             })
@@ -8527,9 +8529,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                 }
                 if shared {
-                    return match self
-                        .shared_futex_wait(&self.wait_cx().with_timeout(timeout), addr, val)?
-                    {
+                    return match self.shared_futex_wait(
+                        &self.wait_cx().with_timeout(timeout),
+                        addr,
+                        val,
+                    )? {
                         true => Ok(0),
                         false => Err(Errno::EAGAIN),
                     };
@@ -8569,9 +8573,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let shared = self.futex_is_cross_process(flags);
                 if shared {
-                    return match self
-                        .shared_futex_wait(&self.wait_cx().with_deadline(deadline), addr, val)?
-                    {
+                    return match self.shared_futex_wait(
+                        &self.wait_cx().with_deadline(deadline),
+                        addr,
+                        val,
+                    )? {
                         true => Ok(0),
                         false => Err(Errno::EAGAIN),
                     };
@@ -9646,10 +9652,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let set_tls = self
                         .global
                         .platform
-                        .set_arch_specific_register(
-                            &ArchSpecificRegister::TpidrEl0,
-                            tls.as_usize(),
-                        )
+                        .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, tls.as_usize())
                         .map_err(Errno::from);
                     if let Err(e) = set_tls {
                         litebox_util_log::warn!(

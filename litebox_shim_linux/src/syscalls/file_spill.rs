@@ -100,11 +100,17 @@ pub(crate) struct SharedFileSpill {
 }
 
 pub(crate) enum SpillEdit<'a> {
-    Write { start: usize, bytes: &'a [u8] },
+    Write {
+        start: usize,
+        bytes: &'a [u8],
+    },
     /// An `O_APPEND` write: `local_start` is where this process put the bytes, which is only a
     /// guess at where they belong -- real Linux resolves an append's destination at write time, so
     /// the store does too (see `apply`).
-    Append { bytes: &'a [u8], local_start: usize },
+    Append {
+        bytes: &'a [u8],
+        local_start: usize,
+    },
     Truncate(usize),
     Reset,
     Replace,
@@ -142,10 +148,14 @@ enum LockPolicy {
 
 enum Acquired {
     Fresh,
-    Recovered { dead_owner: u32 },
+    Recovered {
+        dead_owner: u32,
+    },
     /// Still held by `owner`. Only `LockPolicy::BargeAfter` may proceed after this, and doing so
     /// is the interleaving the lock exists to prevent.
-    Contended { owner: u32 },
+    Contended {
+        owner: u32,
+    },
 }
 
 fn policy_for(barge: bool) -> LockPolicy {
@@ -187,12 +197,7 @@ impl SharedFileSpill {
     /// A live holder is a holder that is still making progress: this critical section is bounded
     /// host I/O, so a waiter spins instead of entering. A waiter of the SAME host pid is another
     /// thread of this process (a multi-threaded guest), whose hold is likewise bounded.
-    fn acquire(
-        &self,
-        me: u32,
-        is_alive: &impl Fn(u32) -> bool,
-        policy: LockPolicy,
-    ) -> Acquired {
+    fn acquire(&self, me: u32, is_alive: &impl Fn(u32) -> bool, policy: LockPolicy) -> Acquired {
         let mut spins = 0u32;
         loop {
             match self
@@ -324,7 +329,8 @@ impl SharedFileSpill {
             let slot = &self.slots[index];
             slot.assign(to);
             let previous_generation = slot.generation.load(Ordering::Relaxed);
-            slot.generation.store(previous_generation + 1, Ordering::Relaxed);
+            slot.generation
+                .store(previous_generation + 1, Ordering::Relaxed);
             slot.state.store(SLOT_LIVE, Ordering::Release);
             Some(AppliedEdit {
                 slot: index,
@@ -395,7 +401,9 @@ impl SharedFileSpill {
             } else {
                 match edit {
                     SpillEdit::Write { start, bytes } => {
-                        platform.spill_write(slot_id, start as u64, bytes).then_some(())?;
+                        platform
+                            .spill_write(slot_id, start as u64, bytes)
+                            .then_some(())?;
                         current_length.max((start + bytes.len()) as u64)
                     }
                     // Real Linux resolves an `O_APPEND` write's destination AT WRITE TIME, under
@@ -411,7 +419,9 @@ impl SharedFileSpill {
                         current_length + bytes.len() as u64
                     }
                     SpillEdit::Truncate(length) => {
-                        platform.spill_set_len(slot_id, length as u64).then_some(())?;
+                        platform
+                            .spill_set_len(slot_id, length as u64)
+                            .then_some(())?;
                         length as u64
                     }
                     SpillEdit::Reset | SpillEdit::Remove | SpillEdit::Replace => {
@@ -422,7 +432,8 @@ impl SharedFileSpill {
             };
             let previous_generation = slot.generation.load(Ordering::Relaxed);
             slot.length.store(new_length, Ordering::Relaxed);
-            slot.generation.store(previous_generation + 1, Ordering::Relaxed);
+            slot.generation
+                .store(previous_generation + 1, Ordering::Relaxed);
             let state = if matches!(edit, SpillEdit::Remove) {
                 SLOT_DELETED
             } else {
@@ -440,7 +451,9 @@ impl SharedFileSpill {
 }
 
 fn is_spilled_path(path: &str) -> bool {
-    SPILLED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+    SPILLED_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 /// A path the host asked to share on top of [`SPILLED_PREFIXES`]:
@@ -491,7 +504,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.spill_enabled_for(path) {
             return;
         }
-        let Some(view) = self.global.shared_file_spill.view(self.global.platform, path) else {
+        let Some(view) = self
+            .global
+            .shared_file_spill
+            .view(self.global.platform, path)
+        else {
             return;
         };
         let seen = &LOCALLY_SEEN_GENERATION[view.slot];
@@ -534,10 +551,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let files = self.files.borrow();
         while offset < view.length {
             let wanted = chunk.len().min((view.length - offset) as usize);
-            let read = self
-                .global
-                .platform
-                .spill_read_at(view.slot as u32, offset, &mut chunk[..wanted]);
+            let read =
+                self.global
+                    .platform
+                    .spill_read_at(view.slot as u32, offset, &mut chunk[..wanted]);
             if read == 0 {
                 break;
             }
@@ -580,27 +597,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn copier_of_local_file<'a>(&'a self, path: &'a str) -> impl FnOnce(u32) -> Option<u64> + 'a {
-        move |slot| litebox::fs::with_root_identity(|| {
-            let files = self.files.borrow();
-            let file = files.fs.open(path, OFlags::RDONLY, Mode::empty()).ok()?;
-            let platform = self.global.platform;
-            let mut chunk = vec![0u8; TRANSFER_CHUNK];
-            let mut offset = 0u64;
-            let mut complete = platform.spill_set_len(slot, 0);
-            while complete {
-                let Ok(read) = files.fs.read(&file, &mut chunk, Some(offset as usize)) else {
-                    complete = false;
-                    break;
-                };
-                if read == 0 {
-                    break;
+        move |slot| {
+            litebox::fs::with_root_identity(|| {
+                let files = self.files.borrow();
+                let file = files.fs.open(path, OFlags::RDONLY, Mode::empty()).ok()?;
+                let platform = self.global.platform;
+                let mut chunk = vec![0u8; TRANSFER_CHUNK];
+                let mut offset = 0u64;
+                let mut complete = platform.spill_set_len(slot, 0);
+                while complete {
+                    let Ok(read) = files.fs.read(&file, &mut chunk, Some(offset as usize)) else {
+                        complete = false;
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    complete = platform.spill_write(slot, offset, &chunk[..read]);
+                    offset += read as u64;
                 }
-                complete = platform.spill_write(slot, offset, &chunk[..read]);
-                offset += read as u64;
-            }
-            let _ = files.fs.close(&file);
-            complete.then_some(offset)
-        })
+                let _ = files.fs.close(&file);
+                complete.then_some(offset)
+            })
+        }
     }
 
     pub(crate) fn publish_spilled(&self, path: &str, edit: SpillEdit<'_>) {
@@ -620,9 +639,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // does when the copy was current as of `previous_generation` AND the store put this edit
         // where this process put it; otherwise the next read must install the store's bytes, and
         // leaving `seen` behind is exactly what makes `refresh_from_spill` do that.
-        if seen.load(Ordering::Acquire) == applied.previous_generation
-            && !applied.local_diverged
-        {
+        if seen.load(Ordering::Acquire) == applied.previous_generation && !applied.local_diverged {
             seen.store(applied.new_generation, Ordering::Release);
         }
     }
@@ -631,10 +648,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.spill_enabled_for(from) && !self.spill_enabled_for(to) {
             return;
         }
-        if let Some(applied) = self
-            .global
-            .shared_file_spill
-            .move_slot(self.global.platform, from, to)
+        if let Some(applied) =
+            self.global
+                .shared_file_spill
+                .move_slot(self.global.platform, from, to)
         {
             // The move does not touch the bytes, so a local copy that already matched the store
             // still matches it; one that was behind stays behind, so the next read installs.

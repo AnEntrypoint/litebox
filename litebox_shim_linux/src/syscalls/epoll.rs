@@ -81,8 +81,8 @@ fn park_on_unix_wake_words<Platform: ShimPlatform, FS: ShimFS>(
         {
             return;
         }
-        let share = core::cmp::max(remaining / words.len() as u32, POLL_WORD_MIN_SLICE)
-            .min(remaining);
+        let share =
+            core::cmp::max(remaining / words.len() as u32, POLL_WORD_MIN_SLICE).min(remaining);
         words[next % words.len()].wake_wait_changed(seen[next % words.len()], share);
         remaining = remaining.saturating_sub(share);
         next += 1;

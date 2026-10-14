@@ -418,8 +418,7 @@ impl PidNamespaceTable {
 
     fn is_referenced(&self, ns: u32) -> bool {
         self.members.iter().any(|row| {
-            row.ns_pid.load(Ordering::Acquire) != FREE_PID
-                && row.ns.load(Ordering::Acquire) == ns
+            row.ns_pid.load(Ordering::Acquire) != FREE_PID && row.ns.load(Ordering::Acquire) == ns
         })
     }
 

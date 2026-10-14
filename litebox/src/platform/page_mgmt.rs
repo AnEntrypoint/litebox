@@ -412,10 +412,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The default is `None`, matching [`Self::shared_memory_token_for`]'s default.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn shared_memory_from_token(
-        &self,
-        token: &str,
-    ) -> Option<Self::SharedMemoryHandle> {
+    fn shared_memory_from_token(&self, token: &str) -> Option<Self::SharedMemoryHandle> {
         None
     }
 

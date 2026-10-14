@@ -337,8 +337,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     Some(u64::from_le_bytes(w))
                 };
                 let window_start = (ctx.rbp as usize).saturating_sub(0x260);
-                let frame = UserPtr::<u8>::from_usize(window_start)
-                    .to_owned_slice::<Platform>(0x270);
+                let frame =
+                    UserPtr::<u8>::from_usize(window_start).to_owned_slice::<Platform>(0x270);
                 let (h_begin, h_end) = (
                     read_u64((ctx.rbp as usize).saturating_sub(0x250)),
                     read_u64((ctx.rbp as usize).saturating_sub(0x248)),
@@ -939,9 +939,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             crate::diag::spawn_stuck_ticker(platform);
         }
         let inner = attached.unwrap_or_else(|| {
-                let mut net = Network::new(&self.litebox);
-                net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-                platform.create_shared_kernel_state(
+            let mut net = Network::new(&self.litebox);
+            net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+            platform.create_shared_kernel_state(
                     slot,
                     GlobalState {
                         platform: self.platform,
@@ -989,7 +989,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         shared_futex_wake: syscalls::process::SharedFutexWake::new(),
                     },
                 )
-            });
+        });
         // `/proc/self/{uid_map,gid_map,setgroups}` and the user namespaces they describe are
         // credentials, not files: the fs layer owns the paths, so it calls back into the shim,
         // which owns the task those files belong to. Registered per process (each fork child runs
@@ -1158,14 +1158,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
     /// calls this from its own keyboard/mouse-button event handler.
     pub fn push_input_key(&self, code: u16, value: i32) {
-        self.0.evdev.push_key(code, value, &self.0.evdev_pollee_local);
+        self.0
+            .evdev
+            .push_key(code, value, &self.0.evdev_pollee_local);
     }
 
     /// Push a real relative mouse-motion or wheel event into the shim's `/dev/input/event0`
     /// queue -- see [`syscalls::evdev::SharedEvdevTable::push_rel`]'s doc comment for the
     /// `code`/`value` contract.
     pub fn push_input_rel(&self, code: u16, value: i32) {
-        self.0.evdev.push_rel(code, value, &self.0.evdev_pollee_local);
+        self.0
+            .evdev
+            .push_rel(code, value, &self.0.evdev_pollee_local);
     }
 
     /// Push one 2D mouse movement as a SINGLE evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`),
@@ -1528,7 +1532,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         // The rootfs the admission bound protects is already rebuilt here, so the slot is given
         // back now rather than at a `wait4()` a long-lived child may never reach. See
         // `cross_process_fork_slots`.
-        self.0.release_cross_process_fork_slot_for_child(self.0.platform.current_host_pid());
+        self.0
+            .release_cross_process_fork_slot_for_child(self.0.platform.current_host_pid());
         entrypoints
     }
 
@@ -2431,9 +2436,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.platform.env_flag("LITEBOX_STRACE_SUMMARY")
         });
         crate::diag::init_rip_hist(|| self.global.platform.env_flag("LITEBOX_RIP_HIST"));
-        crate::diag::init_spin_stack(|| {
-            self.global.platform.env_value("LITEBOX_SPIN_STACK")
-        });
+        crate::diag::init_spin_stack(|| self.global.platform.env_value("LITEBOX_SPIN_STACK"));
         crate::diag::init_parked(|| self.global.platform.env_flag("LITEBOX_PARKED"));
         crate::diag::init_stuck(|| self.global.platform.env_value("LITEBOX_DIAG_STUCK_SECS"));
         crate::diag::set_mainthread_enabled(
@@ -2626,15 +2629,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )
         {
             crate::diag::emit_timeline_line(
-                    self.global.platform,
-                    &alloc::format!(
-                        "[diag-mainthread] pid={} tid={} syscall={} num={}",
-                        self.pid.get(),
-                        self.tid.get(),
-                        crate::diag::syscall_name_pub(syscall_number),
-                        syscall_number,
-                    ),
-                );
+                self.global.platform,
+                &alloc::format!(
+                    "[diag-mainthread] pid={} tid={} syscall={} num={}",
+                    self.pid.get(),
+                    self.tid.get(),
+                    crate::diag::syscall_name_pub(syscall_number),
+                    syscall_number,
+                ),
+            );
             // `clock_gettime` is the syscall the main thread spins on, and its `rip` is the
             // vDSO -- so the interesting address is NOT rip but what the stack holds: `[rsp]`
             // returns into the vDSO's caller (glibc), and the frames above that are the
@@ -2823,7 +2826,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         crate::diag::maybe_trace_child_ipc(
             self.global.platform,
             syscall_number,
-            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
             return_value as u64,
             self.pid.get(),
             self.tid.get(),
@@ -2833,7 +2840,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // exists after dispatch. One atomic load per syscall when the knob is unset.
         crate::diag::record_last_trail(
             syscall_number,
-            [ctx.syscall_arg(0) as u64, ctx.syscall_arg(1) as u64, ctx.syscall_arg(2) as u64],
+            [
+                ctx.syscall_arg(0) as u64,
+                ctx.syscall_arg(1) as u64,
+                ctx.syscall_arg(2) as u64,
+            ],
             return_value as u64,
         );
         #[cfg(target_arch = "x86_64")]

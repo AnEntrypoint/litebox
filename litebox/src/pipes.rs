@@ -101,7 +101,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Close the pipe at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, litebox: &LiteBox<Platform>, fd: &PipeFd<Platform>) -> Result<(), errors::CloseError> {
+    pub fn close(
+        &self,
+        litebox: &LiteBox<Platform>,
+        fd: &PipeFd<Platform>,
+    ) -> Result<(), errors::CloseError> {
         let removed = litebox.descriptor_table_mut().remove(fd);
         // `unique` is the invariant that decides whether the guest on the other end gets EOF:
         // only a unique entry is actually dropped here, and only that drop runs `WriteEnd::drop`.
@@ -212,7 +216,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     }
 
     /// Get the flags set on the pipe at `fd`.
-    pub fn get_flags(&self, litebox: &LiteBox<Platform>, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
+    pub fn get_flags(
+        &self,
+        litebox: &LiteBox<Platform>,
+        fd: &PipeFd<Platform>,
+    ) -> Result<Flags, errors::ClosedError> {
         let dt = litebox.descriptor_table();
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
@@ -873,7 +881,12 @@ mod tests {
                 let mut i = 0;
                 while i < data.len() {
                     let ret = pipes
-                        .write(litebox, &WaitState::new(platform).context(), &prod, &data[i..])
+                        .write(
+                            litebox,
+                            &WaitState::new(platform).context(),
+                            &prod,
+                            &data[i..],
+                        )
                         .unwrap();
                     i += ret;
                 }
@@ -885,7 +898,12 @@ mod tests {
             let mut i = 0;
             loop {
                 let ret = pipes
-                    .read(litebox, &WaitState::new(platform).context(), &cons, &mut buf[i..])
+                    .read(
+                        litebox,
+                        &WaitState::new(platform).context(),
+                        &cons,
+                        &mut buf[i..],
+                    )
                     .unwrap();
                 if ret == 0 {
                     pipes.close(litebox, &cons).unwrap();
@@ -910,7 +928,12 @@ mod tests {
                 let data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
                 let mut i = 0;
                 while i < data.len() {
-                    match pipes.write(litebox, &WaitState::new(platform).context(), &prod, &data[i..]) {
+                    match pipes.write(
+                        litebox,
+                        &WaitState::new(platform).context(),
+                        &prod,
+                        &data[i..],
+                    ) {
                         Ok(n) => {
                             i += n;
                         }
@@ -930,7 +953,12 @@ mod tests {
             let mut buf = [0; 10];
             let mut i = 0;
             loop {
-                match pipes.read(litebox, &WaitState::new(platform).context(), &cons, &mut buf[i..]) {
+                match pipes.read(
+                    litebox,
+                    &WaitState::new(platform).context(),
+                    &cons,
+                    &mut buf[i..],
+                ) {
                     Ok(n) => {
                         if n == 0 {
                             break;

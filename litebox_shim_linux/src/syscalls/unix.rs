@@ -855,7 +855,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     }
 
     /// `(ring this side reads from, ring this side writes to)`.
-    fn rings(&self) -> (&SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>, &SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>) {
+    fn rings(
+        &self,
+    ) -> (
+        &SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>,
+        &SharedByteRing<Platform, SHARED_UNIX_CONN_BUF>,
+    ) {
         let slot_ref = self.slot_ref();
         if self.is_client {
             (&slot_ref.server_to_client, &slot_ref.client_to_server)
@@ -944,8 +949,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             host_pid = %self.platform().current_host_pid(),
             "DIAG unix shared conn: hold"
         );
-        self.slot_ref()
-            .hold(self.is_client, self.platform().current_host_pid(), self.platform());
+        self.slot_ref().hold(
+            self.is_client,
+            self.platform().current_host_pid(),
+            self.platform(),
+        );
     }
 
     /// Wakes every host process holding the peer side so a thread blocked in a read/poll there
@@ -1017,7 +1025,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// Prefers an atomic all-or-nothing write (temporary backpressure resolves via the normal
     /// `EAGAIN`-then-retry path); a byte stream degrades to a genuine short write only for a
     /// single message bigger than the whole ring, a record-framed slot refuses one (`EMSGSIZE`).
-    fn send(&self, mut msg: Message<Platform, FS>) -> Result<usize, (Message<Platform, FS>, Errno)> {
+    fn send(
+        &self,
+        mut msg: Message<Platform, FS>,
+    ) -> Result<usize, (Message<Platform, FS>, Errno)> {
         // This data plane carries a donated descriptor as its TEXT SPEC alone (`RingFdMail`,
         // rebuilt on the receiving side), so the `TypedFd`s `resolve_scm_rights_fds` duplicated
         // into this process's descriptor table have no receiver here. Release them now, before
@@ -1059,8 +1070,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         };
         let fd_specs = fd_specs.as_deref();
         let (_, write_ring) = self.rings();
-        if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform())
-        {
+        if write_ring.is_shutdown() || self.slot_ref().side_gone(!self.is_client, self.platform()) {
             UnixSocket::<Platform, FS>::release_unadopted_carries(self.global, &msg.fd_specs);
             diag_slot_line(
                 self.platform(),
@@ -1075,7 +1085,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if self.platform().env_flag("LITEBOX_DIAG_UNIXZERO")
             && DIAG_SLOT_WRITES_EMITTED.fetch_add(1, Ordering::Relaxed) < DIAG_SLOT_WRITE_LINES
         {
-            diag_slot_line(self.platform(), "write", self.slot, self.is_client, extra.as_str());
+            diag_slot_line(
+                self.platform(),
+                "write",
+                self.slot,
+                self.is_client,
+                extra.as_str(),
+            );
         }
         if self.slot_ref().framed.load(Ordering::Acquire) {
             if msg.data.len() + 4 > SHARED_UNIX_CONN_BUF {
@@ -1452,10 +1468,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 (link.global.get()?.clone(), slot)
             }
         };
-        if global
-            .platform
-            .env_flag("LITEBOX_UNIX_CROSS_WAKE_OFF")
-        {
+        if global.platform.env_flag("LITEBOX_UNIX_CROSS_WAKE_OFF") {
             return None;
         }
         Some(SharedWakeHandle { global, slot })
@@ -1513,8 +1526,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             } => (recv_channel, link, *is_client),
         };
         let _guard = link.lock.lock();
-        let (bytes, messages, has_fds) =
-            recv_channel.fold_queued((0usize, 0usize, false), |(b, n, f), m| {
+        let (bytes, messages, has_fds) = recv_channel
+            .fold_queued((0usize, 0usize, false), |(b, n, f), m| {
                 (b + m.data.len(), n + 1, f || !m.fds.is_empty())
             });
         if has_fds {
@@ -1968,14 +1981,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 }
             }
             ConnTransport::Shared {
-                self_read_shutdown,
-                ..
+                self_read_shutdown, ..
             } => {
                 if how.is_shutdown_read() && !self_read_shutdown.swap(true, Ordering::AcqRel) {
                     events |= Events::IN | Events::RDHUP;
                 }
                 if how.is_shutdown_write()
-                    && self.shared_view().expect("shared endpoint").shutdown_write()
+                    && self
+                        .shared_view()
+                        .expect("shared endpoint")
+                        .shutdown_write()
                 {
                     events |= Events::OUT | Events::HUP;
                 }
@@ -2523,9 +2538,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             fd_specs,
         });
         // Owned, so the connection's own state lock is NOT held across the park below.
-        let wake = self.with_state_ref(|state| {
-            state.connected().and_then(|conn| conn.shared_wake())
-        });
+        let wake =
+            self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()));
         let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
@@ -2579,9 +2593,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         // Owned, so the connection's own state lock is NOT held across the park below (the peer's
         // write needs that lock, and holding it here would deadlock the very wake we wait for).
-        let wake = self.with_state_ref(|state| {
-            state.connected().and_then(|conn| conn.shared_wake())
-        });
+        let wake =
+            self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()));
         let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
@@ -3133,10 +3146,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         } else {
             parent_host
         };
-        task.global
-            .unix_shared_conn_table
-            .get(slot)
-            .release(is_client, release_host, task.global.platform);
+        task.global.unix_shared_conn_table.get(slot).release(
+            is_client,
+            release_host,
+            task.global.platform,
+        );
         Some(datagram)
     }
 
@@ -3178,9 +3192,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         let recv = inner.recv_channel.as_ref();
         let _guard = link.lock.lock();
         let (bytes, messages) = match recv {
-            Some(channel) => channel.fold_queued((0usize, 0usize), |(b, n), m| {
-                (b + m.data.len(), n + 1)
-            }),
+            Some(channel) => {
+                channel.fold_queued((0usize, 0usize), |(b, n), m| (b + m.data.len(), n + 1))
+            }
             None => (0, 0),
         };
         // One 4-byte length prefix per datagram on top of the bytes themselves.
@@ -3358,7 +3372,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                 let Some(recv_channel) = &guard.recv_channel else {
                     return Err(TryOpError::Other(Errno::ENOTCONN));
                 };
-                recv_channel.try_read(buf, source_addr.as_deref_mut(), peek, sender_cred.as_deref_mut())
+                recv_channel.try_read(
+                    buf,
+                    source_addr.as_deref_mut(),
+                    peek,
+                    sender_cred.as_deref_mut(),
+                )
             },
         )
         .map_err(Errno::from);
@@ -3462,7 +3481,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                     return Err(TryOpError::Other(Errno::EPIPE));
                 }
                 let (_, write_ring) = view.rings();
-                if write_ring.is_shutdown() || view.slot_ref().side_gone(!view.is_client, view.platform())
+                if write_ring.is_shutdown()
+                    || view.slot_ref().side_gone(!view.is_client, view.platform())
                 {
                     return Err(TryOpError::Other(Errno::EPIPE));
                 }
@@ -3825,9 +3845,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         let mut carried: AnyDupFds<Platform, FS> = Vec::new();
         while total < target {
             let ret = match &self.inner {
-                UnixSocketInner::Stream(stream) => {
-                    stream.recvfrom(cx, timeout, &mut buf[total..], is_nonblocking, peek, if total == 0 { source.take() } else { None })
-                }
+                UnixSocketInner::Stream(stream) => stream.recvfrom(
+                    cx,
+                    timeout,
+                    &mut buf[total..],
+                    is_nonblocking,
+                    peek,
+                    if total == 0 { source.take() } else { None },
+                ),
                 UnixSocketInner::Datagram(datagram) => {
                     let mut sender = None;
                     datagram
@@ -4039,9 +4064,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             SocketOption::BROADCAST => {
                 SocketOptionValue::U32(u32::from(self.options.lock().broadcast))
             }
-            SocketOption::RCVLOWAT => {
-                SocketOptionValue::U32(u32::try_from(self.options.lock().recv_lowat()).unwrap_or(u32::MAX))
-            }
+            SocketOption::RCVLOWAT => SocketOptionValue::U32(
+                u32::try_from(self.options.lock().recv_lowat()).unwrap_or(u32::MAX),
+            ),
             _ => unreachable!(),
         }) {
             Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
@@ -4518,7 +4543,10 @@ pub(crate) struct SharedWakeHandle<Platform: ShimPlatform, FS: ShimFS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> SharedWake for SharedWakeHandle<Platform, FS> {
     fn wake_seq(&self) -> u32 {
-        self.global.unix_shared_conn_table.wake_word(self.slot).seq()
+        self.global
+            .unix_shared_conn_table
+            .wake_word(self.slot)
+            .seq()
     }
 
     fn wake_wait_changed(&self, seen: u32, timeout: Duration) {
@@ -4895,8 +4923,7 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
             }
         }
         for (i, b) in data.iter().enumerate() {
-            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES]
-                .store(*b, Ordering::Relaxed);
+            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES].store(*b, Ordering::Relaxed);
         }
         cursor.write_pos = cursor.write_pos.wrapping_add(data.len());
         cursor.blocked_need = 0;
@@ -4943,8 +4970,7 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
             }
         }
         for (i, b) in data.iter().take(n).enumerate() {
-            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES]
-                .store(*b, Ordering::Relaxed);
+            self.buf[(cursor.write_pos.wrapping_add(i)) % RING_BYTES].store(*b, Ordering::Relaxed);
         }
         cursor.write_pos = cursor.write_pos.wrapping_add(n);
         n
@@ -4956,8 +4982,8 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
         for (i, slot) in out.iter_mut().take(n).enumerate() {
-            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES]
-                .load(Ordering::Relaxed);
+            *slot =
+                self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES].load(Ordering::Relaxed);
         }
         n
     }
@@ -4977,8 +5003,8 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
         let avail = cursor.write_pos.wrapping_sub(cursor.read_pos);
         let n = out.len().min(cursor.readable_before_next_fd_mail(avail));
         for (i, slot) in out.iter_mut().take(n).enumerate() {
-            *slot = self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES]
-                .load(Ordering::Relaxed);
+            *slot =
+                self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES].load(Ordering::Relaxed);
         }
         let start = cursor.read_pos;
         cursor.read_pos = cursor.read_pos.wrapping_add(n);
@@ -5037,8 +5063,12 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
         let at = |cursor: &RingCursor, i: usize| {
             self.buf[(cursor.read_pos.wrapping_add(i)) % RING_BYTES].load(Ordering::Relaxed)
         };
-        let len = u32::from_le_bytes([at(&cursor, 0), at(&cursor, 1), at(&cursor, 2), at(&cursor, 3)])
-            as usize;
+        let len = u32::from_le_bytes([
+            at(&cursor, 0),
+            at(&cursor, 1),
+            at(&cursor, 2),
+            at(&cursor, 3),
+        ]) as usize;
         if avail < 4 + len {
             return None;
         }
@@ -5167,7 +5197,9 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
                 continue;
             }
             let prev = h.load(Ordering::Acquire);
-            if h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 c.fetch_add(1, Ordering::AcqRel);
                 return;
             }
@@ -5182,7 +5214,8 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
                 continue;
             }
             if !platform.is_process_alive(prev)
-                && h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                && h.compare_exchange(prev, host, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
             {
                 c.store(1, Ordering::Release);
                 return;
@@ -5208,7 +5241,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
     /// `untracked_holders` instead (see that field).
     fn release(&self, is_client: bool, host: u32, platform: &Platform) -> bool {
         let side = conn_side(is_client);
-        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+        for (h, c) in self.holder_hosts[side]
+            .iter()
+            .zip(&self.holder_counts[side])
+        {
             if h.load(Ordering::Acquire) == host
                 && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
@@ -5228,7 +5264,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         let mut out = alloc::string::String::new();
         for side in 0..2 {
             out.push_str(if side == 0 { "client[" } else { " server[" });
-            for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+            for (h, c) in self.holder_hosts[side]
+                .iter()
+                .zip(&self.holder_counts[side])
+            {
                 let n = c.load(Ordering::Acquire);
                 if n > 0 {
                     out.push_str(&alloc::format!("{}x{} ", h.load(Ordering::Acquire), n));
@@ -5260,7 +5299,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         let me = platform.current_host_pid();
         let mut any = false;
         let mut retired = false;
-        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+        for (h, c) in self.holder_hosts[side]
+            .iter()
+            .zip(&self.holder_counts[side])
+        {
             if c.load(Ordering::Acquire) == 0 {
                 continue;
             }
@@ -5317,7 +5359,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
     /// Calls `f` with every distinct host process currently holding `is_client`'s side.
     fn for_each_holder_host(&self, is_client: bool, mut f: impl FnMut(u32)) {
         let side = conn_side(is_client);
-        for (h, c) in self.holder_hosts[side].iter().zip(&self.holder_counts[side]) {
+        for (h, c) in self.holder_hosts[side]
+            .iter()
+            .zip(&self.holder_counts[side])
+        {
             if c.load(Ordering::Acquire) > 0 {
                 f(h.load(Ordering::Acquire));
             }
@@ -5610,7 +5655,10 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
             let mut hosts = [0u32; 2 * CONN_HOLDER_HOSTS];
             let mut hosts_n = 0usize;
             for side in 0..2 {
-                for (h, c) in slot.holder_hosts[side].iter().zip(&slot.holder_counts[side]) {
+                for (h, c) in slot.holder_hosts[side]
+                    .iter()
+                    .zip(&slot.holder_counts[side])
+                {
                     if c.load(Ordering::Acquire) == 0 {
                         continue;
                     }
@@ -6060,7 +6108,12 @@ impl SharedUnixConnectQueue {
 // registered by the parent, which knows the child's pid).
 
 fn encode_unix_addr(addr: &UnixSocketAddr) -> String {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| alloc::format!("{b:02x}")).collect::<String>();
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|b| alloc::format!("{b:02x}"))
+            .collect::<String>()
+    };
     match addr {
         UnixSocketAddr::Unnamed => String::from("u"),
         UnixSocketAddr::Path(p) => alloc::format!("p{}", hex(p.as_bytes())),
@@ -6153,8 +6206,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             // reachable across the fork. `LITEBOX_UNIX_DGRAM_CARRY_OFF=1` restores the refusal
             // that sent such a fork down the in-process relocating path instead.
             UnixSocketInner::Datagram(datagram) => {
-                if !datagram.is_plain()
-                    && global.platform.env_flag("LITEBOX_UNIX_DGRAM_CARRY_OFF")
+                if !datagram.is_plain() && global.platform.env_flag("LITEBOX_UNIX_DGRAM_CARRY_OFF")
                 {
                     Err("unix-datagram(bound-or-connected)")
                 } else {
@@ -6213,9 +6265,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         u8::from(is_client),
                         encode_unix_addr(&datagram.get_local_addr()),
                         encode_unix_addr(
-                            &datagram
-                                .get_peer_addr()
-                                .unwrap_or(UnixSocketAddr::Unnamed)
+                            &datagram.get_peer_addr().unwrap_or(UnixSocketAddr::Unnamed)
                         )
                     ),
                     Some(UnixCarryHold::Conn {
@@ -6301,10 +6351,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                             host_pid = %me,
                             "DIAG unix shared conn: fork_carry extra hold for the child"
                         );
-                        global
-                            .unix_shared_conn_table
-                            .get(slot)
-                            .hold(is_client, me, global.platform);
+                        global.unix_shared_conn_table.get(slot).hold(
+                            is_client,
+                            me,
+                            global.platform,
+                        );
                         let peer = conn.peer_cred;
                         Ok((
                             alloc::format!(
@@ -6366,7 +6417,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     }
 
     /// Undoes a [`Self::fork_carry`] whose fork did not happen.
-    pub(super) fn fork_carry_abandon(global: &GlobalStateHandle<Platform, FS>, hold: UnixCarryHold) {
+    pub(super) fn fork_carry_abandon(
+        global: &GlobalStateHandle<Platform, FS>,
+        hold: UnixCarryHold,
+    ) {
         match hold {
             UnixCarryHold::Conn {
                 slot,
@@ -6394,10 +6448,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     ///
     /// Parses only the fields [`Self::from_fork_spec`]'s `C` branch needs, and stays silent on
     /// anything else: a spec that describes no shared connection has no hold to release.
-    pub(super) fn release_unadopted_carry(
-        global: &GlobalStateHandle<Platform, FS>,
-        spec: &str,
-    ) {
+    pub(super) fn release_unadopted_carry(global: &GlobalStateHandle<Platform, FS>, spec: &str) {
         let Some((_status, body)) = spec.split_once(';') else {
             return;
         };
@@ -6549,10 +6600,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                     if register_own_presence {
                         let key = addr.to_key();
                         let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
-                        let inserted = task
-                            .global
-                            .unix_addr_presence
-                            .insert(presence_kind, presence_bytes, owner_pid);
+                        let inserted = task.global.unix_addr_presence.insert(
+                            presence_kind,
+                            presence_bytes,
+                            owner_pid,
+                        );
                         if !inserted {
                             // Degrade, never panic: the address simply is not visible to a
                             // cross-process `connect()` that misses this process's own address
@@ -6620,10 +6672,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                         "DIAG unix shared conn: child adopted, releasing the parent's extra hold"
                     );
                     // The holder the parent counted for this child now lives here.
-                    task.global
-                        .unix_shared_conn_table
-                        .get(slot)
-                        .release(is_client, release_host, task.global.platform);
+                    task.global.unix_shared_conn_table.get(slot).release(
+                        is_client,
+                        release_host,
+                        task.global.platform,
+                    );
                     litebox_util_log::__private::tracing::event!(
                         target: "litebox_diag::unix_conn_teardown",
                         litebox_util_log::__private::tracing::Level::DEBUG,

@@ -13,9 +13,7 @@
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
-use core::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-syscall accounting, keyed by raw syscall number.
 #[derive(Default)]
@@ -253,7 +251,8 @@ pub fn parked_enabled() -> bool {
 /// The main thread is the one whose tid equals its pid; a thread that leaves its message pump
 /// and spins is invisible to every exit-time instrument, because it never parks and never
 /// finishes the syscall the instruments would attribute to it.
-static MAINTHREAD_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MAINTHREAD_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 pub fn set_mainthread_enabled(v: bool) {
     MAINTHREAD_ENABLED.store(v, core::sync::atomic::Ordering::Release);
 }
@@ -603,8 +602,7 @@ fn stuck_slot(pid: i32, tid: i32, claim: bool) -> Option<(&'static StuckSlot, bo
         // Published before `key_pid` turns nonzero, so a reader that matches the pid never
         // compares against a `key_tid` that is still being written.
         s.key_tid.store(tid, Ordering::Relaxed);
-        if s
-            .key_pid
+        if s.key_pid
             .compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
@@ -642,8 +640,14 @@ pub fn stuck_enter(
     let mut c = [0u8; 16];
     let n = comm.len().min(16);
     c[..n].copy_from_slice(&comm[..n]);
-    s.comm[0].store(u64::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])), Ordering::Relaxed);
-    s.comm[1].store(u64::from_ne_bytes(c[8..].try_into().unwrap_or([0; 8])), Ordering::Relaxed);
+    s.comm[0].store(
+        u64::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])),
+        Ordering::Relaxed,
+    );
+    s.comm[1].store(
+        u64::from_ne_bytes(c[8..].try_into().unwrap_or([0; 8])),
+        Ordering::Relaxed,
+    );
     s.started_ms.store(now_ms, Ordering::Relaxed);
     // Last: a reader that sees `active == 1` sees every field above already written.
     s.active.store(1, Ordering::Release);
@@ -703,12 +707,7 @@ fn stuck_mix(s: &StuckSlot) -> String {
     let mut out = String::new();
     for (count, n) in pairs {
         use core::fmt::Write as _;
-        let _ = write!(
-            out,
-            " {}={}",
-            syscall_name(n as usize),
-            count
-        );
+        let _ = write!(out, " {}={}", syscall_name(n as usize), count);
     }
     out
 }
@@ -980,7 +979,10 @@ pub fn maybe_dump_rip_histogram<Platform: litebox::platform::StdioProvider>(plat
     let mut guard = RIP_HISTOGRAM.lock();
     let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
     rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
-    emit_timeline_line(platform, "[diag-rip-hist] busiest syscall call sites since last dump:");
+    emit_timeline_line(
+        platform,
+        "[diag-rip-hist] busiest syscall call sites since last dump:",
+    );
     for ((num, rip), hit) in rows.iter().take(20) {
         emit_timeline_line(
             platform,
@@ -1008,7 +1010,9 @@ pub fn print_rip_histogram(mut eprint: impl FnMut(&str)) {
     if guard.is_empty() {
         return;
     }
-    eprint("\n=== LITEBOX_STRACE_SUMMARY: syscall call sites (1-in-64 sampled rip histogram) ===\n");
+    eprint(
+        "\n=== LITEBOX_STRACE_SUMMARY: syscall call sites (1-in-64 sampled rip histogram) ===\n",
+    );
     let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
     rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
     for ((num, rip), hit) in rows.iter().take(60) {
@@ -1600,8 +1604,14 @@ static CHILD_EXIT_TRAIL_INIT: AtomicBool = AtomicBool::new(false);
 /// register snapshot in its own environment (`LITEBOX_INTERNAL_FORK_CHILD_GPRS`, read once) --
 /// and fires on the `exit`/`exit_group` SYSCALL NUMBER, before dispatch, so it cannot be bypassed
 /// by whatever the exit path turns out to be.
-pub fn maybe_dump_child_exit_trail<Platform>(platform: &Platform, syscall_number: usize, pid: i32, tid: i32, comm: &[u8], args: [u64; 3])
-where
+pub fn maybe_dump_child_exit_trail<Platform>(
+    platform: &Platform,
+    syscall_number: usize,
+    pid: i32,
+    tid: i32,
+    comm: &[u8],
+    args: [u64; 3],
+) where
     Platform: litebox::platform::StdioProvider + litebox::platform::SystemInfoProvider,
 {
     if !matches!(
@@ -1773,9 +1783,7 @@ pub fn emit_child_exit_trail<Platform: litebox::platform::StdioProvider>(
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
     let wanted = CHILD_EXIT_TRAIL_COMM.lock();
-    let comm_ok = wanted.is_empty()
-        || trimmed == wanted.as_slice()
-        || wanted.starts_with(trimmed);
+    let comm_ok = wanted.is_empty() || trimmed == wanted.as_slice() || wanted.starts_with(trimmed);
     let budget = CHILD_EXIT_TRAIL_BUDGET.load(Ordering::Acquire);
     let entries = first_trail_oldest_first();
     // One header per call, emitted BEFORE every gate on purpose: a header with `budget=0` means
@@ -1864,9 +1872,7 @@ pub fn emit_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
     let wanted = CHILD_EXIT_TRAIL_LAST_COMM.lock();
-    let comm_ok = wanted.is_empty()
-        || trimmed == wanted.as_slice()
-        || wanted.starts_with(trimmed);
+    let comm_ok = wanted.is_empty() || trimmed == wanted.as_slice() || wanted.starts_with(trimmed);
     let budget = CHILD_EXIT_TRAIL_LAST_BUDGET.load(Ordering::Acquire);
     let entries = last_trail_oldest_first();
     let _ = platform.write_to(
@@ -1926,11 +1932,8 @@ pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
     if CHILD_IPC_INIT.load(Ordering::Acquire) {
         return;
     }
-    let (budget, comm) = parse_child_trail_target(
-        value(),
-        CHILD_IPC_DEFAULT_BUDGET,
-        CHILD_IPC_DEFAULT_BUDGET,
-    );
+    let (budget, comm) =
+        parse_child_trail_target(value(), CHILD_IPC_DEFAULT_BUDGET, CHILD_IPC_DEFAULT_BUDGET);
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let own = String::from_utf8_lossy(&comm[..end]).into_owned();
     *CHILD_IPC_COMM.lock() = comm;
@@ -1997,13 +2000,14 @@ pub fn maybe_trace_child_ipc<Platform>(
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
     let wanted = CHILD_IPC_COMM.lock();
-    if !wanted.is_empty()
-        && !(trimmed == wanted.as_slice() || wanted.starts_with(trimmed))
-    {
+    if !wanted.is_empty() && !(trimmed == wanted.as_slice() || wanted.starts_with(trimmed)) {
         return;
     }
     if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
-        if platform.env_value("LITEBOX_INTERNAL_FORK_CHILD_GPRS").is_none() {
+        if platform
+            .env_value("LITEBOX_INTERNAL_FORK_CHILD_GPRS")
+            .is_none()
+        {
             return;
         }
         IS_FORK_CHILD_HOST.store(true, Ordering::Release);

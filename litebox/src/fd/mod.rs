@@ -301,7 +301,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 let Some(Some(entry)) = self.entries.get(idx) else {
                     continue;
                 };
-                let Some(guard) = entry.try_read() else { continue };
+                let Some(guard) = entry.try_read() else {
+                    continue;
+                };
                 if !guard.matches_subsystem::<Subsystem>() {
                     continue;
                 }
@@ -323,7 +325,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             let Some(Some(entry)) = self.entries.get(idx) else {
                 continue;
             };
-            let Some(guard) = entry.try_read() else { continue };
+            let Some(guard) = entry.try_read() else {
+                continue;
+            };
             if !guard.matches_subsystem::<Subsystem>() {
                 continue;
             }

@@ -139,7 +139,10 @@ impl SocketBuffers {
         Some(slot)
     }
 
-    fn meta_slice(&mut self, claim: &mut Claim) -> Option<&'static mut [PacketMetadata<udp::UdpMetadata>]> {
+    fn meta_slice(
+        &mut self,
+        claim: &mut Claim,
+    ) -> Option<&'static mut [PacketMetadata<udp::UdpMetadata>]> {
         let (idx, slot) = self.meta.alloc()?;
         claim.meta[usize::from(claim.nmeta)] = idx;
         claim.nmeta += 1;
@@ -154,7 +157,9 @@ impl SocketBuffers {
     }
 
     /// RX and TX ring buffers for a TCP socket, or `None` when the pool is exhausted.
-    pub(crate) fn tcp(&mut self) -> Option<(RingBuffer<'static, u8>, RingBuffer<'static, u8>, Claim)> {
+    pub(crate) fn tcp(
+        &mut self,
+    ) -> Option<(RingBuffer<'static, u8>, RingBuffer<'static, u8>, Claim)> {
         let mut claim = Claim::new();
         let rx = self.data_slot(&mut claim);
         let tx = self.data_slot(&mut claim);
@@ -240,9 +245,15 @@ impl SocketBuffers {
     pub(crate) fn occupancy(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.data.slots,
-            self.data.used[..self.data.slots].iter().filter(|u| **u).count(),
+            self.data.used[..self.data.slots]
+                .iter()
+                .filter(|u| **u)
+                .count(),
             self.meta.slots,
-            self.meta.used[..self.meta.slots].iter().filter(|u| **u).count(),
+            self.meta.used[..self.meta.slots]
+                .iter()
+                .filter(|u| **u)
+                .count(),
             self.owners.iter().filter(|o| o.is_some()).count(),
         )
     }

@@ -464,7 +464,10 @@ static PUBLISHED_PROCESS_TABLE: AtomicUsize = AtomicUsize::new(0);
 /// host process of the fork family -- including each cross-process fork child -- publishes its own
 /// view of the one shared table.
 pub(crate) fn publish_process_table(table: &SharedProcessTable) {
-    PUBLISHED_PROCESS_TABLE.store(table as *const SharedProcessTable as usize, Ordering::Release);
+    PUBLISHED_PROCESS_TABLE.store(
+        table as *const SharedProcessTable as usize,
+        Ordering::Release,
+    );
 }
 
 /// Whether some host process in this fork family is running guest `pid`. False before
@@ -566,9 +569,11 @@ fn drain_host<Platform: ShimPlatform, FS: ShimFS>(global: &GlobalStateHandle<Pla
             if table.has_pending(view.index) {
                 let bits = table.take_pending(view.index, view.pid);
                 if view.owns_host && bits & signal_bit(Signal::SIGKILL) != 0 {
-                    global.platform.exit_host_process_quiesced(
-                        encode_cross_process_exit_status(ExitStatus::Signal(Signal::SIGKILL)),
-                    );
+                    global
+                        .platform
+                        .exit_host_process_quiesced(encode_cross_process_exit_status(
+                            ExitStatus::Signal(Signal::SIGKILL),
+                        ));
                 }
                 deliver_bits(&process, bits);
             }
@@ -905,10 +910,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             && view.owns_host
             && self.process_table.post(view.index, view.pid, signal)
             && self.platform.wake_signal_listener(view.host_pid)
-            && self.platform.wait_for_host_process_exit(
-                view.host_pid,
-                GRACEFUL_SIGKILL_EXIT_LIMIT_MS,
-            )
+            && self
+                .platform
+                .wait_for_host_process_exit(view.host_pid, GRACEFUL_SIGKILL_EXIT_LIMIT_MS)
         {
             return;
         }

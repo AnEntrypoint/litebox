@@ -175,9 +175,9 @@ impl SysvShmTable {
     /// dying segment -- the observed `fresh_after_rmid shmid=1 same=True` -- and a client that
     /// recreated its buffer after tearing the old one down keeps reading the OLD contents.
     fn index_of_key(&self, key: i32) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            matches!(slot, Some(s) if s.segment.key == key && !s.segment.removed)
-        })
+        self.slots
+            .iter()
+            .position(|slot| matches!(slot, Some(s) if s.segment.key == key && !s.segment.removed))
     }
 
     fn get_mut(&mut self, shmid: i32) -> Option<&mut SysvShmSegment> {
@@ -434,7 +434,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(handle) => handle,
             Err(SharedMemoryError::UnsupportedByPlatform) => {
                 let section = alloc::format!("Local\\{name}");
-                match self.global.platform.create_named_shared_memory(&section, size) {
+                match self
+                    .global
+                    .platform
+                    .create_named_shared_memory(&section, size)
+                {
                     Ok(handle) => handle,
                     Err(_) => {
                         rollback_attach();
@@ -1513,7 +1517,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     |_| None,
                     |_| None,
                     |_| None,
-                    |_| None)
+                    |_| None,
+                )
                 .ok()
                 .flatten()
         };
@@ -1528,7 +1533,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if start >= end {
             return;
         }
-        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(align_up(end, PAGE_SIZE)) else {
+        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(align_up(end, PAGE_SIZE))
+        else {
             return;
         };
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, unmapped before returning.
@@ -1883,12 +1889,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         Some(
             unsafe {
-                self.process().pm().map_existing_shared_pages_file_private_cow(
-                    suggested_addr,
-                    length,
-                    create_flags,
-                    handle,
-                )
+                self.process()
+                    .pm()
+                    .map_existing_shared_pages_file_private_cow(
+                        suggested_addr,
+                        length,
+                        create_flags,
+                        handle,
+                    )
             }
             .map(UserPtrMut::from_platform_ptr::<Platform>),
         )

@@ -1576,7 +1576,8 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// this is the spelled-out form, for the tests, which drive the table without a holder.
     #[cfg(test)]
     pub(crate) fn unlock(&self, dev: usize, path: &[u8], host: u32, id: u64) -> bool {
-        self.region().is_some_and(|r| r.release(dev, path, host, id))
+        self.region()
+            .is_some_and(|r| r.release(dev, path, host, id))
     }
 
     /// Whether the table can exclude at all (i.e. whether its region is in memory every contending
@@ -2033,8 +2034,9 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         }
         let mut chunks = 0u32;
         loop {
-            match self.try_apply(region, platform, dev, path, host, guest, start, end, write, unlock)
-            {
+            match self.try_apply(
+                region, platform, dev, path, host, guest, start, end, write, unlock,
+            ) {
                 SharedRecordLockOutcome::Applied => return Some(Ok(())),
                 SharedRecordLockOutcome::Unavailable => return None,
                 SharedRecordLockOutcome::Full => return Some(Err(Errno::ENOLCK)),
@@ -2140,11 +2142,16 @@ impl RecordLock {
 
 #[derive(Debug)]
 enum FsPath {
-    Absolute { path: CString },
+    Absolute {
+        path: CString,
+    },
     /// Current working directory
     Cwd,
     /// Path is relative to a file descriptor
-    FdRelative { fd: u32, path: CString },
+    FdRelative {
+        fd: u32,
+        path: CString,
+    },
     Fd(u32),
 }
 
@@ -2252,7 +2259,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let snapshot: alloc::vec::Vec<(u32, String)> = {
             let files = self.files.borrow();
-            let alive: alloc::vec::Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+            let alive: alloc::vec::Vec<usize> =
+                files.raw_descriptor_store.read().iter_alive().collect();
             alive
                 .into_iter()
                 .filter_map(|raw| {
@@ -2721,8 +2729,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return Err(errno);
             }
         };
-        let truncating = flags.contains(OFlags::TRUNC)
-            && flags.intersects(OFlags::WRONLY | OFlags::RDWR);
+        let truncating =
+            flags.contains(OFlags::TRUNC) && flags.intersects(OFlags::WRONLY | OFlags::RDWR);
         if creating_spilled_file || truncating {
             self.publish_spilled(path_str, SpillEdit::Reset);
         }
@@ -3381,7 +3389,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some(explicit) => explicit,
             None => i32::try_from(raw_fd)
                 .ok()
-                .and_then(|raw| self.sys_lseek(raw, 0, SeekWhence::RelativeToCurrentOffset).ok())
+                .and_then(|raw| {
+                    self.sys_lseek(raw, 0, SeekWhence::RelativeToCurrentOffset)
+                        .ok()
+                })
                 .unwrap_or(0),
         };
         // Past the memfd's length is EOF, exactly as for a read of a real file.
@@ -3433,11 +3444,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `/proc/self/fd/N` reopen of an unnamed file is a `dup` (`sys_openat`), so the new descriptor
     /// inherits the ORIGINAL access mode and its read-only-ness exists only as `ReopenedAccess`
     /// metadata; `F_SETFL` likewise writes metadata and nothing else.
-    fn regular_file_getfl<Subsystem>(
-        &self,
-        open_flags: OFlags,
-        fd: &TypedFd<Subsystem>,
-    ) -> OFlags
+    fn regular_file_getfl<Subsystem>(&self, open_flags: OFlags, fd: &TypedFd<Subsystem>) -> OFlags
     where
         Subsystem: litebox::fd::FdEnabledSubsystem,
     {
@@ -3495,11 +3502,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let open_flags = files.fs.open_flags(fd)?;
                     // Diagnostic A/B only: `LITEBOX_SHM_CARRY_GETFL_OFF=1` restores the raw
                     // open-time flags, so one binary proves both sides of the FDPair bug.
-                    let flags = if self
-                        .global
-                        .platform
-                        .env_flag("LITEBOX_SHM_CARRY_GETFL_OFF")
-                    {
+                    let flags = if self.global.platform.env_flag("LITEBOX_SHM_CARRY_GETFL_OFF") {
                         open_flags
                     } else {
                         self.regular_file_getfl(open_flags, fd)
@@ -3575,7 +3578,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // as a closed channel (`socket_utils_posix.cc`: `return missing_fds ? 0 : result;`), which
         // is a renderer that activates its seccomp sandbox and then `_exit(0)`. Take the next name
         // instead. `LITEBOX_SHM_CARRIER_RETRY_OFF=1` restores the single-name behaviour.
-        let retry = !self.global.platform.env_flag("LITEBOX_SHM_CARRIER_RETRY_OFF");
+        let retry = !self
+            .global
+            .platform
+            .env_flag("LITEBOX_SHM_CARRIER_RETRY_OFF");
         let mut path = alloc::string::String::new();
         let mut creator = None;
         for _ in 0..Self::CARRIER_NAME_ATTEMPTS {
@@ -3584,7 +3590,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.platform.current_host_pid(),
                 MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
             );
-            match self.sys_openat(AT_FDCWD, path.as_str(), create_flags, Mode::RUSR | Mode::WUSR) {
+            match self.sys_openat(
+                AT_FDCWD,
+                path.as_str(),
+                create_flags,
+                Mode::RUSR | Mode::WUSR,
+            ) {
                 Ok(fd) => {
                     creator = Some(fd);
                     break;
@@ -3625,7 +3636,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen_flags, Mode::empty());
         let _ = self.sys_close(i32::try_from(creator).map_err(|_| Errno::EINVAL)?);
-        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        let _ = self.sys_unlinkat(
+            AT_FDCWD,
+            path.as_str(),
+            litebox_common_linux::AtFlags::empty(),
+        );
         let raw = raw.map_err(|e| stage_log("carrier_reopen_openat", path.as_str(), e))?;
         let key = key.ok_or_else(|| {
             let _ = i32::try_from(raw).map(|fd| self.sys_close(fd));
@@ -3834,7 +3849,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Option<alloc::string::String> {
         const AT_FDCWD: i32 = -100;
         let raw = self
-            .sys_openat(AT_FDCWD, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            .sys_openat(
+                AT_FDCWD,
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
             .ok()?;
         let spec = usize::try_from(raw)
             .ok()
@@ -3882,8 +3902,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // them at all -- the reopen answered EACCES even though `mkdir` had just succeeded, and
         // the carried directory fd was still lost. Measured: `chain=dddd created=1
         // reopened=false`, i.e. the leaf really was created and still refused the opener.
-        let mode = (Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::RGRP | Mode::WGRP
-            | Mode::XGRP | Mode::ROTH | Mode::WOTH | Mode::XOTH)
+        let mode = (Mode::RUSR
+            | Mode::WUSR
+            | Mode::XUSR
+            | Mode::RGRP
+            | Mode::WGRP
+            | Mode::XGRP
+            | Mode::ROTH
+            | Mode::WOTH
+            | Mode::XOTH)
             .bits();
         let mut created = 0;
         for (i, c) in path.char_indices() {
@@ -3911,11 +3938,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The snapshot's bytes already live in the named shared object, so hand it to
         // `install_shm_file`: it attaches by name and puts the carrier at the ROOT under
         // `root_guard`, which needs no guest directory, and it truncates to `size` exactly.
-        if !self
-            .global
-            .platform
-            .env_flag("LITEBOX_FILE_CARRY_FIX_OFF")
-        {
+        if !self.global.platform.env_flag("LITEBOX_FILE_CARRY_FIX_OFF") {
             return self.install_shm_file(name, size, flags, cloexec);
         }
         const AT_FDCWD: i32 = -100;
@@ -3985,7 +4008,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         dir:% = dir, errno:? = e;
                         "diag-snap: snapshot scratch directory unusable"
                     );
-                    continue
+                    continue;
                 }
                 Err(e) => {
                     litebox_util_log::warn!(
@@ -4007,7 +4030,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let written = self.sys_write(creator, &bytes, None);
         let _ = self.sys_close(creator);
         if let Err(e) = written {
-            let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+            let _ = self.sys_unlinkat(
+                AT_FDCWD,
+                path.as_str(),
+                litebox_common_linux::AtFlags::empty(),
+            );
             litebox_util_log::warn!(
                 path:% = path.as_str(), size:% = size, errno:? = e;
                 "diag-snap: writing the snapshot copy failed"
@@ -4020,7 +4047,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             reopen |= OFlags::CLOEXEC;
         }
         let raw = self.sys_openat(AT_FDCWD, path.as_str(), reopen, Mode::empty());
-        let _ = self.sys_unlinkat(AT_FDCWD, path.as_str(), litebox_common_linux::AtFlags::empty());
+        let _ = self.sys_unlinkat(
+            AT_FDCWD,
+            path.as_str(),
+            litebox_common_linux::AtFlags::empty(),
+        );
         if let Err(e) = &raw {
             litebox_util_log::warn!(
                 path:% = path.as_str(), flags:% = flags, errno:? = e;
@@ -4067,7 +4098,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let flags: u32 = parts.next()?.parse().ok()?;
         let size: usize = parts.next()?.parse().ok()?;
         let name = parts.next()?;
-        let raw = i32::try_from(self.rebuild_snapshot_file(flags, size, name, cloexec).ok()?).ok()?;
+        let raw = i32::try_from(
+            self.rebuild_snapshot_file(flags, size, name, cloexec)
+                .ok()?,
+        )
+        .ok()?;
         if raw != target_fd {
             let moved = self
                 .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
@@ -4157,7 +4192,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .filter(|status| status.file_type == litebox::fs::FileType::RegularFile)
                 .map(|status| status.node_info);
             self.refresh_from_spill(path.to_str().unwrap_or_default());
-            let result = self.files.borrow().fs.unlink(path.clone()).map_err(Errno::from);
+            let result = self
+                .files
+                .borrow()
+                .fs
+                .unlink(path.clone())
+                .map_err(Errno::from);
             if result.is_ok()
                 && let Some(node_info) = node_info
             {
@@ -4661,7 +4701,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .ok_or(Errno::EBADF)?;
                     espipe_for_non_seekable_offset(offset)?;
                     handle.with_entry(|end| {
-                        end.read(&self.wait_cx(), &mut buf.borrow_mut(), &self.global.pty_io())
+                        end.read(
+                            &self.wait_cx(),
+                            &mut buf.borrow_mut(),
+                            &self.global.pty_io(),
+                        )
                     })
                 },
                 |fd| {
@@ -4895,8 +4939,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // An `O_APPEND` fd's destination is the store's own end, not wherever this process's
                 // copy happened to end: publishing the local offset instead lets a sibling that
                 // appended in the same instant have its bytes overwritten (`SpillEdit::Append`).
-                let appending = offset.is_none()
-                    && self.files.borrow().fd_was_opened_append(raw_fd);
+                let appending =
+                    offset.is_none() && self.files.borrow().fd_was_opened_append(raw_fd);
                 if appending {
                     self.publish_spilled(
                         path,
@@ -4906,7 +4950,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         },
                     );
                 } else {
-                    self.publish_spilled(path, SpillEdit::Write { start, bytes: &buf[..*n] });
+                    self.publish_spilled(
+                        path,
+                        SpillEdit::Write {
+                            start,
+                            bytes: &buf[..*n],
+                        },
+                    );
                 }
             }
         }
@@ -5483,7 +5533,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn do_chown(&self, path: &str, owner: u32, group: u32) -> Result<(), Errno> {
-        let narrowed = |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX - 1));
+        let narrowed =
+            |id: u32| (id != u32::MAX).then(|| u16::try_from(id).unwrap_or(u16::MAX - 1));
         let (user, group) = (narrowed(owner), narrowed(group));
         self.refresh_from_spill(path);
         let files = self.files.borrow();
@@ -6813,9 +6864,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
-            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                Ok(T::from(self.files.borrow().fs.file_status(self.rooted_cwd())?))
-            }
+            FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => Ok(T::from(
+                self.files.borrow().fs.file_status(self.rooted_cwd())?,
+            )),
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 descriptor_stat(fd as usize, self)
             }
@@ -7549,7 +7600,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 other => Errno::from(other),
             });
         // Any change may unblock a waiter (unlock, downgrade, or a shrunken range).
-        self.global.record_lock_pollee().notify_observers(Events::IN);
+        self.global
+            .record_lock_pollee()
+            .notify_observers(Events::IN);
         r
     }
 
@@ -7565,7 +7618,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let changed = locks.len() != before;
         drop(locks);
         if changed {
-            self.global.record_lock_pollee().notify_observers(Events::IN);
+            self.global
+                .record_lock_pollee()
+                .notify_observers(Events::IN);
         }
     }
 
@@ -8877,9 +8932,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         {
                             return Err(Errno::EINVAL);
                         }
-                        Ok(_unix
-                            .readable_bytes()
-                            .ok_or(Errno::EINVAL)?)
+                        Ok(_unix.readable_bytes().ok_or(Errno::EINVAL)?)
                     },
                 )?;
                 out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
@@ -8901,92 +8954,93 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     FileDescriptorFlags::empty()
                 };
                 files.run_on_raw_fd(
-                desc,
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    // FIOCLEX (set close-on-exec) is a descriptor-table-level flag, not a
-                    // file-type-specific one, so it applies identically regardless of what kind
-                    // of fd this is -- unlike `net`/`pipes` above, which used to panic
-                    // (`todo!()`) here despite `set_fd_metadata` working the same way for them
-                    // as for every other fd type in this match.
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                },
-                |fd| {
-                    let _old = self
-                        .global
-                        .litebox
-                        .descriptor_table_mut()
-                        .set_fd_metadata(fd, flags);
-                    Ok(0)
-                })?
+                    desc,
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        // FIOCLEX (set close-on-exec) is a descriptor-table-level flag, not a
+                        // file-type-specific one, so it applies identically regardless of what kind
+                        // of fd this is -- unlike `net`/`pipes` above, which used to panic
+                        // (`todo!()`) here despite `set_fd_metadata` working the same way for them
+                        // as for every other fd type in this match.
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                    |fd| {
+                        let _old = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, flags);
+                        Ok(0)
+                    },
+                )?
             }
             IoctlArg::TCGETS(..)
             | IoctlArg::TCSETS(..)
@@ -9471,11 +9525,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         match arg {
             IoctlArg::DrmModeGetResources(ptr) => self.global.drm.get_resources(*ptr),
             IoctlArg::DrmModeGetCrtc(ptr) => self.global.drm.get_crtc(*ptr),
-            IoctlArg::DrmModeSetCrtc(ptr) => self.global.drm.set_crtc(
-                self.global.platform,
-                &self.global.drm_flip_local,
-                *ptr,
-            ),
+            IoctlArg::DrmModeSetCrtc(ptr) => {
+                self.global
+                    .drm
+                    .set_crtc(self.global.platform, &self.global.drm_flip_local, *ptr)
+            }
             IoctlArg::DrmModeGetEncoder(ptr) => self.global.drm.get_encoder(*ptr),
             IoctlArg::DrmModeGetConnector(ptr) => self.global.drm.get_connector(*ptr),
             IoctlArg::DrmModeCreateDumb(ptr) => {
@@ -9487,19 +9541,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             IoctlArg::DrmModeAddFb(ptr) => self.global.drm.add_fb(self.global.platform, *ptr),
             IoctlArg::DrmModeAddFb2(ptr) => self.global.drm.add_fb2(self.global.platform, *ptr),
-            IoctlArg::DrmModePageFlip(ptr) => {
-                self.global.drm.page_flip(
-                    self.global.platform,
-                    &self.global.drm_flip_local,
-                    &self.global.boot_time,
-                    *ptr,
-                )
-            }
-            IoctlArg::DrmModeDirtyFb(ptr) => self.global.drm.dirty_fb(
+            IoctlArg::DrmModePageFlip(ptr) => self.global.drm.page_flip(
                 self.global.platform,
                 &self.global.drm_flip_local,
+                &self.global.boot_time,
                 *ptr,
             ),
+            IoctlArg::DrmModeDirtyFb(ptr) => {
+                self.global
+                    .drm
+                    .dirty_fb(self.global.platform, &self.global.drm_flip_local, *ptr)
+            }
             IoctlArg::DrmModeGetPlaneResources(ptr) => self.global.drm.get_plane_resources(*ptr),
             IoctlArg::DrmModeGetPlane(ptr) => self.global.drm.get_plane(*ptr),
             IoctlArg::DrmModeSetPlane(ptr) => self.global.drm.set_plane(*ptr),
@@ -10385,10 +10437,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // answered ENOENT. The bytes are still reachable by name, so snapshot them
                     // through a temporary read-only handle and put the SENDER's own flags back, so
                     // the receiver's copy is writable as the sender's was.
-                    let via_reopen = if self
-                        .global
-                        .platform
-                        .env_flag("LITEBOX_FILE_CARRY_FIX_OFF")
+                    let via_reopen = if self.global.platform.env_flag("LITEBOX_FILE_CARRY_FIX_OFF")
                     {
                         None
                     } else {
@@ -10574,7 +10623,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (cloexec, id) = spec.split_once('|')?;
         let id: u32 = id.parse().ok()?;
         let master = self.global.pty_master_attach(id)?;
-        let flags = if cloexec == "1" { OFlags::CLOEXEC } else { OFlags::empty() };
+        let flags = if cloexec == "1" {
+            OFlags::CLOEXEC
+        } else {
+            OFlags::empty()
+        };
         let raw = i32::try_from(
             self.insert_raw_pty_fd(master, flags, CString::new("/dev/ptmx").ok()?)
                 .ok()?,
@@ -10582,7 +10635,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         .ok()?;
         if raw != target_fd {
             let moved = self
-                .sys_dup(raw, Some(target_fd), (cloexec == "1").then_some(OFlags::CLOEXEC))
+                .sys_dup(
+                    raw,
+                    Some(target_fd),
+                    (cloexec == "1").then_some(OFlags::CLOEXEC),
+                )
                 .is_ok();
             let _ = self.sys_close(raw);
             return moved.then_some(());
@@ -10767,9 +10824,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // anomaly: it would advertise a listening address under a pid no process has
                     // (`child_pid == 0`), and `connect()` would find a listener nobody can accept.
                     match hold {
-                        Some(
-                            hold @ crate::syscalls::unix::UnixCarryHold::Presence { .. },
-                        ) => {
+                        Some(hold @ crate::syscalls::unix::UnixCarryHold::Presence { .. }) => {
                             crate::syscalls::unix::UnixSocket::<Platform, FS>::fork_carry_abandon(
                                 &self.global,
                                 hold,
@@ -10830,8 +10885,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .and_then(|p| p.parse().ok())
                     .ok_or(Errno::EINVAL)?;
                 let path = parts.next().ok_or(Errno::EINVAL)?;
-                let mut flags = OFlags::from_bits_truncate(u32::try_from(first).map_err(|_| Errno::EINVAL)?)
-                    & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
+                let mut flags =
+                    OFlags::from_bits_truncate(u32::try_from(first).map_err(|_| Errno::EINVAL)?)
+                        & !(OFlags::CREAT | OFlags::EXCL | OFlags::TRUNC);
                 if cloexec {
                     flags |= OFlags::CLOEXEC;
                 }
@@ -10851,10 +10907,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     Err(e)
                         if matches!(e, Errno::ENOENT | Errno::EACCES)
                             && flags.contains(OFlags::DIRECTORY)
-                            && !self
-                                .global
-                                .platform
-                                .env_flag("LITEBOX_FILE_CARRY_FIX_OFF") =>
+                            && !self.global.platform.env_flag("LITEBOX_FILE_CARRY_FIX_OFF") =>
                     {
                         let chain = self.diag_dir_chain(path);
                         let created = self.mkdir_chain(path);
@@ -10891,7 +10944,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             .filter(|file| !file.is_empty());
                         let substituted = own.map(|file| alloc::format!("/proc/self/{file}"));
                         let retried = substituted.as_ref().and_then(|p| {
-                            self.sys_openat(AT_FDCWD, p.as_str(), flags, Mode::empty()).ok()
+                            self.sys_openat(AT_FDCWD, p.as_str(), flags, Mode::empty())
+                                .ok()
                         });
                         // Whether the receiver's view of this path differs from the donor's, or
                         // whether the leaf itself is what is missing: opening the PARENT directory
@@ -11001,12 +11055,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
         let raw = {
             let files = self.files.borrow();
-            files
-                .insert_raw_fd(typed)
-                .map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?
+            files.insert_raw_fd(typed).map_err(|typed| {
+                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                Errno::EMFILE
+            })?
         };
         if cloexec || sender_cloexec == "1" && cloexec {
             let files = self.files.borrow();
@@ -11106,7 +11158,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
-    pub(crate) fn raw_fd_unix_carry_check(&self, raw_fd: usize) -> Option<Result<(), &'static str>> {
+    pub(crate) fn raw_fd_unix_carry_check(
+        &self,
+        raw_fd: usize,
+    ) -> Option<Result<(), &'static str>> {
         self.files
             .borrow()
             .raw_fd_unix_carry_check(&self.global, raw_fd)
@@ -11119,13 +11174,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
         child_pid: i32,
         for_spawn: bool,
-    ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str>
-    {
+    ) -> Result<
+        (
+            alloc::string::String,
+            Option<crate::syscalls::unix::UnixCarryHold>,
+        ),
+        &'static str,
+    > {
         let cloexec = self.raw_fd_is_cloexec(raw_fd);
-        let (spec, hold) = self
-            .files
-            .borrow()
-            .raw_fd_unix_carry(&self.global, raw_fd, self.peer_cred(), child_pid, for_spawn)?;
+        let (spec, hold) = self.files.borrow().raw_fd_unix_carry(
+            &self.global,
+            raw_fd,
+            self.peer_cred(),
+            child_pid,
+            for_spawn,
+        )?;
         Ok((alloc::format!("{}|{spec}", u8::from(cloexec)), hold))
     }
 
@@ -11157,13 +11220,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if flags.is_some() {
             let files = self.files.borrow();
             let desc = usize::try_from(target_fd).ok()?;
-            set_file_descriptor_flags(
-                desc,
-                &self.global,
-                &files,
-                FileDescriptorFlags::FD_CLOEXEC,
-            )
-            .ok()?;
+            set_file_descriptor_flags(desc, &self.global, &files, FileDescriptorFlags::FD_CLOEXEC)
+                .ok()?;
         }
         Some(())
     }
@@ -11173,7 +11231,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// child instead of refusing the fork (see `try_cross_process_fork`).
     pub(crate) fn raw_fd_inet_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
         let cloexec = self.raw_fd_is_cloexec(raw_fd);
-        let spec = self.files.borrow().raw_fd_inet_carry(&self.global, raw_fd)?;
+        let spec = self
+            .files
+            .borrow()
+            .raw_fd_inet_carry(&self.global, raw_fd)?;
         Some(alloc::format!("{}|{spec}", u8::from(cloexec)))
     }
 
@@ -11276,13 +11337,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if cloexec {
             let files = self.files.borrow();
             let desc = usize::try_from(raw).ok()?;
-            set_file_descriptor_flags(
-                desc,
-                &self.global,
-                &files,
-                FileDescriptorFlags::FD_CLOEXEC,
-            )
-            .ok()?;
+            set_file_descriptor_flags(desc, &self.global, &files, FileDescriptorFlags::FD_CLOEXEC)
+                .ok()?;
         }
         Some(raw)
     }
@@ -11319,7 +11375,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .entry_handle(&epoll_fd)?;
         let spec = handle.with_entry(|entry| entry.fork_carry_spec());
         drop(files);
-        Some(alloc::format!("{}|{spec}", u8::from(self.raw_fd_is_cloexec(raw_fd))))
+        Some(alloc::format!(
+            "{}|{spec}",
+            u8::from(self.raw_fd_is_cloexec(raw_fd))
+        ))
     }
 
     /// Rebuilds, at exactly `target_fd`, an epoll set a cross-process fork parent carried (see
@@ -11792,9 +11851,7 @@ mod tests {
         let fp = FsPath::new(
             litebox_common_linux::AT_FDCWD,
             "/usr/bin",
-            || {
-                panic!("get_cwd should not be called for absolute paths")
-            },
+            || panic!("get_cwd should not be called for absolute paths"),
             "/",
         )
         .unwrap();
@@ -11816,9 +11873,7 @@ mod tests {
         let fp = FsPath::new(
             litebox_common_linux::AT_FDCWD,
             "",
-            || {
-                panic!("get_cwd should not be called for empty Cwd path")
-            },
+            || panic!("get_cwd should not be called for empty Cwd path"),
             "/",
         )
         .unwrap();

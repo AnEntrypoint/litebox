@@ -291,8 +291,15 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // below panics with `PathError::MissingComponent` (confirmed live: first attempt at this
         // fix, before adding this `mkdir("/dev", ...)`, crashed exactly this way). Mode 0755
         // root-owned matches real Linux's own `/dev`.
-        fs.mkdir("/dev", litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::XGRP | litebox::fs::Mode::ROTH | litebox::fs::Mode::XOTH)
-            .unwrap();
+        fs.mkdir(
+            "/dev",
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
+        )
+        .unwrap();
         fs.mkdir(
             "/dev/shm",
             litebox::fs::Mode::RWXU
@@ -348,7 +355,11 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
         // above.
         fs.mkdir(
             "/etc",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RGRP | litebox::fs::Mode::XGRP | litebox::fs::Mode::ROTH | litebox::fs::Mode::XOTH,
+            litebox::fs::Mode::RWXU
+                | litebox::fs::Mode::RGRP
+                | litebox::fs::Mode::XGRP
+                | litebox::fs::Mode::ROTH
+                | litebox::fs::Mode::XOTH,
         )
         .unwrap();
         let resolv_conf = fs
@@ -932,16 +943,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             } => {
                 register_layer_sources(&layers);
                 match read_merged_rootfs_index_cache(&resolved_layers_json) {
-                Some(entries) => {
-                    shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, layers, entries)
-                }
-                None => {
-                    let (fs, freshly_built) = shim_builder.default_fs_multi_layer(in_mem, layers);
-                    if let Some(entries) = &freshly_built {
-                        write_merged_rootfs_index_cache(&resolved_layers_json, entries);
+                    Some(entries) => shim_builder
+                        .default_fs_multi_layer_with_cached_merge(in_mem, layers, entries),
+                    None => {
+                        let (fs, freshly_built) =
+                            shim_builder.default_fs_multi_layer(in_mem, layers);
+                        if let Some(entries) = &freshly_built {
+                            write_merged_rootfs_index_cache(&resolved_layers_json, entries);
+                        }
+                        fs
                     }
-                    fs
-                }
                 }
             }
         }
@@ -1051,8 +1062,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // unless `-e` was passed, which is why in-guest `python3` reported an empty `sys.executable`
     // (its argv[0] PATH search had no `PATH` to search) and `HOME`/`TERM` were unset.
     let mut env_pairs: Vec<(String, String)> = Vec::new();
-    #[allow(clippy::items_after_statements, reason = "kept next to its only caller")]
-    fn extend_env(env_pairs: &mut Vec<(String, String)>, entries: impl IntoIterator<Item = String>) {
+    #[allow(
+        clippy::items_after_statements,
+        reason = "kept next to its only caller"
+    )]
+    fn extend_env(
+        env_pairs: &mut Vec<(String, String)>,
+        entries: impl IntoIterator<Item = String>,
+    ) {
         for entry in entries {
             let Some((name, value)) = entry.split_once('=') else {
                 continue;
@@ -1071,35 +1088,39 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         cli_args.environment_variables.iter().cloned(),
     );
     if cli_args.forward_environment_variables {
-        extend_env(&mut env_pairs, std::env::vars().map(|(k, v)| {
-            // Windows' own env var names are case-insensitive but reported with whatever
-            // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
-            // env var lookups (including the guest's own PATH-based executable search) are
-            // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
-            // different, useless variable while the `PATH` Linux tools actually look up is
-            // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
-            // installed binary (e.g. after `npm install`) despite the install itself
-            // succeeding, because the guest's `execve`/shell PATH search had nothing to
-            // search. Normalize this one, specific, known-mismatched name rather than
-            // case-folding every forwarded variable, which could needlessly collide two
-            // differently-cased Windows variables that mean different things on Linux.
-            //
-            // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
-            // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
-            // meaningless to the guest -- without this prefix, forwarding PATH at all is
-            // strictly worse than not forwarding it, since it shadows the guest's own
-            // otherwise-implicit default search locations with a value that matches nothing.
-            if k.eq_ignore_ascii_case("PATH") {
-                format!("PATH={LINUX_DEFAULT_PATH}:{v}")
-            } else {
-                format!("{k}={v}")
-            }
-        }));
+        extend_env(
+            &mut env_pairs,
+            std::env::vars().map(|(k, v)| {
+                // Windows' own env var names are case-insensitive but reported with whatever
+                // original casing was set -- notably `Path` (mixed case), never `PATH`. Linux
+                // env var lookups (including the guest's own PATH-based executable search) are
+                // case-SENSITIVE, so forwarding `Path` verbatim reaches the guest as a completely
+                // different, useless variable while the `PATH` Linux tools actually look up is
+                // never set at all -- confirmed live: `sh: <cmd>: not found` for any locally-
+                // installed binary (e.g. after `npm install`) despite the install itself
+                // succeeding, because the guest's `execve`/shell PATH search had nothing to
+                // search. Normalize this one, specific, known-mismatched name rather than
+                // case-folding every forwarded variable, which could needlessly collide two
+                // differently-cased Windows variables that mean different things on Linux.
+                //
+                // Also prepend the standard Linux search path (see `LINUX_DEFAULT_PATH` above):
+                // the forwarded value is the HOST's Windows `Path`, whose `C:\...` entries are
+                // meaningless to the guest -- without this prefix, forwarding PATH at all is
+                // strictly worse than not forwarding it, since it shadows the guest's own
+                // otherwise-implicit default search locations with a value that matches nothing.
+                if k.eq_ignore_ascii_case("PATH") {
+                    format!("PATH={LINUX_DEFAULT_PATH}:{v}")
+                } else {
+                    format!("{k}={v}")
+                }
+            }),
+        );
     }
     let envp: Vec<_> = env_pairs
         .into_iter()
         .filter_map(|(k, v)| {
-            std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>()).ok()
+            std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
+                .ok()
         })
         .collect();
 
@@ -1267,19 +1288,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // '<unknown>' has overflowed its stack" with zero indication of the real cause).
                 // Print the real error and exit cleanly instead of unwinding through whatever
                 // is fragile on this thread.
-                let program = match shim.load_program(
-                    initial_file_system,
-                    init_task,
-                    &prog_path,
-                    argv,
-                    envp,
-                ) {
-                    Ok(program) => program,
-                    Err(e) => {
-                        eprintln!("failed to load program {prog_path:?}: {e:?}");
-                        litebox_platform_windows_userland::exit_process_quiesced(1);
-                    }
-                };
+                let program =
+                    match shim.load_program(initial_file_system, init_task, &prog_path, argv, envp)
+                    {
+                        Ok(program) => program,
+                        Err(e) => {
+                            eprintln!("failed to load program {prog_path:?}: {e:?}");
+                            litebox_platform_windows_userland::exit_process_quiesced(1);
+                        }
+                    };
                 unsafe {
                     litebox_platform_windows_userland::run_thread(
                         program.entrypoints,
@@ -1490,7 +1507,9 @@ fn diag_process_fork_globalstate_probe_inner() {
 
     let platform = Platform::new();
     diag_elapsed!("Platform::new() returned");
-    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child after Platform::new");
+    litebox_platform_windows_userland::diag_private_memory_breakdown(
+        "fork-child after Platform::new",
+    );
     // Lazy (reserve-then-commit-on-first-fault) fork memory population -- see
     // `litebox_platform_windows_userland::lazy_fork_commit`'s own module doc comment for the full
     // design. MUST run AFTER `Platform::new()` (this line), never before: `Platform::new()`
@@ -1606,7 +1625,9 @@ fn diag_process_fork_globalstate_probe_inner() {
         None => shim_builder.default_fs_multi_layer(in_mem, tar_layers).0,
     };
     diag_elapsed!("default_fs_multi_layer returned (rootfs indexed/merged)");
-    litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child after rootfs index");
+    litebox_platform_windows_userland::diag_private_memory_breakdown(
+        "fork-child after rootfs index",
+    );
     let fs = std::sync::Arc::new(fs);
 
     // This child is itself a fork parent for any child IT goes on to spawn, and it never reaches
@@ -1949,16 +1970,15 @@ fn diag_process_fork_task_resume_probe(
         .and_then(|s| pf::hex_decode(&s))
         .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
         .unwrap_or([0; 16]);
-    let entrypoints =
-        shim.adopt_forked_process(
-            fs,
-            task_params,
-            page_manager,
-            comm,
-            sigreturn_trampoline,
-            identity.map(|id| id.pgid),
-            identity.map(|id| (id.pid_ns as u32, id.ns_pid, id.ns_tid)),
-        );
+    let entrypoints = shim.adopt_forked_process(
+        fs,
+        task_params,
+        page_manager,
+        comm,
+        sigreturn_trampoline,
+        identity.map(|id| id.pgid),
+        identity.map(|id| (id.pid_ns as u32, id.ns_pid, id.ns_tid)),
+    );
 
     // Reopen the regular-file fds the parent held.
     //
@@ -2117,7 +2137,11 @@ fn diag_process_fork_task_resume_probe(
             };
             eprintln!(
                 "[process_fork_diag] task-resume-probe (child): guest fd {fd} rebuilt over inherited Windows pipe handle {handle:#x} (child {})",
-                if dir.child_writes() { "writes" } else { "reads" }
+                if dir.child_writes() {
+                    "writes"
+                } else {
+                    "reads"
+                }
             );
             let pump_shim = shim.clone();
             let pump_done = if dir.child_writes() {
@@ -2358,7 +2382,9 @@ fn diag_process_fork_task_resume_probe(
         ctx.rsp
     );
     litebox_platform_windows_userland::diag_private_memory_breakdown("fork-child pre-guest");
-    diag_elapsed!("fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification");
+    diag_elapsed!(
+        "fd/pipe rebuild + net_worker spawn done, about to call run_thread_with_fork_verification"
+    );
     // Arm the SAME post-fork stale-pointer verification the real, working thread-based fork path
     // arms via `Task::init`'s `ThreadInitState::ForkedChild` branch (`begin_fork_child_
     // verification`, litebox_shim_linux/src/syscalls/process.rs) -- this cross-process child never
@@ -2624,7 +2650,11 @@ fn read_merged_rootfs_index_cache(
     let result = litebox::fs::tar_ro::is_flat_index(flat).then_some(flat);
     if diag {
         match &result {
-            Some(flat) => eprintln!("[diag-mergedidx] HIT {} ({} bytes)", path.display(), flat.len()),
+            Some(flat) => eprintln!(
+                "[diag-mergedidx] HIT {} ({} bytes)",
+                path.display(),
+                flat.len()
+            ),
             None => eprintln!("[diag-mergedidx] MISS {}: not a flat index", path.display()),
         }
     }
@@ -2642,10 +2672,7 @@ fn read_merged_rootfs_index_cache(
 /// populate the SAME cache entry (they all compute the identical bytes, by construction), and a
 /// reader must never observe a torn/partial file mid-write -- same atomicity discipline
 /// `litebox_packager::oci::cache::write_cached_layer_inner` already uses one stage earlier.
-fn write_merged_rootfs_index_cache(
-    resolved_layers_json: &str,
-    flat_index: &[u8],
-) {
+fn write_merged_rootfs_index_cache(resolved_layers_json: &str, flat_index: &[u8]) {
     let cache_key = merged_rootfs_index_cache_key(resolved_layers_json);
     let final_path = merged_rootfs_index_cache_path(&cache_key);
     let Some(dir) = final_path.parent() else {
@@ -2834,7 +2861,10 @@ fn merge_pieces(
         return if contents.len() == adopted_len {
             Vec::new()
         } else {
-            vec![(MergeKind::Append { base: adopted_len }, adopted_len..contents.len())]
+            vec![(
+                MergeKind::Append { base: adopted_len },
+                adopted_len..contents.len(),
+            )]
         };
     }
 
@@ -2845,7 +2875,10 @@ fn merge_pieces(
         if blocks.get(i) == Some(&payload_hash(chunk)) {
             if let Some(start) = run_start.take() {
                 pieces.push((
-                    MergeKind::Range { offset: start, final_len: contents.len() },
+                    MergeKind::Range {
+                        offset: start,
+                        final_len: contents.len(),
+                    },
                     start..run_end,
                 ));
             }
@@ -2858,7 +2891,10 @@ fn merge_pieces(
     }
     if let Some(start) = run_start.take() {
         pieces.push((
-            MergeKind::Range { offset: start, final_len: contents.len() },
+            MergeKind::Range {
+                offset: start,
+                final_len: contents.len(),
+            },
             start..run_end,
         ));
     }
@@ -2871,7 +2907,10 @@ fn merge_pieces(
 }
 
 fn whiteout_tar_path(path: &str) -> Option<String> {
-    let (directory, name) = path.trim_start_matches('/').rsplit_once('/').unwrap_or(("", path.trim_start_matches('/')));
+    let (directory, name) = path
+        .trim_start_matches('/')
+        .rsplit_once('/')
+        .unwrap_or(("", path.trim_start_matches('/')));
     (!name.is_empty()).then(|| {
         if directory.is_empty() {
             format!(".wh.{name}")
@@ -3013,10 +3052,18 @@ where
     }
     // `present` is built from the UNFILTERED walk: an entry withheld by `only_changed` is
     // unchanged, not deleted, and emitting a whiteout for it would delete it from the reader.
-    let present: std::collections::HashSet<&str> =
-        all_entries.iter().map(|entry| entry.path.as_str()).collect();
-    let adopted = ADOPTED_PATHS.lock().map(|paths| paths.clone()).unwrap_or_default();
-    for path in adopted.iter().filter(|path| !present.contains(path.as_str())) {
+    let present: std::collections::HashSet<&str> = all_entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    let adopted = ADOPTED_PATHS
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default();
+    for path in adopted
+        .iter()
+        .filter(|path| !present.contains(path.as_str()))
+    {
         let Some(whiteout) = whiteout_tar_path(path) else {
             continue;
         };
@@ -3061,7 +3108,11 @@ fn import_writable_layer(
             .map_err(|e| anyhow!("invalid entry path in {}: {e}", resume_from.display()))?
             .to_string_lossy()
             .into_owned();
-        if header_path.rsplit('/').next().is_some_and(|name| name.starts_with(".wh.")) {
+        if header_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with(".wh."))
+        {
             continue;
         }
         let path = alloc::format!("/{header_path}");

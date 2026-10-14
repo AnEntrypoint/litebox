@@ -388,15 +388,15 @@ impl GatewayState {
         self.diag_gateway_state();
     }
 
-/// The gateway's own table occupancy, every 256th `drive()`.
-///
-/// A published port that stops serving while the guest's own loopback connect to it still
-/// answers has to be gateway-side bookkeeping (a flow never reaped, a claim never released, a
-/// socket never removed), which no guest-side per-port diagnostic can see.
-/// `claimed_ports` climbing across ticks is the one that eventually fails every new host
-/// connection. `flow_states` is the answer to "did the guest ever answer the SYN": an inbound
-/// flow parked in `SynSent` is a guest that never sent SA back, which looks exactly like a
-/// dead port from the host side and is invisible to every guest-side per-port diagnostic.
+    /// The gateway's own table occupancy, every 256th `drive()`.
+    ///
+    /// A published port that stops serving while the guest's own loopback connect to it still
+    /// answers has to be gateway-side bookkeeping (a flow never reaped, a claim never released, a
+    /// socket never removed), which no guest-side per-port diagnostic can see.
+    /// `claimed_ports` climbing across ticks is the one that eventually fails every new host
+    /// connection. `flow_states` is the answer to "did the guest ever answer the SYN": an inbound
+    /// flow parked in `SynSent` is a guest that never sent SA back, which looks exactly like a
+    /// dead port from the host side and is invisible to every guest-side per-port diagnostic.
     fn diag_gateway_state(&self) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEEN: AtomicU32 = AtomicU32::new(0);

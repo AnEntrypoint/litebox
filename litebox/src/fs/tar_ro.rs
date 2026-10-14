@@ -70,8 +70,7 @@ impl TarRo {
         inode_allocator: InodeAllocator,
     ) -> Self {
         Self {
-            tar_index: TreeIndex::from_layers(layers)
-                .flatten(&inode_allocator),
+            tar_index: TreeIndex::from_layers(layers).flatten(&inode_allocator),
         }
     }
 
@@ -221,18 +220,15 @@ impl super::backend::Backend for TarRo {
             .children(handle.idx)
             .map(|(name, child)| {
                 let (file_type, node_info) = match child {
-                    IndexedChild::File(idx) => (
-                        FileType::RegularFile,
-                        self.tar_index.file(idx).node_info,
-                    ),
-                    IndexedChild::Dir(idx) => (
-                        FileType::Directory,
-                        self.tar_index.dir(idx).node_info,
-                    ),
-                    IndexedChild::Symlink(idx) => (
-                        FileType::Symlink,
-                        self.tar_index.symlink(idx).1,
-                    ),
+                    IndexedChild::File(idx) => {
+                        (FileType::RegularFile, self.tar_index.file(idx).node_info)
+                    }
+                    IndexedChild::Dir(idx) => {
+                        (FileType::Directory, self.tar_index.dir(idx).node_info)
+                    }
+                    IndexedChild::Symlink(idx) => {
+                        (FileType::Symlink, self.tar_index.symlink(idx).1)
+                    }
                 };
                 DirEntry {
                     name: String::from(name),
@@ -534,7 +530,11 @@ impl FlatHeader {
         (parsed.dir_count != 0
             && fits(parsed.files_off, parsed.file_count, FILE_RECORD_LEN)
             && fits(parsed.dirs_off, parsed.dir_count, DIR_RECORD_LEN)
-            && fits(parsed.symlinks_off, parsed.symlink_count, SYMLINK_RECORD_LEN)
+            && fits(
+                parsed.symlinks_off,
+                parsed.symlink_count,
+                SYMLINK_RECORD_LEN,
+            )
             && fits(parsed.children_off, child_count, CHILD_RECORD_LEN)
             && parsed.strings_off <= flat.len())
         .then_some(parsed)
@@ -636,7 +636,8 @@ impl TarIndex {
                 user: self.u16_at(at),
                 group: self.u16_at(at + 2),
             }),
-            mode: (flags & DIR_HAS_MODE != 0).then(|| Mode::from_bits_truncate(self.u32_at(at + 8))),
+            mode: (flags & DIR_HAS_MODE != 0)
+                .then(|| Mode::from_bits_truncate(self.u32_at(at + 8))),
             mtime: self.u64_at(at + 24) as i64,
             node_info: self.node_info(idx),
         }
@@ -715,8 +716,11 @@ impl TreeIndex {
             (offset, text.len() as u32)
         };
         for dir in &dirs {
-            let mut names: Vec<(&String, IndexedChild)> =
-                dir.children.iter().map(|(name, child)| (name, *child)).collect();
+            let mut names: Vec<(&String, IndexedChild)> = dir
+                .children
+                .iter()
+                .map(|(name, child)| (name, *child))
+                .collect();
             names.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             let first = child_total;
             for (name, child) in &names {
@@ -757,7 +761,8 @@ impl TreeIndex {
             dir_records.extend_from_slice(&owner.user.to_le_bytes());
             dir_records.extend_from_slice(&owner.group.to_le_bytes());
             dir_records.extend_from_slice(&flags.to_le_bytes());
-            dir_records.extend_from_slice(&dir.mode.unwrap_or(DEFAULT_DIR_MODE).bits().to_le_bytes());
+            dir_records
+                .extend_from_slice(&dir.mode.unwrap_or(DEFAULT_DIR_MODE).bits().to_le_bytes());
             dir_records.extend_from_slice(&0u32.to_le_bytes());
             dir_records.extend_from_slice(&first.to_le_bytes());
             dir_records.extend_from_slice(&(names.len() as u32).to_le_bytes());
@@ -1045,9 +1050,7 @@ impl TreeIndex {
     /// is the base layer; each subsequent layer's whiteout/opaque-whiteout entries remove
     /// entries contributed by any strictly-earlier layer (never a later one, since layers are
     /// folded in order) before that layer's own real files/symlinks are added.
-    fn from_layers(
-        layers: Vec<alloc::borrow::Cow<'static, [u8]>>,
-    ) -> Self {
+    fn from_layers(layers: Vec<alloc::borrow::Cow<'static, [u8]>>) -> Self {
         let mut files = Vec::new();
         let mut symlinks = Vec::new();
         let mut raw_entries: Vec<RawEntry> = Vec::new();
@@ -1133,12 +1136,7 @@ impl TreeIndex {
                 RawLiveEntry::Dir(owner, mtime, mode) => {
                     let mut probe = path.clone();
                     probe.push_str("/x");
-                    ensure_ancestors(
-                        &mut dirs,
-                        &mut dirs_by_path,
-                        &probe,
-                        owner,
-                    );
+                    ensure_ancestors(&mut dirs, &mut dirs_by_path, &probe, owner);
                     if let Some(&idx) = dirs_by_path.get(path.as_str()) {
                         dirs[idx].owner = Some(owner);
                         dirs[idx].mtime = mtime;
@@ -1147,24 +1145,16 @@ impl TreeIndex {
                 }
                 RawLiveEntry::File(file_idx) => {
                     let owner = files[file_idx].owner;
-                    let (parent_dir_idx, name) = ensure_ancestors(
-                        &mut dirs,
-                        &mut dirs_by_path,
-                        &path,
-                        owner,
-                    );
+                    let (parent_dir_idx, name) =
+                        ensure_ancestors(&mut dirs, &mut dirs_by_path, &path, owner);
                     dirs[parent_dir_idx]
                         .children
                         .insert(name, IndexedChild::File(file_idx));
                 }
                 RawLiveEntry::Symlink(symlink_idx) => {
                     let owner = symlinks[symlink_idx].owner;
-                    let (parent_dir_idx, name) = ensure_ancestors(
-                        &mut dirs,
-                        &mut dirs_by_path,
-                        &path,
-                        owner,
-                    );
+                    let (parent_dir_idx, name) =
+                        ensure_ancestors(&mut dirs, &mut dirs_by_path, &path, owner);
                     dirs[parent_dir_idx]
                         .children
                         .insert(name, IndexedChild::Symlink(symlink_idx));
@@ -1305,7 +1295,7 @@ fn ensure_ancestors(
                 owner: Some(owner),
                 mtime: 0,
                 mode: None,
-                    children: HashMap::new(),
+                children: HashMap::new(),
             });
             dirs.len() - 1
         });

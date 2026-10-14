@@ -74,8 +74,10 @@ fn diag_claim(addr: usize, expected: u32, bitset: u32) -> Option<usize> {
         {
             let packed = (u64::from(expected) << 32) | u64::from(bitset);
             info_slot.store(packed, Ordering::Release);
-            DIAG_PARK_WAKES[slot]
-                .store(DIAG_WAKES[diag_bucket(addr)].load(Ordering::Relaxed), Ordering::Relaxed);
+            DIAG_PARK_WAKES[slot].store(
+                DIAG_WAKES[diag_bucket(addr)].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             return Some(slot);
         }
     }
@@ -227,7 +229,10 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // never delivered (a lost wakeup), and the log says so.
         let mut slices: u32 = 0;
         let waited = loop {
-            match cx.with_timeout(FUTEX_WORD_CHECK_SLICE).wait_until(&mut ready) {
+            match cx
+                .with_timeout(FUTEX_WORD_CHECK_SLICE)
+                .wait_until(&mut ready)
+            {
                 Err(WaitError::TimedOut)
                     if !(cx.deadline().is_some() && cx.remaining_timeout().is_none()) =>
                 {

@@ -4752,11 +4752,12 @@ fn copy_one_group_with_shared(
                 // the parent) sees them: a "private" mapping that is not private. The child's own
                 // `mprotect(PROT_WRITE)` succeeds either way, so nothing but the bytes tells the
                 // two apart -- hence `cb70.sh`.
-                let protections: &[u32] = if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
-                    &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
-                } else {
-                    &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
-                };
+                let protections: &[u32] =
+                    if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
+                        &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
+                    } else {
+                        &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
+                    };
                 let mut view = 0usize;
                 let mut granted = 0u32;
                 for protection in protections {
@@ -5731,7 +5732,8 @@ pub fn run_external_fault_watchdog_child() -> ! {
     //
     // `LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM=1` forces this path so the degradation is
     // measured rather than assumed.
-    let unobservable_arm = std::env::var_os("LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM").is_some();
+    let unobservable_arm =
+        std::env::var_os("LITEBOX_DIAG_FAULT_WATCHDOG_UNOBSERVABLE_ARM").is_some();
     let armed_name = fault_armed_event_name(target_pid);
     let armed_event = if unobservable_arm {
         core::ptr::null_mut()
@@ -5755,9 +5757,9 @@ pub fn run_external_fault_watchdog_child() -> ! {
     }
     loop {
         std::thread::sleep(POLL_INTERVAL);
-        let arm_signalled = unsafe {
-            windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0)
-        } == 0;
+        let arm_signalled =
+            unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0) }
+                == 0;
         if !arm_signalled {
             let mut code: u32 = STILL_ACTIVE;
             if unsafe { GetExitCodeProcess(handle, &raw mut code) } == 0 || code != STILL_ACTIVE {

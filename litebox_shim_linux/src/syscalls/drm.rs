@@ -33,7 +33,7 @@
 //!   which is read via `pop_flip_event_bytes()` on the DRM device file descriptor.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use litebox::event::Events;
 use litebox::event::polling::Pollee;
@@ -563,9 +563,9 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             core::ptr::addr_of_mut!((*ptr.as_ptr()).crtc_fb).write(AtomicU32::new(0));
             core::ptr::addr_of_mut!((*ptr.as_ptr()).crtc_mode_set).write(AtomicBool::new(false));
             core::ptr::addr_of_mut!((*ptr.as_ptr()).plane_fb).write(AtomicU32::new(0));
-            core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_events).write(core::array::from_fn(|_| {
-                core::array::from_fn(|_| AtomicU8::new(0))
-            }));
+            core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_events).write(core::array::from_fn(
+                |_| core::array::from_fn(|_| AtomicU8::new(0)),
+            ));
             core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_head).write(AtomicU32::new(0));
             core::ptr::addr_of_mut!((*ptr.as_ptr()).flip_count).write(AtomicU32::new(0));
             core::ptr::addr_of_mut!((*ptr.as_ptr()).next_vblank_sequence).write(AtomicU32::new(0));
@@ -678,8 +678,9 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             return Some(i);
         }
         self.reclaim_dead(platform);
-        let i = (0..SHARED_DRM_FRAMEBUFFERS)
-            .find(|i| self.region.framebuffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE)?;
+        let i = (0..SHARED_DRM_FRAMEBUFFERS).find(|i| {
+            self.region.framebuffers[*i].state.load(Ordering::Acquire) == DRM_SLOT_FREE
+        })?;
         Some(i)
     }
 
@@ -713,9 +714,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         let idx = if count == SHARED_DRM_FLIP_EVENTS {
             // Full: overwrite the oldest in place and advance the head past it.
             let idx = head;
-            self.region
-                .flip_head
-                .store(((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32, Ordering::Release);
+            self.region.flip_head.store(
+                ((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32,
+                Ordering::Release,
+            );
             idx
         } else {
             let idx = (head + count) % SHARED_DRM_FLIP_EVENTS;
@@ -741,9 +743,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         for (i, byte) in out.iter_mut().enumerate() {
             *byte = self.region.flip_events[head][i].load(Ordering::Acquire);
         }
-        self.region
-            .flip_head
-            .store(((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32, Ordering::Release);
+        self.region.flip_head.store(
+            ((head + 1) % SHARED_DRM_FLIP_EVENTS) as u32,
+            Ordering::Release,
+        );
         self.region
             .flip_count
             .store((count - 1) as u32, Ordering::Release);
@@ -1012,9 +1015,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         );
         let attached_fb = {
             let _guard = self.region.guard.lock();
-            self.region
-                .crtc_fb
-                .store(if req.fb_id == 0 { 0 } else { req.fb_id }, Ordering::Release);
+            self.region.crtc_fb.store(
+                if req.fb_id == 0 { 0 } else { req.fb_id },
+                Ordering::Release,
+            );
             // Track mode-configured state independent of `fb_id` -- see
             // [`SharedDrmRegion::crtc_mode_set`]'s own doc comment for why conflating the two
             // previously misreported `GETCRTC` during a legitimate empty-buffer modeset
@@ -1061,7 +1065,12 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// registered a single callback would otherwise see every `diag-drm-*` line below silently
     /// vanish, indistinguishable from "no presents happened" (see this fn's own fix history for
     /// the LYING INSTRUMENTS writeup this corrects).
-    fn notify_flip_callback(&self, platform: &Platform, local: &DrmFlipLocal<Platform>, fb_id: u32) {
+    fn notify_flip_callback(
+        &self,
+        platform: &Platform,
+        local: &DrmFlipLocal<Platform>,
+        fb_id: u32,
+    ) {
         // Unconditional: see this field's own doc comment for why this must not be gated behind
         // `callback_count == 0` the way the rest of this function is.
         self.region.frame_seq.fetch_add(1, Ordering::Release);
@@ -1726,7 +1735,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             .create_shared_memory(page_aligned_size)
             .map_err(|_| Errno::ENOMEM)?;
         let _guard = self.region.guard.lock();
-        let handle = self.region.next_buffer_handle.fetch_add(1, Ordering::Relaxed);
+        let handle = self
+            .region
+            .next_buffer_handle
+            .fetch_add(1, Ordering::Relaxed);
         let owner = platform.current_host_pid();
         // Table full (after dead-owner reclaim): real DRM answers a GEM object it cannot allocate
         // with ENOMEM, and so does this. Never a panic.
@@ -1865,7 +1877,8 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         slot.fb_id.store(fb_id, Ordering::Release);
         slot.width.store(req.width, Ordering::Release);
         slot.height.store(req.height, Ordering::Release);
-        slot.pixel_format.store(DRM_FORMAT_XRGB8888, Ordering::Release);
+        slot.pixel_format
+            .store(DRM_FORMAT_XRGB8888, Ordering::Release);
         slot.handle.store(handle, Ordering::Release);
         slot.owner_host.store(owner, Ordering::Release);
         slot.state.store(DRM_SLOT_USED, Ordering::Release);

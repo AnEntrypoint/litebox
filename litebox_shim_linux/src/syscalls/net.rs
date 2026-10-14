@@ -187,7 +187,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         own_cred: litebox_common_linux::Ucred,
         child_pid: i32,
         for_spawn: bool,
-    ) -> Result<(alloc::string::String, Option<crate::syscalls::unix::UnixCarryHold>), &'static str> {
+    ) -> Result<
+        (
+            alloc::string::String,
+            Option<crate::syscalls::unix::UnixCarryHold>,
+        ),
+        &'static str,
+    > {
         let raw_fd = u32::try_from(raw_fd).map_err(|_| "fd out of range")?;
         self.with_socket_netlink(
             global,
@@ -244,7 +250,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         .ok()
         .flatten()
     }
-
 }
 
 /// Linux's `struct sockaddr_nl` (verified against the real kernel
@@ -742,13 +747,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                     // A `TCP_*` option on a non-TCP socket is an ordinary errno, never a panic:
                     // `setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, ..)` on a UDP socket reaches
                     // this with `NotTcpSocket`, which is Linux's `ENOPROTOOPT` (92).
-                    self.net_lock()
-                        .set_tcp_option(
-                            fd,
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_secs(u64::from(val)),
-                            )),
-                        )?;
+                    self.net_lock().set_tcp_option(
+                        fd,
+                        litebox::net::TcpOptionData::KEEPALIVE(Some(
+                            core::time::Duration::from_secs(u64::from(val)),
+                        )),
+                    )?;
                 }
             },
         }
@@ -957,9 +961,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     ) -> Result<SocketFd<Platform>, TryOpError<Errno>> {
         self.net_lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
-            AcceptError::InvalidFd | AcceptError::NotListening | _ => {
-                TryOpError::Other(e.into())
-            }
+            AcceptError::InvalidFd | AcceptError::NotListening | _ => TryOpError::Other(e.into()),
         })
     }
 
@@ -1099,23 +1101,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         let is_empty_stream = buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::Stream(_));
 
         super::unix::wait_on_events_polling(
-                &cx.with_timeout(timeout),
-                is_nonblock,
-                Events::OUT,
-                |observer, filter| {
-                    proxy.register_observer(observer, filter);
-                    Ok(())
-                },
-                || match proxy.try_write(buf, new_flags, sockaddr) {
-                    Ok(0) if buf.is_empty() => Ok(0),
-                    Ok(0) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
-                    Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
-                    Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
-                },
-            )
-            .map_err(Errno::from)
+            &cx.with_timeout(timeout),
+            is_nonblock,
+            Events::OUT,
+            |observer, filter| {
+                proxy.register_observer(observer, filter);
+                Ok(())
+            },
+            || match proxy.try_write(buf, new_flags, sockaddr) {
+                Ok(0) if buf.is_empty() => Ok(0),
+                Ok(0) => Err(TryOpError::TryAgain),
+                Ok(n) => Ok(n),
+                Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
+                Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
+                Err(e) => Err(TryOpError::Other(Errno::from(e))),
+            },
+        )
+        .map_err(Errno::from)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1167,30 +1169,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
             NetworkProxy::Raw => false,
         };
         super::unix::wait_on_events_polling(
-                &cx.with_timeout(timeout),
-                is_nonblock,
-                Events::IN,
-                |observer, filter| {
-                    proxy.register_observer(observer, filter);
-                    Ok(())
-                },
-                || {
-                    if pulls_own_rx {
-                        self.net_lock().drain_rx_into_proxy(fd);
-                    }
-                    match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                        Ok(0) => Err(TryOpError::TryAgain),
-                        Ok(n) => Ok(n),
-                        Err(ChannelReadError::ReadShutdown) => Ok(0),
-                        Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
-                            Some(err) => Err(TryOpError::Other(err.into())),
-                            None => Ok(0),
-                        },
-                        Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
-                    }
-                },
-            )
-            .map_err(Errno::from)
+            &cx.with_timeout(timeout),
+            is_nonblock,
+            Events::IN,
+            |observer, filter| {
+                proxy.register_observer(observer, filter);
+                Ok(())
+            },
+            || {
+                if pulls_own_rx {
+                    self.net_lock().drain_rx_into_proxy(fd);
+                }
+                match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
+                    Ok(0) => Err(TryOpError::TryAgain),
+                    Ok(n) => Ok(n),
+                    Err(ChannelReadError::ReadShutdown) => Ok(0),
+                    Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
+                        Some(err) => Err(TryOpError::Other(err.into())),
+                        None => Ok(0),
+                    },
+                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                }
+            },
+        )
+        .map_err(Errno::from)
     }
 
     fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -1812,7 +1814,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .with_socket(
                 &self.global,
                 sockfd,
-                |fd| Ok(self.global.with_socket_options(fd, |options| options.is_v6)?),
+                |fd| {
+                    Ok(self
+                        .global
+                        .with_socket_options(fd, |options| options.is_v6)?)
+                },
                 |_| Ok(false),
             )
             .unwrap_or(false)
@@ -1877,7 +1883,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let proxy = self
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
-                if self.global.with_socket_options(fd, |options| options.is_v6)? {
+                if self
+                    .global
+                    .with_socket_options(fd, |options| options.is_v6)?
+                {
                     self.global
                         .with_socket_options_mut(&accepted_file, |options| options.is_v6 = true)?;
                 }
@@ -2174,8 +2183,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn resolve_scm_rights_fds(
         &self,
         control: &[u8],
-    ) -> Result<(AnyDupFds<Platform, FS>, alloc::vec::Vec<Option<alloc::string::String>>), Errno>
-    {
+    ) -> Result<
+        (
+            AnyDupFds<Platform, FS>,
+            alloc::vec::Vec<Option<alloc::string::String>>,
+        ),
+        Errno,
+    > {
         let mut fds = alloc::vec::Vec::new();
         let mut specs = alloc::vec::Vec::new();
         let mut offset = 0usize;
@@ -2858,7 +2872,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // itself after 15 s. Linux behaves this way for a reason: an ancillary
                     // failure is never a transport failure.
                     if let Some(spec) = carried_spec {
-                        litebox_util_log::warn!("recvmsg: rebuilding a carried SCM_RIGHTS fd failed errno={e:?} spec={spec}");
+                        litebox_util_log::warn!(
+                            "recvmsg: rebuilding a carried SCM_RIGHTS fd failed errno={e:?} spec={spec}"
+                        );
                         crate::syscalls::unix::UnixSocket::release_unadopted_carry(
                             &self.global,
                             &spec,
@@ -2921,7 +2937,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // leaving them open leaks one descriptor per truncated message, and for a carried
                 // unix socket it also keeps the sender's shared-connection hold counted (a hold
                 // only goes away when the fd is adopted or dropped), so the slot never frees.
-                let delivered = control_capacity.saturating_sub(size_of::<CmsgHdr>()) / size_of::<i32>();
+                let delivered =
+                    control_capacity.saturating_sub(size_of::<CmsgHdr>()) / size_of::<i32>();
                 for raw_fd in written_fds.iter().skip(delivered) {
                     if let Ok(fd) = i32::try_from(*raw_fd) {
                         let _ = self.sys_close(fd);

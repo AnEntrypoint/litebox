@@ -147,12 +147,18 @@ fn diag_loop(dir: &'static str, packet: &[u8], depth: usize) {
     // `String` written straight into the field list does not satisfy it.
     let src = alloc::format!(
         "{}.{}.{}.{}:{}",
-        packet[12], packet[13], packet[14], packet[15],
+        packet[12],
+        packet[13],
+        packet[14],
+        packet[15],
         u16::from_be_bytes([tcp[0], tcp[1]])
     );
     let dst = alloc::format!(
         "{}.{}.{}.{}:{}",
-        packet[16], packet[17], packet[18], packet[19],
+        packet[16],
+        packet[17],
+        packet[18],
+        packet[19],
         u16::from_be_bytes([tcp[2], tcp[3]])
     );
     litebox_util_log::debug!(

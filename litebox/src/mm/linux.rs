@@ -1307,9 +1307,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             SharedObjectKind::FileBacked => self
                 .platform
                 .create_file_backed_named_shared_memory(name, carry.size),
-            SharedObjectKind::Named => self
-                .platform
-                .create_named_shared_memory(name, carry.size),
+            SharedObjectKind::Named => self.platform.create_named_shared_memory(name, carry.size),
         };
         let Ok(handle) = opened else {
             litebox_util_log::warn!(
@@ -1815,8 +1813,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         AllocationError::OutOfMemory
                     }
                 })?;
-            let actual_permissions =
-                MemoryRegionPermissions::from_bits(permissions).unwrap() | vma.flags.write_qualifier();
+            let actual_permissions = MemoryRegionPermissions::from_bits(permissions).unwrap()
+                | vma.flags.write_qualifier();
             if actual_permissions != widest_permissions {
                 let mapped_range =
                     dest_ptr.as_usize()..(dest_ptr.as_usize() + suggested_range.len());
@@ -2508,12 +2506,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let mergeable = pieces.len() > 1
             && first_range.start <= span.start
             && pieces.iter().all(|(_, vma)| {
-                vma.shared_handle.is_none()
-                    && !vma.is_file_backed()
-                    && vma.flags == first_vma.flags
+                vma.shared_handle.is_none() && !vma.is_file_backed() && vma.flags == first_vma.flags
             })
-            && pieces.windows(2).all(|pair| pair[0].0.end == pair[1].0.start)
-            && pieces.last().is_some_and(|(range, _)| range.end >= span.end);
+            && pieces
+                .windows(2)
+                .all(|pair| pair[0].0.end == pair[1].0.start)
+            && pieces
+                .last()
+                .is_some_and(|(range, _)| range.end >= span.end);
         if mergeable {
             self.vmas.insert(span.start..span.end, first_vma);
         }
@@ -2856,8 +2856,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
             // `intersection` is page aligned.
             unsafe {
-                self.platform
-                    .update_permissions(intersection.clone(), permissions | vma.flags.write_qualifier())
+                self.platform.update_permissions(
+                    intersection.clone(),
+                    permissions | vma.flags.write_qualifier(),
+                )
             }
             .map_err(|e| {
                 // restore the original mapping

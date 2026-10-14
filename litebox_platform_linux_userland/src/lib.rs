@@ -2533,11 +2533,16 @@ impl litebox::platform::RawMutex for RawMutex {
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         // Diagnostic (LITEBOX_DIAG_LONGWAIT): record every long timed park on entry and exit, so a
         // stalled run shows whether its long sleeps are entered and whether they ever return.
-        if timeout >= Duration::from_secs(10) && std::env::var_os("LITEBOX_DIAG_LONGWAIT").is_some() {
+        if timeout >= Duration::from_secs(10) && std::env::var_os("LITEBOX_DIAG_LONGWAIT").is_some()
+        {
             std::eprintln!("[diag-longwait] enter timeout_ms={}", timeout.as_millis());
             let start = std::time::Instant::now();
             let r = self.block_or_maybe_timeout(val, Some(timeout));
-            std::eprintln!("[diag-longwait] exit elapsed_ms={} ok={}", start.elapsed().as_millis(), r.is_ok());
+            std::eprintln!(
+                "[diag-longwait] exit elapsed_ms={} ok={}",
+                start.elapsed().as_millis(),
+                r.is_ok()
+            );
             return r;
         }
         self.block_or_maybe_timeout(val, Some(timeout))
@@ -3656,13 +3661,15 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         let interval = std::time::Duration::from_millis(interval_ms.max(1));
         let built = std::thread::Builder::new()
             .name("lbx-diag-ticker".into())
-            .spawn(move || loop {
-                std::thread::sleep(interval);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                tick(now);
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    tick(now);
+                }
             });
         drop(built);
     }

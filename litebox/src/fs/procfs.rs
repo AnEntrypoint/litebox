@@ -287,21 +287,25 @@ nodev	devpts
 /// honestly zero (litebox does not schedule guest threads); the `cpuN` count is the real payload
 /// `nproc` and GLib read. See gm mutable `mut-1789043865374`.
 fn format_stat_global(cpu_count: usize, boot_unix_secs: u64) -> Vec<u8> {
-    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0
-");
+    let mut out = String::from(
+        "cpu  0 0 0 0 0 0 0 0 0 0
+",
+    );
     for cpu in 0..cpu_count {
         out.push_str(&format!(
             "cpu{cpu} 0 0 0 0 0 0 0 0 0 0
 "
         ));
     }
-    out.push_str(&format!("intr 0
+    out.push_str(&format!(
+        "intr 0
 ctxt 0
 btime {boot_unix_secs}
 processes 0
 procs_running 1
 procs_blocked 0
-"));
+"
+    ));
     out.into_bytes()
 }
 
@@ -840,9 +844,8 @@ where
                     // `/proc/<pid>/task/<tid>/status` for tids only the owning process can list.
                     let known = parse_pid_component(component)
                         .is_some_and(|tid| self.task_ids(pid).contains(&tid))
-                        || parse_pid_component(component).is_some_and(|tid| {
-                            tid > 0 && pid_lenient(pid)
-                        });
+                        || parse_pid_component(component)
+                            .is_some_and(|tid| tid > 0 && pid_lenient(pid));
                     if !known {
                         return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
                     }
@@ -936,8 +939,7 @@ where
                 // The id-map control files are the caller's own credentials, so they exist under
                 // `/proc/<pid>` only for the caller's own pid -- see `ProcPidEntry::UidMap`.
                 if let Some(id_map) = entry.as_id_map_file() {
-                    if !crate::fs::ident::id_map_linux_semantics()
-                        || self.caller_pid() != Some(pid)
+                    if !crate::fs::ident::id_map_linux_semantics() || self.caller_pid() != Some(pid)
                     {
                         return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
                     }
@@ -969,7 +971,7 @@ where
                     // ENOENT rather than panicking is the safer shape for a branch that cannot be
                     // reached: a guest-visible path must never abort the host process.
                     ProcPidEntry::UidMap | ProcPidEntry::GidMap | ProcPidEntry::Setgroups => {
-                        return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+                        return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
                     }
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)

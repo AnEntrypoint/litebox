@@ -498,7 +498,9 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
             }
         }
         for (h, c) in self.slave_hosts.iter().zip(&self.slave_counts) {
-            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 h.store(host, Ordering::Release);
                 return;
             }
@@ -543,7 +545,9 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
             }
         }
         for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
-            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if c.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 h.store(host, Ordering::Release);
                 return;
             }
@@ -1719,7 +1723,10 @@ impl<Platform: ShimPlatform, FS: crate::ShimFS> Task<Platform, FS> {
             let slave = global.pts_open(id)?;
             let scratch_fd = {
                 let files = self.files.borrow();
-                files.raw_descriptor_store.write().fd_into_raw_integer(slave)
+                files
+                    .raw_descriptor_store
+                    .write()
+                    .fd_into_raw_integer(slave)
             };
             return self.install_pty_stdio(scratch_fd, id);
         }

@@ -2000,8 +2000,12 @@ fn heal_xmm_store_lanes(
         return false;
     }
     let lane_count = match instruction.mnemonic() {
-        Mnemonic::Movups | Mnemonic::Movaps | Mnemonic::Movdqu | Mnemonic::Movdqa
-        | Mnemonic::Movupd | Mnemonic::Movapd => 2,
+        Mnemonic::Movups
+        | Mnemonic::Movaps
+        | Mnemonic::Movdqu
+        | Mnemonic::Movdqa
+        | Mnemonic::Movupd
+        | Mnemonic::Movapd => 2,
         Mnemonic::Movq => 1,
         _ => return false,
     };
@@ -3139,10 +3143,9 @@ pub(crate) fn end() {
     }
 }
 
-
 #[cfg(test)]
 mod xmm_store_heal_tests {
-    use super::{heal_xmm_store_lanes, CONTEXT, CONTEXT_FLOATING_POINT_AMD64};
+    use super::{CONTEXT, CONTEXT_FLOATING_POINT_AMD64, heal_xmm_store_lanes};
     use iced_x86::{Decoder, DecoderOptions, Instruction};
 
     const PARENT: usize = 0x1a03_639a_6a0;
@@ -3186,7 +3189,11 @@ mod xmm_store_heal_tests {
         let instruction = decode(&[0x0f, 0x11, 0x06]);
         let mut context = context_with_xmm0(PARENT, PARENT);
 
-        assert!(heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert!(heal_xmm_store_lanes(
+            &instruction,
+            &mut context,
+            translate_parent_to_child
+        ));
         assert_eq!(xmm0(&context), [CHILD, CHILD]);
     }
 
@@ -3197,7 +3204,11 @@ mod xmm_store_heal_tests {
         let instruction = decode(&[0x66, 0x0f, 0xd6, 0x06]);
         let mut context = context_with_xmm0(PARENT, PARENT);
 
-        assert!(heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert!(heal_xmm_store_lanes(
+            &instruction,
+            &mut context,
+            translate_parent_to_child
+        ));
         assert_eq!(xmm0(&context), [CHILD, PARENT]);
     }
 
@@ -3208,7 +3219,11 @@ mod xmm_store_heal_tests {
         let instruction = decode(&[0x0f, 0x11, 0x06]);
         let mut context = context_with_xmm0(NON_POINTER, NON_POINTER);
 
-        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert!(!heal_xmm_store_lanes(
+            &instruction,
+            &mut context,
+            translate_parent_to_child
+        ));
         assert_eq!(xmm0(&context), [NON_POINTER, NON_POINTER]);
     }
 
@@ -3240,7 +3255,11 @@ mod xmm_store_heal_tests {
         let instruction = decode(&[0x48, 0x89, 0x06]);
         let mut context = context_with_xmm0(PARENT, PARENT);
 
-        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert!(!heal_xmm_store_lanes(
+            &instruction,
+            &mut context,
+            translate_parent_to_child
+        ));
         assert_eq!(xmm0(&context), [PARENT, PARENT]);
     }
 
@@ -3252,7 +3271,11 @@ mod xmm_store_heal_tests {
         let mut context = context_with_xmm0(PARENT, PARENT);
         context.ContextFlags = 0;
 
-        assert!(!heal_xmm_store_lanes(&instruction, &mut context, translate_parent_to_child));
+        assert!(!heal_xmm_store_lanes(
+            &instruction,
+            &mut context,
+            translate_parent_to_child
+        ));
         context.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
         assert_eq!(xmm0(&context), [PARENT, PARENT]);
     }

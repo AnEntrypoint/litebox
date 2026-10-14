@@ -1233,7 +1233,8 @@ where
         // guest session instead of returning an errno. Anonymous `PROT_NONE` keeps the
         // never-committed path -- there is nothing to populate and a guard reservation must stay
         // free.
-        let before_perms = if permissions.is_empty() && !flags.contains(CreatePagesFlags::MAP_FILE) {
+        let before_perms = if permissions.is_empty() && !flags.contains(CreatePagesFlags::MAP_FILE)
+        {
             MemoryRegionPermissions::empty()
         } else {
             MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
@@ -1571,15 +1572,9 @@ where
         let range = PageRange::new(start, start + len)
             .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
         let (set, clear) = if dont_fork {
-            (
-                linux::VmFlags::VM_DONT_FORK,
-                linux::VmFlags::empty(),
-            )
+            (linux::VmFlags::VM_DONT_FORK, linux::VmFlags::empty())
         } else {
-            (
-                linux::VmFlags::empty(),
-                linux::VmFlags::VM_DONT_FORK,
-            )
+            (linux::VmFlags::empty(), linux::VmFlags::VM_DONT_FORK)
         };
         vmem.update_range_flags(range, set, clear)
     }

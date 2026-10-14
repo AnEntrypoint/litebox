@@ -30,7 +30,7 @@
 //! - **Multiple event devices**: exactly one combined keyboard+mouse node (`event0`), matching
 //!   `litebox::fs::devices::InputDevice`'s current single-variant enum.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use litebox::event::Events;
 use litebox::event::polling::Pollee;

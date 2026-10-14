@@ -94,8 +94,16 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
                 .to_flags()
                 .unwrap_or(tar_no_std::ModeFlags::empty()),
         );
-        let owner_user = header.uid.as_number::<u32>().ok().and_then(|id| u16::try_from(id).ok());
-        let owner_group = header.gid.as_number::<u32>().ok().and_then(|id| u16::try_from(id).ok());
+        let owner_user = header
+            .uid
+            .as_number::<u32>()
+            .ok()
+            .and_then(|id| u16::try_from(id).ok());
+        let owner_group = header
+            .gid
+            .as_number::<u32>()
+            .ok()
+            .and_then(|id| u16::try_from(id).ok());
 
         match typeflag {
             tar_no_std::TypeFlag::DIRTYPE => match fs.mkdir(&*path, mode) {
@@ -132,7 +140,13 @@ fn import_all_as_root<FS: FileSystem>(fs: &FS, tar_data: &[u8]) -> Result<(), Im
                 block_index += payload_blocks;
 
                 let contents: &[u8] = tar_data.get(content_start..content_end).unwrap_or(&[]);
-                record(import_file(fs, &path, mode, contents, merge_spec_of(header)));
+                record(import_file(
+                    fs,
+                    &path,
+                    mode,
+                    contents,
+                    merge_spec_of(header),
+                ));
             }
             _ => {
                 // Character devices and hardlinks: not produced by `export_all`, skipped.
@@ -193,7 +207,9 @@ fn merge_spec_of(header: &tar_no_std::PosixHeader) -> MergeSpec {
     let mut fields = fields.split(' ').filter(|part| !part.is_empty());
     let number = |part: Option<&str>| part.and_then(|value| value.parse::<usize>().ok());
     match fields.next() {
-        Some("a") => number(fields.next()).map_or(MergeSpec::Whole, |base| MergeSpec::Append { base }),
+        Some("a") => {
+            number(fields.next()).map_or(MergeSpec::Whole, |base| MergeSpec::Append { base })
+        }
         Some("r") => match (number(fields.next()), number(fields.next())) {
             (Some(offset), Some(final_len)) => MergeSpec::Range { offset, final_len },
             _ => MergeSpec::Whole,
@@ -219,8 +235,12 @@ fn import_file<FS: FileSystem>(
     let (fd, restore_mode) = match fs.open(path, flags, mode) {
         Ok(fd) => (fd, false),
         Err(super::errors::OpenError::AccessNotAllowed) => {
-            fs.chmod(path, mode | Mode::WUSR)
-                .map_err(|_| ImportError::Open(String::from(path), super::errors::OpenError::AccessNotAllowed))?;
+            fs.chmod(path, mode | Mode::WUSR).map_err(|_| {
+                ImportError::Open(
+                    String::from(path),
+                    super::errors::OpenError::AccessNotAllowed,
+                )
+            })?;
             let fd = fs
                 .open(path, flags, mode)
                 .map_err(|e| ImportError::Open(String::from(path), e))?;

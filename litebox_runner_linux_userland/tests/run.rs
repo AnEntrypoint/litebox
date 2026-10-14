@@ -308,11 +308,7 @@ fn find_program(prog: &str) -> Option<std::path::PathBuf> {
         .expect("Failed to find program binary")
         .stdout;
     let path = std::path::PathBuf::from(String::from_utf8(output).unwrap().trim());
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 /// Get the path of a program using `which`

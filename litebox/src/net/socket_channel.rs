@@ -710,7 +710,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Record whether the smoltcp socket still holds bytes this process has not pulled, waking
     /// any waiter when bytes appeared.
     pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
-        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+        if self
+            .inner
+            .smoltcp_rx_pending
+            .swap(pending, Ordering::AcqRel)
+            != pending
+            && pending
+        {
             self.inner.pollee.notify_observers(Events::IN);
         }
     }
@@ -1004,7 +1010,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Record whether the smoltcp socket still holds datagrams this process has not pulled,
     /// waking any waiter when one appeared.
     pub(super) fn set_smoltcp_rx_pending(&self, pending: bool) {
-        if self.inner.smoltcp_rx_pending.swap(pending, Ordering::AcqRel) != pending && pending {
+        if self
+            .inner
+            .smoltcp_rx_pending
+            .swap(pending, Ordering::AcqRel)
+            != pending
+            && pending
+        {
             self.inner.pollee.notify_observers(Events::IN);
         }
     }

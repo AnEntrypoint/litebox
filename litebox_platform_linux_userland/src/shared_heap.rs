@@ -500,7 +500,8 @@ impl<'a> Guard<'a> {
             {
                 let owner = h.lock.load(Ordering::Relaxed);
                 if owner != 0 && owner != me {
-                    let msg = b"shared heap lock steal: taking over from a holder that never released\n";
+                    let msg =
+                        b"shared heap lock steal: taking over from a holder that never released\n";
                     // SAFETY: raw write of a static buffer to stderr.
                     unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
                     if h.lock

@@ -170,18 +170,21 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
         // condition store is visible, losing the wakeup.
         core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.condvar;
-        let v = condvar.underlying_atomic().try_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |state| match ThreadState(state) {
-                ThreadState::RUNNING_IN_HOST
-                | ThreadState::WOKEN
-                | ThreadState::INTERRUPTED_GUEST
-                | ThreadState::RUNNING_IN_GUEST => None,
-                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
-                state => unreachable!("{state:?}"),
-            },
-        );
+        let v =
+            condvar
+                .underlying_atomic()
+                .try_update(
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                    |state| match ThreadState(state) {
+                        ThreadState::RUNNING_IN_HOST
+                        | ThreadState::WOKEN
+                        | ThreadState::INTERRUPTED_GUEST
+                        | ThreadState::RUNNING_IN_GUEST => None,
+                        ThreadState::WAITING => Some(ThreadState::WOKEN.0),
+                        state => unreachable!("{state:?}"),
+                    },
+                );
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
@@ -230,18 +233,21 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
         // (stores RUNNING_IN_GUEST then reads pending interrupts) and `wait_until`.
         core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
-        let v = condvar.underlying_atomic().try_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |state| match ThreadState(state) {
-                ThreadState::RUNNING_IN_HOST
-                | ThreadState::WOKEN
-                | ThreadState::INTERRUPTED_GUEST => None,
-                ThreadState::WAITING => Some(ThreadState::WOKEN.0),
-                ThreadState::RUNNING_IN_GUEST => Some(ThreadState::INTERRUPTED_GUEST.0),
-                state => unreachable!("{state:?}"),
-            },
-        );
+        let v =
+            condvar
+                .underlying_atomic()
+                .try_update(
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                    |state| match ThreadState(state) {
+                        ThreadState::RUNNING_IN_HOST
+                        | ThreadState::WOKEN
+                        | ThreadState::INTERRUPTED_GUEST => None,
+                        ThreadState::WAITING => Some(ThreadState::WOKEN.0),
+                        ThreadState::RUNNING_IN_GUEST => Some(ThreadState::INTERRUPTED_GUEST.0),
+                        state => unreachable!("{state:?}"),
+                    },
+                );
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
