@@ -4901,6 +4901,8 @@ impl SyscallRequest {
             Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
+            // `inotify_init` has no aarch64 syscall number (only `inotify_init1`), so it is x86_64-only.
+            #[cfg(target_arch = "x86_64")]
             Sysno::inotify_init => SyscallRequest::InotifyInit { flags: 0 },
             Sysno::inotify_init1 => sys_req!(InotifyInit { flags }),
             Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
