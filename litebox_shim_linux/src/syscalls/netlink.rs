@@ -53,6 +53,12 @@ const NETLINK_AUDIT: u8 = 9;
 const NLMSG_HEADER_BYTES: usize = 16;
 
 impl NetlinkSocket {
+    /// Only the tests create a socket without naming a protocol.
+    #[cfg(test)]
+    pub(crate) fn new(flags: litebox_common_linux::SockFlags) -> Self {
+        Self::new_with_protocol(flags, u8::MAX)
+    }
+
     pub(crate) fn new_with_protocol(flags: litebox_common_linux::SockFlags, protocol: u8) -> Self {
         let mut status = OFlags::RDWR;
         status.set(
