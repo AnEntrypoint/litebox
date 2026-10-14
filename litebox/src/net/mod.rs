@@ -4465,7 +4465,8 @@ where
         // value for now until we have a better solution.
         let backlog = backlog.min(8);
 
-        let mut armed_endpoint: Option<smoltcp::wire::IpListenEndpoint> = None;
+        // Assigned only by the TCP arm below; every other arm diverges, so no path reads it unset.
+        let armed_endpoint: Option<smoltcp::wire::IpListenEndpoint>;
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 if handle.server_socket.is_none() {

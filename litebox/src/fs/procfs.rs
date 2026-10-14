@@ -974,7 +974,7 @@ where
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
             }
-            ProcfsDirHandle::PidTask(_) | ProcfsDirHandle::PidFd(_) => {
+            ProcfsDirHandle::PidTask(_) => {
                 return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
         };

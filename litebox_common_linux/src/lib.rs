@@ -5184,15 +5184,6 @@ impl SyscallRequest {
                         PrctlOption::SetPDeathSig => SyscallRequest::Prctl {
                             args: PrctlArg::SetPDeathSig(ctx.sys_req_arg(1)),
                         },
-                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
-                            args: PrctlArg::GetSecureBits,
-                        },
-                        PrctlOption::SetSecureBits => SyscallRequest::Prctl {
-                            args: PrctlArg::SetSecureBits(ctx.sys_req_arg(1)),
-                        },
-                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
-                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
-                        },
                         // `PR_SET_PTRACER` names a pid permitted to ptrace this process. Real
                         // Linux accepts it even where it changes nothing (no Yama, or Yama in
                         // `ptrace_scope` 0), and a hard `EINVAL` here is a caller-visible refusal
@@ -5585,10 +5576,6 @@ impl SyscallRequest {
             // "no such attribute", and setting one is "not supported here" -- what a tmpfs
             // without xattr support says. GIO asks for the list of every file it inspects
             // (thousands of calls); failing them as unimplemented is only noise.
-            // Scheduling priority has no meaning here (every guest thread is an ordinary host
-            // thread, and the host scheduler is not the guest's to tune); accepting the request
-            // is what an unprivileged `nice` that happens to succeed looks like.
-            Sysno::setpriority => SyscallRequest::SchedYield,
             // Tracing another process is not offered; `EPERM` is what a kernel with ptrace
             // restricted (yama, or a container default) answers, which debuggers and crash
             // handlers already handle, unlike an unimplemented-syscall error.

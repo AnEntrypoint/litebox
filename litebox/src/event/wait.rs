@@ -170,7 +170,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
         // condition store is visible, losing the wakeup.
         core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.condvar;
-        let v = condvar.underlying_atomic().fetch_update(
+        let v = condvar.underlying_atomic().try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |state| match ThreadState(state) {
@@ -230,7 +230,7 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
         // (stores RUNNING_IN_GUEST then reads pending interrupts) and `wait_until`.
         core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
-        let v = condvar.underlying_atomic().fetch_update(
+        let v = condvar.underlying_atomic().try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |state| match ThreadState(state) {
