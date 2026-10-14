@@ -3493,8 +3493,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     );
                                 }
                                 for (p, h) in cross.iter() {
+                                    // On Linux the handle is the native fork's pid (the argument
+                                    // `waitpid` takes), so it names the child's host process
+                                    // directly; the platform accessor answers None here.
+                                    let host = h.0 as u64;
                                     litebox_util_log::warn!(
                                         child:% = *p,
+                                        host:% = host,
                                         done:% = self.global.platform.try_wait_for_cross_process_exit(*h).is_some();
                                         "[diag-wait4-stuck] cross child"
                                     );

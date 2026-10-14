@@ -53,6 +53,19 @@ static DIAG_WAIT_ADDR: [core::sync::atomic::AtomicUsize; DIAG_WAIT_SLOTS] =
 static DIAG_WAIT_INFO: [core::sync::atomic::AtomicU64; DIAG_WAIT_SLOTS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_WAIT_SLOTS];
 
+/// Diagnostic: `FUTEX_WAKE`s per address bucket, process-wide. A parked waiter records its bucket's
+/// count when it parks, so a dump shows whether any wake reached that address since.
+static DIAG_WAKES: [core::sync::atomic::AtomicU64; 256] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 256];
+
+/// The bucket count each parked waiter saw when it parked (indexed like `DIAG_WAIT_ADDR`).
+static DIAG_PARK_WAKES: [core::sync::atomic::AtomicU64; DIAG_WAIT_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; DIAG_WAIT_SLOTS];
+
+fn diag_bucket(addr: usize) -> usize {
+    (addr >> 2) % 256
+}
+
 fn diag_claim(addr: usize, expected: u32, bitset: u32) -> Option<usize> {
     for (slot, (addr_slot, info_slot)) in DIAG_WAIT_ADDR.iter().zip(&DIAG_WAIT_INFO).enumerate() {
         if addr_slot
@@ -61,6 +74,8 @@ fn diag_claim(addr: usize, expected: u32, bitset: u32) -> Option<usize> {
         {
             let packed = (u64::from(expected) << 32) | u64::from(bitset);
             info_slot.store(packed, Ordering::Release);
+            DIAG_PARK_WAKES[slot]
+                .store(DIAG_WAKES[diag_bucket(addr)].load(Ordering::Relaxed), Ordering::Relaxed);
             return Some(slot);
         }
     }
@@ -74,16 +89,20 @@ fn diag_release(slot: Option<usize>) {
 }
 
 fn diag_dump_parked(reporter_addr: usize) {
-    for (addr_slot, info_slot) in DIAG_WAIT_ADDR.iter().zip(&DIAG_WAIT_INFO) {
+    for (index, (addr_slot, info_slot)) in DIAG_WAIT_ADDR.iter().zip(&DIAG_WAIT_INFO).enumerate() {
         let addr = addr_slot.load(Ordering::Acquire);
         if addr == 0 {
             continue;
         }
         let info = info_slot.load(Ordering::Acquire);
+        let wakes_since_park = DIAG_WAKES[diag_bucket(addr)]
+            .load(Ordering::Relaxed)
+            .wrapping_sub(DIAG_PARK_WAKES[index].load(Ordering::Relaxed));
         litebox_util_log::warn!(
             addr:% = addr,
             expected:% = info >> 32,
             bitset:% = info & 0xffff_ffff,
+            wakes_since_park:% = wakes_since_park,
             reporter:% = addr == reporter_addr;
             "diag-futex-parked: a FUTEX_WAIT is parked"
         );
@@ -206,11 +225,18 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Wait in slices. A slice that times out (not the caller's own deadline) re-reads the
         // word: if it has changed while `done` is still false, the wake this waiter needs was
         // never delivered (a lost wakeup), and the log says so.
+        let mut slices: u32 = 0;
         let waited = loop {
             match cx.with_timeout(FUTEX_WORD_CHECK_SLICE).wait_until(&mut ready) {
                 Err(WaitError::TimedOut)
                     if !(cx.deadline().is_some() && cx.remaining_timeout().is_none()) =>
                 {
+                    // A wait parked for a minute with no wake is the stall shape: dump every parked
+                    // waiter once, with the wakes each saw since it parked.
+                    slices += 1;
+                    if slices == 30 {
+                        diag_dump_parked(addr);
+                    }
                     let word = futex_addr.read_at_offset(0).unwrap_or(u32::MAX);
                     if word != expected_value && !entry.get().done.load(Ordering::Acquire) {
                         litebox_util_log::warn!(
@@ -259,6 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         if !addr.is_multiple_of(align_of::<u32>()) {
             return Err(FutexError::NotAligned);
         }
+        DIAG_WAKES[diag_bucket(addr)].fetch_add(1, Ordering::Relaxed);
         let bitset = bitset.unwrap_or(ALL_BITS).get();
         let mut woken = 0;
         let bucket = self.bucket(addr);
