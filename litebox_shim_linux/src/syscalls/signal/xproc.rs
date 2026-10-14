@@ -733,10 +733,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    /// Called only after `pid` has exited AND been reaped (`wait4`/`waitid`); see the four call
+    /// sites in `syscalls::process`.
+    ///
+    /// Deliberately NOT gated on `xproc_host()`: on a platform with no host process identity
+    /// (`current_host_pid() == 0`) the registry exists for `/proc/<pid>` visibility only, and a
+    /// guest pid is still registered there -- `xproc_preregister_child` registers under host 0 for
+    /// exactly that reason. Gating the release on a host pid that platform never has left those
+    /// slots APPEND-ONLY: every pid ever forked stayed in the fixed 512-slot table for the rest of
+    /// the run, so `ls /proc` grew to ~505 entries against 14 live host processes and then ran out
+    /// of slots, after which every new process was invisible in `/proc`. A reap is the one moment
+    /// the pid is known to be gone, on every platform alike, and the table lives in the shared
+    /// arena, so the reaping host process frees the slot validly.
     pub(crate) fn xproc_unregister(&self, pid: i32) {
-        if self.xproc_host().is_none() {
-            return;
-        }
         self.global.process_table.unregister(pid);
         self.global.xproc_local.lock().remove(&pid);
     }
