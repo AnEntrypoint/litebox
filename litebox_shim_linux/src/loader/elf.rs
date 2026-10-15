@@ -533,6 +533,14 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the ELF fixtures are used only by the Linux-only load test"
+    )
+)]
 mod tests {
     extern crate std;
 

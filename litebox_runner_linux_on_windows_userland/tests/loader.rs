@@ -150,6 +150,22 @@ int main(void) {
 
 #[test]
 fn test_static_linked_prog_with_rewriter() {
+    // The in-process ELF load aborts with `Recursion too deep` (0xc00000fd) on the default 2 MiB
+    // test-thread stack on Windows; the same load fits on Linux. Only the stack size changes here.
+    run_on_large_stack(static_linked_prog_with_rewriter);
+}
+
+fn run_on_large_stack(body: fn()) {
+    let handle = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(body)
+        .expect("spawn large-stack test thread");
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn static_linked_prog_with_rewriter() {
     println!("Running statically linked binary + rewriter test...");
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
