@@ -35,10 +35,10 @@ fn cpu_units() -> u64 {
     unsafe {
         GetProcessTimes(
             GetCurrentProcess(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
         )
     };
     let join =
@@ -48,9 +48,15 @@ fn cpu_units() -> u64 {
 
 fn working_set_bytes() -> usize {
     let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { core::mem::zeroed() };
-    counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "PROCESS_MEMORY_COUNTERS is a fixed Win32 struct of a few dozen bytes"
+    )]
+    {
+        counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    }
     // SAFETY: `counters` is a valid, correctly sized out structure.
-    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &raw mut counters, counters.cb) };
     counters.WorkingSetSize
 }
 

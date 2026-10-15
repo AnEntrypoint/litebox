@@ -113,7 +113,7 @@ impl Reply {
     ///
     /// Returns an error string if `line` starts with neither `ok` nor `err`.
     pub fn parse_header(line: &str) -> Result<ReplyHeader, String> {
-        let mut tokens = line.trim().split_whitespace();
+        let mut tokens = line.split_whitespace();
         match tokens.next() {
             Some("ok") => Ok(ReplyHeader::Ok {
                 tokens: tokens.map(str::to_owned).collect(),

@@ -251,6 +251,31 @@ impl WindowsUserland {
     }
 }
 
+/// Reads a 64-bit register or fault word as a pointer-sized value.
+///
+/// Every target this crate builds for is 64-bit, so `usize` holds the whole word and the cast
+/// never truncates.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "usize is 64 bits on every supported Windows target (x86_64 and aarch64)"
+)]
+#[must_use]
+const fn word_as_usize(word: u64) -> usize {
+    word as usize
+}
+
+/// Sign-extends a signed Win32 status or exception code to `usize`, exactly as `as usize` does.
+///
+/// The sign extension is deliberate: the diagnostics print the code's full two's-complement value.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "sign extension is the intended two's-complement value of a status code"
+)]
+#[must_use]
+const fn signed_code_as_usize(code: i32) -> usize {
+    code as usize
+}
+
 /// Every diagnostic gate consulted by code reachable from the vectored exception handler,
 /// resolved ONCE before any guest thread exists.
 ///
@@ -283,6 +308,10 @@ impl WindowsUserland {
 /// replaces `diag_interrupt_enabled`'s own `OnceLock` and two per-thread caches, so the count goes
 /// down.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent LITEBOX_DIAG_* env switch read once; they do not form a state machine"
+)]
 pub(crate) struct VehGates {
     /// `LITEBOX_VEH_TRACE`
     pub(crate) veh_trace: bool,
@@ -751,6 +780,13 @@ unsafe extern "system" fn vectored_exception_handler_entry(
 /// `diag-unrecov-av-pagestate` block already uses. Returns `None` when the address is not
 /// committed or not readable, so the caller can print why it stopped instead of dying.
 fn diag_probe_read_usize(addr: usize) -> Option<usize> {
+    // PAGE_NOACCESS/PAGE_GUARD would fault on read just as surely as an unmapped page does.
+    const READABLE: u32 = Win32_Memory::PAGE_READONLY
+        | Win32_Memory::PAGE_READWRITE
+        | Win32_Memory::PAGE_WRITECOPY
+        | Win32_Memory::PAGE_EXECUTE_READ
+        | Win32_Memory::PAGE_EXECUTE_READWRITE
+        | Win32_Memory::PAGE_EXECUTE_WRITECOPY;
     // A null address cannot be mapped; skip the syscall entirely.
     if addr == 0 {
         return None;
@@ -759,20 +795,13 @@ fn diag_probe_read_usize(addr: usize) -> Option<usize> {
     let queried = unsafe {
         Win32_Memory::VirtualQuery(
             addr as *const c_void,
-            &mut mbi,
+            &raw mut mbi,
             core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
         )
     };
     if queried == 0 || mbi.State != Win32_Memory::MEM_COMMIT {
         return None;
     }
-    // PAGE_NOACCESS/PAGE_GUARD would fault on read just as surely as an unmapped page does.
-    const READABLE: u32 = Win32_Memory::PAGE_READONLY
-        | Win32_Memory::PAGE_READWRITE
-        | Win32_Memory::PAGE_WRITECOPY
-        | Win32_Memory::PAGE_EXECUTE_READ
-        | Win32_Memory::PAGE_EXECUTE_READWRITE
-        | Win32_Memory::PAGE_EXECUTE_WRITECOPY;
     if mbi.Protect & READABLE == 0 || mbi.Protect & Win32_Memory::PAGE_GUARD != 0 {
         return None;
     }
@@ -850,7 +879,7 @@ impl VehFrameCanaryGuard {
         // rather than relying on a single far jump to trigger ordinary sequential guard-page
         // growth.
         unsafe {
-            let commit_page = (addr as *mut u8).map_addr(|a| a & !0xFFF);
+            let commit_page = addr.cast::<u8>().map_addr(|a| a & !0xFFF);
             let _ = Win32_Memory::VirtualAlloc(
                 commit_page.cast(),
                 4096,
@@ -873,7 +902,7 @@ impl Drop for VehFrameCanaryGuard {
                 b"[diag-veh-frame-stride-overflow] addr=0x",
                 self.addr as usize,
                 b" corrupted_value=0x",
-                value as usize,
+                word_as_usize(value),
             );
             // Same reasoning as the unrecovered-AV circuit breaker just below in this file: a
             // stack slice known to have been overrun risks silent corruption of a neighboring
@@ -897,6 +926,13 @@ impl Drop for VehFrameCanaryGuard {
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
+    // DIAG (LITEBOX_DIAG_ALLOC_VEC=1 investigation continuation): unconditional (no gate other
+    // than a call-count cap), allocation-free entry counter -- answers "is VEH even being
+    // entered again after the first single-step" directly, independent of every other diagnostic
+    // gate in this function (all of which run later and could themselves be skipped for reasons
+    // unrelated to whether VEH fired at all).
+    static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
     // AGENTS.md pass 266: `RaiseFailFastException` (the LITEBOX_DIAG_ALLOW_WER escape hatch,
     // pass 246) raises `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409) specifically because real
     // Windows treats it as non-continuable and non-interceptable by ordinary SEH/VEH handlers --
@@ -949,18 +985,16 @@ unsafe extern "system" fn vectored_exception_handler(
         VehFrameCanaryGuard::new(tls.host_sp.get(), tls.veh_depth.get())
     });
 
-    // DIAG (LITEBOX_DIAG_ALLOC_VEC=1 investigation continuation): unconditional (no gate other
-    // than a call-count cap), allocation-free entry counter -- answers "is VEH even being
-    // entered again after the first single-step" directly, independent of every other diagnostic
-    // gate in this function (all of which run later and could themselves be skipped for reasons
-    // unrelated to whether VEH fired at all).
-    static VEH_ENTRY_COUNT: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
     if veh_gates().alloc_vec {
         let n = VEH_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
             let code = unsafe { (*(*exception_info).ExceptionRecord).ExceptionCode };
-            diag_raw_print(b"[diag_veh_entry] n=0x", n, b" code=0x", code as usize);
+            diag_raw_print(
+                b"[diag_veh_entry] n=0x",
+                n,
+                b" code=0x",
+                signed_code_as_usize(code),
+            );
         }
     }
 
@@ -975,6 +1009,7 @@ unsafe extern "system" fn vectored_exception_handler(
     std::thread_local! {
         // `Option<bool>` (not `bool`): see the `is_in_guest_state` comment below -- `None` means
         // "could not determine" and must stay distinguishable from a confirmed `Some(false)`.
+        #[allow(clippy::type_complexity, reason = "one-off diagnostic ring; a named alias would serve only this static")]
         static RECENT_FAULTS: RefCell<[(i32, u64, u64, Option<bool>); 4]> =
             const { RefCell::new([(0, 0, 0, None); 4]) };
         // Ring of (faulting_rip, recover_fixup_addr) pairs for every exception-table recovery
@@ -1093,13 +1128,14 @@ unsafe extern "system" fn vectored_exception_handler(
         if raw_exception_code == Win32_Foundation::EXCEPTION_BREAKPOINT {
             diag_raw_print(
                 b"[diag-bp-entry] rip=0x",
-                rip as usize,
+                word_as_usize(rip),
                 b" rsp=0x",
-                rsp as usize,
+                word_as_usize(rsp),
             );
             for slot in 0..192usize {
-                let value =
-                    unsafe { core::ptr::read_unaligned((rsp as usize + slot * 8) as *const usize) };
+                let value = unsafe {
+                    core::ptr::read_unaligned((word_as_usize(rsp) + slot * 8) as *const usize)
+                };
                 if (0x1_0000_0000..0x1_4000_0000).contains(&value) {
                     diag_raw_print(b"[diag-bp-stack] slot=0x", slot, b" value=0x", value);
                 }
@@ -1111,14 +1147,14 @@ unsafe extern "system" fn vectored_exception_handler(
                 b"[diag-ud-entry] tid=0x",
                 tid0 as usize,
                 b" rip=0x",
-                rip as usize,
+                word_as_usize(rip),
             );
             let insn_bytes = unsafe { core::ptr::read_unaligned(rip as *const u64) };
             diag_raw_print(
                 b"[diag-ud-entry]   insn_bytes=0x",
-                insn_bytes as usize,
+                word_as_usize(insn_bytes),
                 b" rip=0x",
-                rip as usize,
+                word_as_usize(rip),
             );
             // Encode the tri-state as 0/1/2 (not `this_is_in_guest as usize`'s collapsed 0/1):
             // 2 means "no TLS slot -- could not determine", never conflated with a confirmed 0.
@@ -1130,7 +1166,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     None => 2usize,
                 },
                 b" raw_code=0x",
-                raw_exception_code as usize as usize,
+                signed_code_as_usize(raw_exception_code),
             );
         }
         let raw_cr2 =
@@ -1166,19 +1202,19 @@ unsafe extern "system" fn vectored_exception_handler(
                 b"[diag-fault-vq] tid=0x",
                 tid as usize,
                 b" rip=0x",
-                rip as usize,
+                word_as_usize(rip),
             );
             diag_raw_print(
                 b"[diag-fault-vq]   is_ud_fault=0x",
-                is_ud_fault as usize,
+                usize::from(is_ud_fault),
                 b" raw_code=0x",
-                raw_exception_code as usize as usize,
+                signed_code_as_usize(raw_exception_code),
             );
             diag_raw_print(
                 b"[diag-fault-vq]   cr2=0x",
-                cr2 as usize,
+                word_as_usize(cr2),
                 b" queried=0x",
-                cr2_queried as usize,
+                usize::from(cr2_queried),
             );
             diag_raw_print(
                 b"[diag-fault-vq]   state=0x",
@@ -1202,7 +1238,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 b"[diag-fault-vq]   alloc_base=0x",
                 cr2_mbi.AllocationBase as usize,
                 b" rsp=0x",
-                rsp as usize,
+                word_as_usize(rsp),
             );
         }
 
@@ -1222,7 +1258,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
                         module,
                         name_buf.as_mut_ptr(),
-                        name_buf.len() as u32,
+                        u32::try_from(name_buf.len()).unwrap_or(u32::MAX),
                     )
                 };
                 let module_base = module as u64;
@@ -1312,7 +1348,7 @@ unsafe extern "system" fn vectored_exception_handler(
         let rec = unsafe { &*(*exception_info).ExceptionRecord };
         diag_raw_print(
             b"[diag-veh-no-tls] code=0x",
-            rec.ExceptionCode as usize,
+            signed_code_as_usize(rec.ExceptionCode),
             b" fault_addr=0x",
             rec.ExceptionInformation[1],
         );
@@ -1335,7 +1371,7 @@ unsafe extern "system" fn vectored_exception_handler(
             b"[diag_null_host_sp] tid_hash=0x",
             std::process::id() as usize,
             b" code=0x",
-            rec.ExceptionCode as usize,
+            signed_code_as_usize(rec.ExceptionCode),
         );
     }
     if veh_gates().alloc_vec {
@@ -1347,11 +1383,11 @@ unsafe extern "system" fn vectored_exception_handler(
                 b"[diag_veh_depth] REENTRANT depth=0x",
                 depth as usize,
                 b" code=0x",
-                rec.ExceptionCode as usize,
+                signed_code_as_usize(rec.ExceptionCode),
             );
             diag_raw_print(
                 b"[diag_veh_depth]   rip=0x",
-                ctx.Rip as usize,
+                word_as_usize(ctx.Rip),
                 b" fault_addr=0x",
                 rec.ExceptionInformation[1],
             );
@@ -1436,6 +1472,9 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     if veh_trace_enabled() {
+        unsafe extern "C" {
+            safe static __ImageBase: c_void;
+        }
         // DIAG-REALSTACK (mallocng .meta=0 investigation continuation): reads the REAL host
         // TEB's StackBase/StackLimit/DeallocationStack directly via inline asm to check whether a
         // crashing thread's real Windows-backing stack reservation is genuinely the expected 8
@@ -1471,9 +1510,6 @@ unsafe extern "system" fn vectored_exception_handler(
             stack_base.wrapping_sub(dealloc_stack),
             i64::try_from(rsp_now.wrapping_sub(dealloc_stack)).unwrap_or(-1),
         );
-        unsafe extern "C" {
-            safe static __ImageBase: c_void;
-        }
         let image_base = (&raw const __ImageBase).addr();
         eprintln!(
             "[veh] tid={:?} code={:#x} rip={:#x} rva={:#x} addr={:#x} is_in_guest={} is_verifying={} rdfsbase={:#x} thread_fs_base={:#x}",
@@ -1769,8 +1805,10 @@ unsafe extern "system" fn vectored_exception_handler(
         let mut stack_words = [0u8; 256];
         let nsw = fork_verify::read_code_bytes_for_diagnostics(rsp, &mut stack_words);
         let words: Vec<u64> = stack_words[..nsw]
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         eprintln!("[veh] DIAG-STACKWALK rsp={rsp:#x} qwords={words:#x?}");
     }
@@ -2148,12 +2186,12 @@ unsafe extern "system" fn vectored_exception_handler(
                 // allocation-based printing is not trustworthy this early/this deep in a fault
                 // this investigation is chasing. Two raw prints instead of one richer `eprintln!`
                 // line, since `diag_raw_print` only carries two hex values at a time.
-                let fault_addr = exception_record.ExceptionInformation[1] as usize;
+                let fault_addr = exception_record.ExceptionInformation[1];
                 let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
                 let ok = unsafe {
                     Win32_Memory::VirtualQuery(
                         fault_addr as *mut c_void,
-                        &mut mbi,
+                        &raw mut mbi,
                         core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                     ) != 0
                 };
@@ -2161,11 +2199,11 @@ unsafe extern "system" fn vectored_exception_handler(
                     b"[diag-recovered-av] fault_addr=0x",
                     fault_addr,
                     b" recover_rip=0x",
-                    recover as usize,
+                    recover,
                 );
                 diag_raw_print(
                     b"[diag-recovered-av2] rsp=0x",
-                    context.Rsp as usize,
+                    word_as_usize(context.Rsp),
                     b" State=0x",
                     if ok { mbi.State as usize } else { 0xdead },
                 );
@@ -2223,7 +2261,7 @@ unsafe extern "system" fn vectored_exception_handler(
             }
             diag_raw_print(
                 b"[diag-recover-fsbase] recover_rip=0x",
-                recover as usize,
+                recover,
                 b" fsbase=0x",
                 unsafe { litebox_common_linux::rdfsbase() } as usize,
             );
@@ -2290,6 +2328,10 @@ unsafe extern "system" fn vectored_exception_handler(
             // access-violation-class fault racing a fork-heavy repro), so this diagnostic exists
             // specifically to survive on the fast/untraced path where the crash actually occurs.
             if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION {
+                unsafe extern "C" {
+                    safe static __ImageBase: c_void;
+                }
+                use std::io::Write;
                 // AGENTS.md pass 232: a genuinely unrecovered AV at this exact point (most
                 // often the still-unexplained `ntdll!RtlpUnwindPrologue` fault documented since
                 // pass 205) has been observed live to recur at the SAME `rip`, thousands of
@@ -2334,10 +2376,14 @@ unsafe extern "system" fn vectored_exception_handler(
                     // reach Windows so WER can capture full register/stack state. Never set
                     // this outside a debugging session -- it reintroduces the unbounded
                     // disk-exhaustion hazard this circuit breaker exists to prevent.
+                    #[allow(
+                        clippy::if_not_else,
+                        reason = "the give-up branch is the debugging override; the default path is the else branch and reads better unflipped"
+                    )]
                     if !veh_gates().allow_wer {
                         diag_raw_print(
                             b"[diag-unrecov-av-giveup] rip=0x",
-                            context_snapshot.Rip as usize,
+                            word_as_usize(context_snapshot.Rip),
                             b" repeat_count=0x",
                             repeat_count as usize,
                         );
@@ -2370,15 +2416,14 @@ unsafe extern "system" fn vectored_exception_handler(
                         // handler chain to recurse through.
                         diag_raw_print(
                             b"[diag-unrecov-av-allow-wer] rip=0x",
-                            context_snapshot.Rip as usize,
+                            word_as_usize(context_snapshot.Rip),
                             b" repeat_count=0x",
                             repeat_count as usize,
                         );
                         unsafe {
                             windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
-                                exception_record as *const EXCEPTION_RECORD,
-                                context as *const _
-                                    as *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+                                core::ptr::from_ref(exception_record),
+                                core::ptr::from_ref(context),
                                 0,
                             );
                         }
@@ -2407,13 +2452,10 @@ unsafe extern "system" fn vectored_exception_handler(
                 // it simply failed to recover.
                 diag_raw_print(
                     b"[diag-lsearch-exits] count=0x",
-                    LSEARCH_EXIT_COUNT.load(Ordering::Relaxed) as usize,
+                    word_as_usize(LSEARCH_EXIT_COUNT.load(Ordering::Relaxed)),
                     b" veh_depth=0x",
                     tls.veh_depth.get() as usize,
                 );
-                unsafe extern "C" {
-                    safe static __ImageBase: c_void;
-                }
                 let module_base = (&raw const __ImageBase) as usize;
                 // The on-disk `.extable` section of this very binary was verified to contain an
                 // entry whose [start, stop) range covers this exact faulting RVA, yet the lookup
@@ -2426,12 +2468,12 @@ unsafe extern "system" fn vectored_exception_handler(
                     eprintln!(
                         "[diag-extable] module_base={module_base:#x} rip={:#x} rva={:#x} table_len={} shown={n}",
                         context_snapshot.Rip,
-                        (context_snapshot.Rip as usize).wrapping_sub(module_base),
+                        word_as_usize(context_snapshot.Rip).wrapping_sub(module_base),
                         litebox::mm::exception_table::debug_table_len(),
                     );
                     for (i, (s, e, f)) in entries.iter().take(n).enumerate() {
-                        let covers = (context_snapshot.Rip as usize) >= *s
-                            && (context_snapshot.Rip as usize) < *e;
+                        let covers = word_as_usize(context_snapshot.Rip) >= *s
+                            && word_as_usize(context_snapshot.Rip) < *e;
                         eprintln!(
                             "[diag-extable]   [{i}] start={s:#x} (rva {:#x}) stop={e:#x} (rva {:#x}) fixup={f:#x} covers={covers}",
                             s.wrapping_sub(module_base),
@@ -2443,7 +2485,7 @@ unsafe extern "system" fn vectored_exception_handler(
                     "[diag-unrecov-av] tid={:?} rip={:#x} rva={:#x} addr={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} is_in_guest={} is_verifying={} -- no exception-table entry found",
                     std::thread::current().id(),
                     context_snapshot.Rip,
-                    (context_snapshot.Rip as usize).wrapping_sub(module_base),
+                    word_as_usize(context_snapshot.Rip).wrapping_sub(module_base),
                     exception_record.ExceptionInformation[1],
                     context_snapshot.Rsp,
                     context_snapshot.Rax,
@@ -2489,15 +2531,14 @@ unsafe extern "system" fn vectored_exception_handler(
                     .map(|(name, _)| *name)
                     .collect();
                     eprintln!(
-                        "[diag-unrecov-av-gprmatch] fault_addr={:#x} matching_gprs={:?}",
-                        fault_addr_val, matches,
+                        "[diag-unrecov-av-gprmatch] fault_addr={fault_addr_val:#x} matching_gprs={matches:?}",
                     );
                     let fault_addr = fault_addr_val as *mut c_void;
                     let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
                     let ok = unsafe {
                         Win32_Memory::VirtualQuery(
                             fault_addr,
-                            &mut mbi,
+                            &raw mut mbi,
                             core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                         ) != 0
                     };
@@ -2524,7 +2565,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 // to recover the call chain even though `rip` itself is a wild jump into
                 // non-code memory and cannot be symbolized or unwound normally.
                 {
-                    let rsp = context_snapshot.Rsp as usize;
+                    let rsp = word_as_usize(context_snapshot.Rsp);
                     for i in 0..32usize {
                         let addr = rsp.wrapping_add(i * 8);
                         // `read_unaligned`, not `read_volatile`: this code runs precisely when
@@ -2579,7 +2620,7 @@ unsafe extern "system" fn vectored_exception_handler(
                             };
                             eprintln!(
                                 "[diag-unrecov-av-ring] [{i}] code={code:#x} rip={rip:#x} rva={:#x} rsp={fault_rsp:#x} is_in_guest={in_guest_str}",
-                                (*rip as usize).wrapping_sub(module_base),
+                                word_as_usize(*rip).wrapping_sub(module_base),
                             );
                             // Dump this ring entry's own top-of-stack too, so the caller of a
                             // fault like `write_u8_fallible` (a tiny leaf function with almost no
@@ -2589,7 +2630,7 @@ unsafe extern "system" fn vectored_exception_handler(
                                 && *fault_rsp != 0
                             {
                                 for j in 0..8usize {
-                                    let addr = (*fault_rsp as usize).wrapping_add(j * 8);
+                                    let addr = word_as_usize(*fault_rsp).wrapping_add(j * 8);
                                     // See the alignment note on the primary stack dump above:
                                     // a recorded `fault_rsp` has the same misalignment hazard.
                                     // A recorded `fault_rsp` carries the identical garbage-value
@@ -2621,13 +2662,12 @@ unsafe extern "system" fn vectored_exception_handler(
                             }
                             eprintln!(
                                 "[diag-unrecov-av-recovery] [{i}] fault_rip={fault_rip:#x} rva={:#x} -> recover={recover_addr:#x} rva={:#x}",
-                                (*fault_rip as usize).wrapping_sub(module_base),
-                                (*recover_addr as usize).wrapping_sub(module_base),
+                                word_as_usize(*fault_rip).wrapping_sub(module_base),
+                                word_as_usize(*recover_addr).wrapping_sub(module_base),
                             );
                         }
                     }
                 });
-                use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
             // `EXCEPTION_CONTINUE_SEARCH` is actively harmful here, for BOTH guest-mode and
@@ -2639,7 +2679,7 @@ unsafe extern "system" fn vectored_exception_handler(
             // terminate instead of EXCEPTION_CONTINUE_SEARCH") for the full evidence trail.
             diag_raw_print(
                 b"[diag-unrecov-av-terminate] rip=0x",
-                context_snapshot.Rip as usize,
+                word_as_usize(context_snapshot.Rip),
                 b" addr=0x",
                 exception_record.ExceptionInformation[1],
             );
@@ -2661,9 +2701,8 @@ unsafe extern "system" fn vectored_exception_handler(
             // never returns.
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::RaiseFailFastException(
-                    exception_record as *const EXCEPTION_RECORD,
-                    context as *const _
-                        as *const windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+                    core::ptr::from_ref(exception_record),
+                    core::ptr::from_ref(context),
                     0,
                 );
             }
@@ -2780,14 +2819,6 @@ unsafe extern "system" fn vectored_exception_handler(
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && fork_verify::is_verifying(tls)
     {
-        // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
-        // `context.Rip` -- this value drives the whole stale-pointer healing decision tree below
-        // (`translate_stale_source_rip` and its three siblings), all real control flow. No write
-        // to `context.Rip` occurs on this path before this point, so the snapshot and the live
-        // value are still guaranteed identical here absent a torn read -- using the snapshot
-        // removes the torn-read hazard with no behavior change on the non-torn path.
-        #[allow(clippy::cast_possible_truncation)]
-        let rip = context_snapshot.Rip as usize;
         // Livelock breaker: if this exact `(rip, translated_rip)` pair has already been "healed"
         // via the `[rsp-8]`/`[rsp]`/GPR fixups below many times in a row with no forward progress,
         // something else keeps re-supplying the identical stale value from a slot those fixups
@@ -2798,6 +2829,14 @@ unsafe extern "system" fn vectored_exception_handler(
         /// re-enters this path millions of times, so one line per pass is a disk-filling flood, not
         /// a log.
         const AV_HEAL_LOG_SAMPLE_STRIDE: u32 = 8192;
+        // TORN-READ FIX (track-b sweep): `context_snapshot.Rip`, not a live re-read of
+        // `context.Rip` -- this value drives the whole stale-pointer healing decision tree below
+        // (`translate_stale_source_rip` and its three siblings), all real control flow. No write
+        // to `context.Rip` occurs on this path before this point, so the snapshot and the live
+        // value are still guaranteed identical here absent a torn read -- using the snapshot
+        // removes the torn-read hazard with no behavior change on the non-torn path.
+        #[allow(clippy::cast_possible_truncation)]
+        let rip = context_snapshot.Rip as usize;
         // Budget: [`on_single_step`]'s step bounds count only single-step traps, so a child that
         // keeps re-faulting on one pointer no healer can fix would stay in this path forever (one
         // Windows exception round-trip per pass, 99,455 passes observed in 2.5 minutes). Past the
@@ -2922,7 +2961,7 @@ unsafe extern "system" fn vectored_exception_handler(
                 _ => 1,
             };
             tls.fork_verify_av_data_repeat.set(Some((rip, occurrences)));
-            if occurrences <= 2 || occurrences % AV_HEAL_LOG_SAMPLE_STRIDE as u64 == 0 {
+            if occurrences <= 2 || occurrences % u64::from(AV_HEAL_LOG_SAMPLE_STRIDE) == 0 {
                 litebox_util_log::warn!(
                     host_pid:? = std::process::id(),
                     thread:? = std::thread::current().id(),
@@ -2989,7 +3028,7 @@ unsafe extern "system" fn vectored_exception_handler(
                         b"[diag_tf] tf_armed=0x",
                         tf_armed,
                         b" steps=0x",
-                        tls.fork_verify_step_count.get() as usize,
+                        word_as_usize(tls.fork_verify_step_count.get()),
                     );
                     #[allow(clippy::cast_possible_truncation)]
                     let resume_rip = context.Rip as usize;
@@ -3159,6 +3198,10 @@ unsafe extern "system" fn vectored_exception_handler(
     );
     let depth = tls.veh_depth.get() as usize;
     let slot = depth.min(EXC_RECORD_SLOTS.saturating_sub(1));
+    #[allow(
+        clippy::cast_ptr_alignment,
+        reason = "the slot is asserted aligned on the next line before any dereference"
+    )]
     let exception_record_ptr = tls
         .host_sp
         .get()
@@ -3268,6 +3311,23 @@ impl WindowsUserland {
     ///
     /// Panics if the TLS slot cannot be created.
     pub fn new() -> &'static Self {
+        // Watch for real console window resizes and deliver SIGWINCH. There is no Win32 resize
+        // *event* callback equivalent to `SetConsoleCtrlHandler` -- `GetConsoleScreenBufferInfo`
+        // polling on a dedicated thread is the standard approach (e.g. used by libuv/Node's own
+        // Windows tty backend). This deliberately does not touch `STD_INPUT_HANDLE` or the input
+        // event queue at all (unlike `ConsoleStdinReader`), so it cannot race with or steal
+        // events from the existing stdin reader thread -- `GetConsoleScreenBufferInfo` reads the
+        // *output* buffer's window-size state, a wholly separate API surface.
+        // Live cdb inspection of a real crash (`rsp` corrupted inside `ntdll!RtlDispatchException`,
+        // the same signature already root-caused to `exception_table::write_u8_fallible` failing to
+        // recover) showed OTHER real OS threads on this process whose call stacks read
+        // `console_resize_watcher_thread_body` -> ... -> `syscall_callback` -> `pty_ioctl` --
+        // i.e. a thread this closure spawned (with Rust's plain, unsized default stack, no
+        // `.stack_size()` call, unlike every properly-sized guest thread) is later reused to
+        // service a REAL guest syscall once its own polling loop returns/exits. Give it the same
+        // `GUEST_THREAD_STACK_SIZE` headroom every other guest-work-capable thread gets, closing
+        // that gap rather than leaving this one thread as the sole undersized exception.
+        const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
         // Resolve every exception-handler-reachable diagnostic gate now, while this is still
         // ordinary startup code. See [`VehGates`] for why doing it later -- lazily, from inside
         // the handler -- is not merely slower but unsafe.
@@ -3391,23 +3451,6 @@ impl WindowsUserland {
             }
         }
 
-        // Watch for real console window resizes and deliver SIGWINCH. There is no Win32 resize
-        // *event* callback equivalent to `SetConsoleCtrlHandler` -- `GetConsoleScreenBufferInfo`
-        // polling on a dedicated thread is the standard approach (e.g. used by libuv/Node's own
-        // Windows tty backend). This deliberately does not touch `STD_INPUT_HANDLE` or the input
-        // event queue at all (unlike `ConsoleStdinReader`), so it cannot race with or steal
-        // events from the existing stdin reader thread -- `GetConsoleScreenBufferInfo` reads the
-        // *output* buffer's window-size state, a wholly separate API surface.
-        // Live cdb inspection of a real crash (`rsp` corrupted inside `ntdll!RtlDispatchException`,
-        // the same signature already root-caused to `exception_table::write_u8_fallible` failing to
-        // recover) showed OTHER real OS threads on this process whose call stacks read
-        // `console_resize_watcher_thread_body` -> ... -> `syscall_callback` -> `pty_ioctl` --
-        // i.e. a thread this closure spawned (with Rust's plain, unsized default stack, no
-        // `.stack_size()` call, unlike every properly-sized guest thread) is later reused to
-        // service a REAL guest syscall once its own polling loop returns/exits. Give it the same
-        // `GUEST_THREAD_STACK_SIZE` headroom every other guest-work-capable thread gets, closing
-        // that gap rather than leaving this one thread as the sole undersized exception.
-        const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
         // Diagnostic (temporary, this investigation pass): LITEBOX_DIAG_NO_RESIZE_WATCHER=1 skips
         // spawning this thread entirely, to test whether it (or the SIGWINCH delivery it
         // performs) is ever a factor in the still-open "silent host crash on the 3rd fork" bug.
@@ -3748,13 +3791,13 @@ fn run_thread_inner(
     // for cross-thread TlsState address collisions -- see AGENTS.md's "DEFINITIVE (4th pass)"
     // entry, which found the earlier watchpoint captures never actually observed a second thread.
     if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+        use std::io::Write;
         eprintln!(
             "[diag-tls-addr] pid={} tid={:?} tls_state={:p}",
             std::process::id(),
             std::thread::current().id(),
             &tls_state,
         );
-        use std::io::Write;
         let _ = std::io::stderr().flush();
     }
 
@@ -4798,13 +4841,13 @@ fn thread_start(
         .set(std::ptr::from_mut(&mut ctx).wrapping_add(1));
 
     if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+        use std::io::Write;
         eprintln!(
             "[diag-tls-addr] pid={} tid={:?} tls_state={:p} (thread_start)",
             std::process::id(),
             std::thread::current().id(),
             &tls_state,
         );
-        use std::io::Write;
         let _ = std::io::stderr().flush();
     }
 
@@ -4825,6 +4868,7 @@ fn thread_start(
 
         #[cfg(target_arch = "x86_64")]
         if std::env::var_os("LITEBOX_DIAG_TLS_ADDR").is_some() {
+            use std::io::Write;
             eprintln!(
                 "[diag-tls-addr] pid={} tid={:?} init_thread.init() returned, about to run_thread_arch rip={:#x} rsp={:#x}",
                 std::process::id(),
@@ -4832,7 +4876,6 @@ fn thread_start(
                 ctx.rip,
                 ctx.rsp,
             );
-            use std::io::Write;
             let _ = std::io::stderr().flush();
         }
 
@@ -5265,14 +5308,6 @@ fn console_resize_watcher_thread_body() {
 /// mirroring the EXTERNAL `Stop-Process -Force` this investigation confirmed always works
 /// immediately against the same wedged PID.
 fn fault_terminate_watchdog_thread_body() {
-    if std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some() {
-        diag_raw_print(
-            b"[diag-watchdog-started] win_tid=0x",
-            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
-            b" pid=0x",
-            std::process::id() as usize,
-        );
-    }
     // Bounded, not a tight spin: this thread does nothing for the overwhelming majority of any
     // process's lifetime (only an unrecovered AV arms the flag at all), so a coarse poll interval
     // costs nothing while still resolving a real hang within a bounded, short, human-imperceptible
@@ -5284,6 +5319,14 @@ fn fault_terminate_watchdog_thread_body() {
     // wedged) is never raced or second-guessed, short enough that a real hang is still resolved
     // promptly rather than left indefinitely.
     const GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(3);
+    if std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some() {
+        diag_raw_print(
+            b"[diag-watchdog-started] win_tid=0x",
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() } as usize,
+            b" pid=0x",
+            std::process::id() as usize,
+        );
+    }
     // How many consecutive poll ticks the flag has been observed armed -- a simple tick COUNT
     // rather than a real timestamp, since `FAULT_TERMINATE_ARMED_TICK` is a process-wide
     // `AtomicU64` written by the (possibly wedged) faulting thread and read here from a genuinely
@@ -5306,7 +5349,7 @@ fn fault_terminate_watchdog_thread_body() {
         if std::env::var_os("LITEBOX_DIAG_WATCHDOG").is_some() {
             diag_raw_print(
                 b"[diag-watchdog-tick] armed_tick=0x",
-                armed_tick as usize,
+                word_as_usize(armed_tick),
                 b" armed_ticks_seen=0x",
                 armed_ticks_seen as usize,
             );
@@ -5337,7 +5380,7 @@ fn fault_terminate_watchdog_thread_body() {
         // the process is in a degraded state by the time this runs.
         diag_raw_print(
             b"[diag-fault-watchdog-terminate] armed_tick=0x",
-            armed_tick as usize,
+            word_as_usize(armed_tick),
             b" poll_ticks_waited=0x",
             armed_ticks_seen as usize,
         );
@@ -5776,7 +5819,7 @@ fn register_current_thread_stack() {
             out(reg) dealloc_stack,
         );
     }
-    let range = (dealloc_stack as usize)..(stack_base as usize);
+    let range = word_as_usize(dealloc_stack)..word_as_usize(stack_base);
     if range.is_empty() {
         return;
     }
@@ -6271,6 +6314,7 @@ impl ThreadHandle {
     ///    context to resume at the interrupt callback.
     /// 5. Resume the target thread.
     fn interrupt(&self, current: Option<&ThreadHandle>) {
+        const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 64;
         if diag_interrupt_enabled() {
             diag_raw_print(
                 b"[diag-interrupt-enter] caller_tid=0x",
@@ -6323,7 +6367,6 @@ impl ThreadHandle {
         let _ = diag_rip0_enabled();
         let _ = is_in_ntdll_or_this(0);
 
-        const MAX_ALLOCATOR_SUSPEND_RETRIES: u32 = 64;
         let mut attempt = 0u32;
         // Whether the retry budget ran out with the target still inside the global allocator.
         //
@@ -6548,7 +6591,7 @@ impl ThreadHandle {
                 // `Anonymous` view of the XMM registers is populated.
                 let regs = unsafe { &context.Anonymous.Anonymous };
                 let pack = |reg: &windows_sys::Win32::System::Diagnostics::Debug::M128A| {
-                    (u128::from(reg.High as u64) << 64) | u128::from(reg.Low)
+                    (u128::from(reg.High.cast_unsigned()) << 64) | u128::from(reg.Low)
                 };
                 target_tls.guest_xmm0_5.set([
                     pack(&regs.Xmm0),
@@ -6796,6 +6839,10 @@ struct WaiterQueue {
 
 impl WaiterQueue {
     const fn new() -> Self {
+        #[allow(
+            clippy::declare_interior_mutable_const,
+            reason = "used only as the array-repeat element for the waiter table; every slot receives its own copy, so the shared-const interior mutability is never observed"
+        )]
         const EMPTY: WaiterSlot = WaiterSlot::empty();
         Self {
             lock: core::sync::atomic::AtomicU32::new(0),
@@ -6883,8 +6930,10 @@ impl WaiterQueue {
                     // A holder in THIS process is a live thread of ours -- never steal, just wait.
                     // Only a holder whose whole host process is confirmed gone can be taken over,
                     // and only after a long spin, so ordinary contention never pays for a probe.
-                    if holder != me && spins & 0xFFF == 0x800 && Self::holder_process_dead(holder) {
-                        if self
+                    if holder != me
+                        && spins & 0xFFF == 0x800
+                        && Self::holder_process_dead(holder)
+                        && self
                             .lock
                             .compare_exchange(
                                 holder,
@@ -6893,13 +6942,12 @@ impl WaiterQueue {
                                 core::sync::atomic::Ordering::Relaxed,
                             )
                             .is_ok()
-                        {
-                            litebox_util_log::warn!(
-                                holder_pid:% = holder, me:% = me;
-                                "WaiterQueue::with_lock: holder process is dead, recovering the orphaned queue lock"
-                            );
-                            break;
-                        }
+                    {
+                        litebox_util_log::warn!(
+                            holder_pid:% = holder, me:% = me;
+                            "WaiterQueue::with_lock: holder process is dead, recovering the orphaned queue lock"
+                        );
+                        break;
                     }
                     spins = spins.wrapping_add(1);
                     core::hint::spin_loop();
@@ -7197,7 +7245,7 @@ impl RawMutex {
                 owner,
                 record.event as Win32_Foundation::HANDLE,
                 GetCurrentProcess(),
-                &mut local,
+                &raw mut local,
                 0,
                 0,
                 Win32_Foundation::DUPLICATE_SAME_ACCESS,
@@ -7224,12 +7272,22 @@ impl RawMutex {
         Some(local)
     }
 
-    #[expect(clippy::unnecessary_wraps)]
     fn block_or_maybe_timeout(
         &self,
         val: u32,
         timeout: Option<Duration>,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+        // Register-then-check under the SAME lock `wake_many` takes to check-then-pop: this is
+        // the lost-wakeup argument. Whichever of (this check) / (a concurrent release's value
+        // change followed by its `wake_many` call) happens second, while holding this lock,
+        // observes the other's effect -- there is no window in which this thread has "decided to
+        // wait" without yet being visible to a waker, because registering and checking are one
+        // critical section.
+        enum Registration {
+            AlreadyChanged,
+            Registered,
+            QueueFull,
+        }
         // `LITEBOX_DIAG_WAIT_DUR=1`: log requested-vs-actual duration for every wait whose
         // actual elapsed time is itself suspiciously long (>=1s), regardless of whether it timed
         // out or was woken. This is the decisive measurement for the "missed wakeup, rescued
@@ -7250,17 +7308,6 @@ impl RawMutex {
             event: event as isize,
         };
 
-        // Register-then-check under the SAME lock `wake_many` takes to check-then-pop: this is
-        // the lost-wakeup argument. Whichever of (this check) / (a concurrent release's value
-        // change followed by its `wake_many` call) happens second, while holding this lock,
-        // observes the other's effect -- there is no window in which this thread has "decided to
-        // wait" without yet being visible to a waker, because registering and checking are one
-        // critical section.
-        enum Registration {
-            AlreadyChanged,
-            Registered,
-            QueueFull,
-        }
         let registration = self.waiters.with_lock(|queue| {
             if self.inner.load(Ordering::SeqCst) != val {
                 Registration::AlreadyChanged
@@ -7392,9 +7439,9 @@ impl RawMutex {
                     let holder = self.holder_pid.load(Ordering::Relaxed);
                     // `val == 2` is the contended state of a `litebox::sync::Mutex` (futex-style
                     // waits pass other values), so holder 0 there means an orphaned lock.
-                    if (holder != 0 || val == 2) && idle_chunks % 15 == 0 {
+                    if (holder != 0 || val == 2) && idle_chunks.is_multiple_of(15) {
                         litebox_util_log::warn!(
-                            lock:% = (self as *const Self as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
+                            lock:% = (core::ptr::from_ref(self) as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
                             holder_tid:% = self.holder_tid.load(Ordering::Relaxed),
                             waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
                             my_pid:% = std::process::id();
@@ -7429,7 +7476,7 @@ impl RawMutex {
                     // the state this waiter is waiting for (`inner != val`) is genuinely not
                     // changing -- a lock holder that never releases, or an orphaned lock.
                     if diag_lockstall
-                        && idle_chunks % 15 == 0
+                        && idle_chunks.is_multiple_of(15)
                         && (idle_chunks / 15).is_power_of_two()
                     {
                         let (queued, occupied) = self
@@ -7443,7 +7490,7 @@ impl RawMutex {
                                 == Win32_Foundation::WAIT_OBJECT_0
                         };
                         litebox_util_log::warn!(
-                            lock:% = (self as *const Self as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
+                            lock:% = (core::ptr::from_ref(self) as usize), val:% = val, now:% = self.inner.load(Ordering::Relaxed), holder_pid:% = holder,
                             holder_tid:% = self.holder_tid.load(Ordering::Relaxed),
                             waited_s:% = u64::from(idle_chunks) * LIVENESS_CHECK_INTERVAL.as_secs(),
                             wall_ms:? = start.map(|s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -7455,7 +7502,7 @@ impl RawMutex {
                         );
                         if diag_lockstall_trace_enabled() && idle_chunks == 15 {
                             litebox_util_log::warn!(
-                                lock:% = (self as *const Self as usize),
+                                lock:% = (core::ptr::from_ref(self) as usize),
                                 tid:? = std::thread::current().id(),
                                 thread:? = std::thread::current().name(),
                                 guest_syscall:% = CURRENT_GUEST_SYSCALL.with(|s| {
@@ -7499,6 +7546,10 @@ impl RawMutex {
     /// `LIVENESS_CHECK_INTERVAL` chunk timeouts (which are not real timeouts at all, see that
     /// loop's own comment) share this exact, pre-existing race-resolution logic with the real one,
     /// unchanged from before this method was split out.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "keeps the Result shape shared with the sibling wait paths, whose call sites chain the result with map and break"
+    )]
     fn finish_real_timeout(
         &self,
         record: WaiterRecord,
@@ -7751,10 +7802,10 @@ impl RawMutex {
                 QueueFullPoll::Registered => return None,
                 QueueFullPoll::StillFull => {}
             }
-            if let Some(deadline) = deadline {
-                if std::time::Instant::now() >= deadline {
-                    return Some(UnblockedOrTimedOut::TimedOut);
-                }
+            if let Some(deadline) = deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Some(UnblockedOrTimedOut::TimedOut);
             }
             let now = std::time::Instant::now();
             if now.duration_since(last_liveness_check) >= LIVENESS_CHECK_INTERVAL {
@@ -7818,9 +7869,8 @@ fn warn_waiter_queue_full() {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let window = QUEUE_FULL_WARN_INTERVAL.as_millis() as u64;
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let window = u64::try_from(QUEUE_FULL_WARN_INTERVAL.as_millis()).unwrap_or(u64::MAX);
     let last = LAST.load(Ordering::Relaxed);
     if last != 0 && now_ms.saturating_sub(last) < window {
         return;
@@ -7922,14 +7972,14 @@ fn diag_lockstall_trace_enabled() -> bool {
     })
 }
 
-/// The guest syscall this host thread is currently executing, as `(number, arg0, arg1, arg2)`.
-///
-/// A `[diag-lockstall-trace]` backtrace names the call site but not the operands, and the operand
-/// is the whole question once the call site is known to be `read(2)`: `arg0` is the fd, which is
-/// what distinguishes "blocked on the child's stdout" from "blocked on the fork/exec error pipe".
-/// Recorded on the guest thread in `syscall_handler` (the one place every guest syscall passes
-/// through) and read back by the lockstall report, which runs on that same thread further down
-/// its own stack. Host threads that never run guest code keep the initial `(0, 0, 0, 0)`.
+// The guest syscall this host thread is currently executing, as `(number, arg0, arg1, arg2)`.
+//
+// A `[diag-lockstall-trace]` backtrace names the call site but not the operands, and the operand
+// is the whole question once the call site is known to be `read(2)`: `arg0` is the fd, which is
+// what distinguishes "blocked on the child's stdout" from "blocked on the fork/exec error pipe".
+// Recorded on the guest thread in `syscall_handler` (the one place every guest syscall passes
+// through) and read back by the lockstall report, which runs on that same thread further down
+// its own stack. Host threads that never run guest code keep the initial `(0, 0, 0, 0)`.
 thread_local! {
     static CURRENT_GUEST_SYSCALL: std::cell::Cell<(u64, u64, u64, u64)> =
         const { std::cell::Cell::new((0, 0, 0, 0)) };
@@ -8800,6 +8850,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         let _ = can_grow_down;
 
         if suggested_range.start != 0 {
+            struct AdvLockTimer(std::time::Instant, usize, std::time::Duration);
+            impl Drop for AdvLockTimer {
+                fn drop(&mut self) {
+                    let held = self.0.elapsed();
+                    // Only report acquisitions that actually cost something, so the
+                    // common fast path does not flood the log and skew the run.
+                    if held.as_millis() >= 50 || self.2.as_millis() >= 50 {
+                        litebox_util_log::debug!(
+                            held_ms:% = held.as_millis(),
+                            waited_ms:% = self.2.as_millis(),
+                            len:% = self.1;
+                            "diag-lockhold: ALLOCATE_PAGES_FIXED_ADDR_LOCK"
+                        );
+                    }
+                }
+            }
             assert!(suggested_range.start >= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MIN);
             assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
@@ -8832,22 +8898,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let adv_waited = adv_wait_start.elapsed();
             let adv_hold_start = std::time::Instant::now();
-            struct AdvLockTimer(std::time::Instant, usize, std::time::Duration);
-            impl Drop for AdvLockTimer {
-                fn drop(&mut self) {
-                    let held = self.0.elapsed();
-                    // Only report acquisitions that actually cost something, so the
-                    // common fast path does not flood the log and skew the run.
-                    if held.as_millis() >= 50 || self.2.as_millis() >= 50 {
-                        litebox_util_log::debug!(
-                            held_ms:% = held.as_millis(),
-                            waited_ms:% = self.2.as_millis(),
-                            len:% = self.1;
-                            "diag-lockhold: ALLOCATE_PAGES_FIXED_ADDR_LOCK"
-                        );
-                    }
-                }
-            }
             let _adv_lock_timer = AdvLockTimer(
                 adv_hold_start,
                 suggested_range.end - suggested_range.start,
@@ -9144,6 +9194,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         }) != 0
                                     } else {
                                         fn decommit_bisecting(range: core::ops::Range<usize>) -> bool {
+                                            // A single page can't be split further; nothing left to try.
+                                            // Use the fixed 4 KiB Windows page granularity here (not
+                                            // the outer `ALIGN` const, which nested `fn`s can't see) --
+                                            // any multiple of the true page size is a valid split point.
+                                            const PAGE: usize = 0x1000;
                                             if range.is_empty() {
                                                 return true;
                                             }
@@ -9163,11 +9218,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                             {
                                                 return false;
                                             }
-                                            // A single page can't be split further; nothing left to try.
-                                            // Use the fixed 4 KiB Windows page granularity here (not
-                                            // the outer `ALIGN` const, which nested `fn`s can't see) --
-                                            // any multiple of the true page size is a valid split point.
-                                            const PAGE: usize = 0x1000;
                                             if range.len() <= PAGE {
                                                 return false;
                                             }
@@ -9244,11 +9294,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                     // (`MEM_FREE` reports `Protect == 0`, not a legal commit
                                     // protection either.)
                                     let anon_prot = match view_mbi.Protect {
-                                        Win32_Memory::PAGE_WRITECOPY => Win32_Memory::PAGE_READWRITE,
+                                        0 | Win32_Memory::PAGE_WRITECOPY => Win32_Memory::PAGE_READWRITE,
                                         Win32_Memory::PAGE_EXECUTE_WRITECOPY => {
                                             Win32_Memory::PAGE_EXECUTE_READWRITE
                                         }
-                                        0 => Win32_Memory::PAGE_READWRITE,
                                         other => other,
                                     };
                                     let reserved_whole = view_span.clone().is_some_and(|span| {
@@ -9836,7 +9885,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     static REFUSED: core::sync::atomic::AtomicU32 =
                         core::sync::atomic::AtomicU32::new(0);
                     let refused = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    if refused % 64 == 0 {
+                    if refused.is_multiple_of(64) {
                         litebox_util_log::error!(
                             start:% = r.start, end:% = r.end, len:% = r.len(),
                             mbi_state:% = mbi.State, mbi_type:% = mbi.Type,
@@ -10420,6 +10469,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         name: &str,
         size: usize,
     ) -> Result<Self::SharedMemoryHandle, SharedMemoryError> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem as Win32_Storage;
         // A file-backed section is what makes a SysV segment outlive its attachers: the object
         // `create_named_shared_memory` returns is pagefile-backed, so it (and every byte written
         // through it) disappears as soon as the last process holding a HANDLE on it exits, while
@@ -10439,8 +10490,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             );
             return Err(SharedMemoryError::OutOfMemory);
         }
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem as Win32_Storage;
         // `access_mode` (not `.read()`/`.write()`) because the section's protection CEILING is
         // decided by the rights this handle carries: `map_shared_memory` maps every shared view
         // with the widest permissions it could ever need (READ|WRITE|EXEC, so the guest can
@@ -10477,7 +10526,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // takes the `current >= size` branch and never disturbs the bytes already in it. Growing
         // it here is also exactly right for a brand-new segment -- a fresh SysV segment reads as
         // zeroes, and extending a file zero-fills the new tail.
-        let current = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let current = file.metadata().map_or(0, |meta| meta.len());
         if current < size as u64 && file.set_len(size as u64).is_err() {
             litebox_util_log::error!(
                 name:% = name, size:% = size;
@@ -10563,15 +10612,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // same bytes -- exactly `shmctl(IPC_RMID)`'s contract. A failure here (the usual one is
         // `ERROR_USER_MAPPED_FILE`, an attacher that has not detached yet) is normal and
         // retryable, not a fault worth surfacing to the guest.
-        match std::fs::remove_file(&path) {
-            Ok(()) => true,
-            Err(_) => {
-                litebox_util_log::debug!(
-                    name:% = name;
-                    "diag-shm: sysvshm backing file still referenced, unlink deferred"
-                );
-                false
-            }
+        if let Ok(()) = std::fs::remove_file(&path) {
+            true
+        } else {
+            litebox_util_log::debug!(
+                name:% = name;
+                "diag-shm: sysvshm backing file still referenced, unlink deferred"
+            );
+            false
         }
     }
 
@@ -10582,6 +10630,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         initial_permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, SharedMemoryError> {
+        // `Hint` means the platform may pick a different address if the hint isn't available
+        // (matching `allocate_pages`'s handling of the same case): retry with no address hint
+        // rather than surfacing an address collision as an error.
+        //
+        // ONLY an address-class failure is retried. In particular `ERROR_ACCESS_DENIED` (5) is
+        // NOT one: `MapViewOfFile3` answers that when the requested VIEW LENGTH EXCEEDS THE
+        // SECTION'S SIZE, and no choice of base address can change that -- retrying is a futile
+        // second syscall that also doubled every real occurrence of this in the log (live: the
+        // `win32_err=1132` / `win32_err=5` error pairs, both from this one attach attempt). A
+        // too-long view is the caller's bug (a mapping grown past the size its object was created
+        // with), and it is now surfaced once, as the real capacity failure it is.
+        const ERROR_INVALID_ADDRESS: u32 = 487;
         debug_assert_alignment!(suggested_range, ALIGN);
         // Mirrors `allocate_pages`'s `reserve_and_commit` null-address branch (see
         // `HOST_ALLOCATOR_REGION_MIN`'s doc comment): when no hint address is available (either
@@ -10650,18 +10710,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             suggested_range.start as *const c_void
         };
         let mut view = try_map(base_addr, base_addr.is_null());
-        // `Hint` means the platform may pick a different address if the hint isn't available
-        // (matching `allocate_pages`'s handling of the same case): retry with no address hint
-        // rather than surfacing an address collision as an error.
-        //
-        // ONLY an address-class failure is retried. In particular `ERROR_ACCESS_DENIED` (5) is
-        // NOT one: `MapViewOfFile3` answers that when the requested VIEW LENGTH EXCEEDS THE
-        // SECTION'S SIZE, and no choice of base address can change that -- retrying is a futile
-        // second syscall that also doubled every real occurrence of this in the log (live: the
-        // `win32_err=1132` / `win32_err=5` error pairs, both from this one attach attempt). A
-        // too-long view is the caller's bug (a mapping grown past the size its object was created
-        // with), and it is now surfaced once, as the real capacity failure it is.
-        const ERROR_INVALID_ADDRESS: u32 = 487;
         let mut first_err = 0u32;
         if view.Value.is_null() && !base_addr.is_null() {
             first_err = unsafe { GetLastError() };
@@ -10687,7 +10735,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             // a view length larger than the section this handle was created with -- and the
             // default log level is `warn`, which drops the debug line entirely.
             litebox_util_log::error!(
-                handle:% = handle as usize, pid:% = std::process::id(), win32_err:% = err,
+                handle:% = handle, pid:% = std::process::id(), win32_err:% = err,
                 base_addr:% = base_addr as usize, len:% = suggested_range.len(),
                 first_err:% = first_err;
                 "diag-shm: map_shared_memory FAILED"
@@ -10740,7 +10788,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 usize::MAX // not sampled
             };
             litebox_util_log::debug!(
-                handle:% = handle as usize,
+                handle:% = handle,
                 pid:% = std::process::id(),
                 addr:% = view.Value as usize,
                 size:% = suggested_range.len(),
@@ -10759,10 +10807,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 let mut live = ADV_SHM_VIEWS
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                live.entry(handle as usize)
-                    .or_insert_with(Vec::new)
+                live.entry(handle)
+                    .or_default()
                     .push((view.Value as usize, suggested_range.len()));
-                if let Some(views) = live.get(&(handle as usize))
+                if let Some(views) = live.get(&handle)
                     && views.len() > 1
                 {
                     let readings: Vec<(usize, usize)> = views
@@ -10778,7 +10826,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     let distinct: std::collections::BTreeSet<usize> =
                         readings.iter().map(|(_, n)| *n).collect();
                     litebox_util_log::debug!(
-                        handle:% = handle as usize,
+                        handle:% = handle,
                         views:? = readings,
                         agree:? = distinct.len() == 1;
                         "diag-shm-crossview"
@@ -10840,6 +10888,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             )
         } != 0;
         if !ok {
+            // Map the REAL Windows error code to the closest `SharedMemoryError` variant instead
+            // of collapsing every failure into a generic `Unaligned` -- a future diagnostic (this
+            // fix's own motivating case: `remove_mapping` calling this with a stale, shrunken
+            // base address) sees which platform-level failure actually happened, not just a
+            // blanket "unaligned" label that was never true in the first place.
+            // `ERROR_INVALID_ADDRESS` (0x1e7 / 487): the given `range.start` is not a view's real
+            // original base -- closest existing variant is `AddressInUse` (this call's `range`
+            // argument IS an address, and this is fundamentally an address-validity failure, not
+            // an alignment one).
+            const ERROR_INVALID_ADDRESS: u32 = 487;
+            // `ERROR_NOT_ENOUGH_MEMORY`/`ERROR_OUTOFMEMORY`: genuine resource exhaustion.
+            const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+            const ERROR_OUTOFMEMORY: u32 = 14;
             // AGENTS.md pass 255-256: this branch previously reported every failure as
             // `SharedMemoryError::Unaligned` regardless of the REAL Windows error, swallowing
             // the actual cause -- surfaced live as a confusing `UnmapError(Unaligned)` panic
@@ -10856,19 +10917,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 b" win_err=0x",
                 win_err as usize,
             );
-            // Map the REAL Windows error code to the closest `SharedMemoryError` variant instead
-            // of collapsing every failure into a generic `Unaligned` -- a future diagnostic (this
-            // fix's own motivating case: `remove_mapping` calling this with a stale, shrunken
-            // base address) sees which platform-level failure actually happened, not just a
-            // blanket "unaligned" label that was never true in the first place.
-            // `ERROR_INVALID_ADDRESS` (0x1e7 / 487): the given `range.start` is not a view's real
-            // original base -- closest existing variant is `AddressInUse` (this call's `range`
-            // argument IS an address, and this is fundamentally an address-validity failure, not
-            // an alignment one).
-            const ERROR_INVALID_ADDRESS: u32 = 487;
-            // `ERROR_NOT_ENOUGH_MEMORY`/`ERROR_OUTOFMEMORY`: genuine resource exhaustion.
-            const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
-            const ERROR_OUTOFMEMORY: u32 = 14;
             return Err(match win_err {
                 ERROR_INVALID_ADDRESS => SharedMemoryError::AddressInUse,
                 ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY => SharedMemoryError::OutOfMemory,
@@ -10971,11 +11019,6 @@ impl ConsoleStdinReader {
     /// process, leaked for its lifetime), so every real caller already has one.
     fn get(platform: &'static WindowsUserland) -> &'static Self {
         platform.console_stdin_reader.get_or_init(|| {
-            let reader = ConsoleStdinReader {
-                buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
-                ready: std::sync::Condvar::new(),
-                eof: core::sync::atomic::AtomicBool::new(false),
-            };
             // Same-sized as every other guest-work-capable thread (see the sibling
             // `litebox-console-resize-watcher` thread's own stack-size fix, above in this file, for
             // why): this thread's blocking `ReadFile` loop can be interrupted and its underlying OS
@@ -10985,6 +11028,11 @@ impl ConsoleStdinReader {
             // lazily-spawned background thread (`sys_write`'s own prologue faulting on a plain
             // stack-relative store under heavy `fork_verify` load).
             const GUEST_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
+            let reader = ConsoleStdinReader {
+                buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: std::sync::Condvar::new(),
+                eof: core::sync::atomic::AtomicBool::new(false),
+            };
             std::thread::Builder::new()
                 .name("litebox-console-stdin-reader".to_owned())
                 .stack_size(GUEST_THREAD_STACK_SIZE)
@@ -11164,10 +11212,6 @@ impl ConsoleStdinReader {
 /// than calling `ReadFile` itself. For a pipe/regular file, `ReadFile` remains safe to call
 /// directly (no cooked-read desync applies to non-console handles), so this still issues it inline
 /// for those, preserving the original direct-call behavior and error handling.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "mirrors StdioProvider::read_from_stdin's Result signature (and write_to_raw_handle's shape) even though every current failure path here maps to Ok(0)/EOF rather than a real Err; keeps the two raw-handle helpers symmetric and leaves room for a genuine error case without a signature change"
-)]
 fn read_from_raw_handle(
     platform: &'static WindowsUserland,
     buf: &mut [u8],
@@ -11474,6 +11518,7 @@ pub fn shm_section_handle(name: &str) -> Option<usize> {
 
 /// Serialize `regions` into the string [`FORK_CHILD_SHARED_REGIONS_ENV_VAR`] carries.
 pub(crate) fn encode_fork_shared_regions(regions: &[SharedRegionCarry]) -> std::string::String {
+    use std::fmt::Write as _;
     let mut out = std::string::String::new();
     for (i, r) in regions.iter().enumerate() {
         if i != 0 {
@@ -11483,7 +11528,8 @@ pub(crate) fn encode_fork_shared_regions(regions: &[SharedRegionCarry]) -> std::
             SharedObjectKind::Named => "N",
             SharedObjectKind::FileBacked => "F",
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "{:x}:{:x}:{:x}:{:x}:{:x}:{}:{}",
             r.range.start,
             r.range.end,
@@ -11492,7 +11538,7 @@ pub(crate) fn encode_fork_shared_regions(regions: &[SharedRegionCarry]) -> std::
             r.perms.bits(),
             kind,
             hex(r.name.as_str().as_bytes()),
-        ));
+        );
     }
     out
 }
@@ -11506,7 +11552,7 @@ fn hex(bytes: &[u8]) -> std::string::String {
 }
 
 fn unhex(s: &str) -> Option<alloc::vec::Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -11825,7 +11871,7 @@ fn raw_env_is_set(name: &[u8]) -> bool {
         windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
             name.as_ptr(),
             buf.as_mut_ptr(),
-            buf.len() as u32,
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
         )
     }
 }
@@ -11844,7 +11890,7 @@ fn raw_env_read_usize(name: &[u8]) -> Option<usize> {
         windows_sys::Win32::System::Environment::GetEnvironmentVariableA(
             name.as_ptr(),
             buf.as_mut_ptr(),
-            buf.len() as u32,
+            u32::try_from(buf.len()).unwrap_or(u32::MAX),
         )
     };
     if len == 0 || len as usize >= buf.len() {
@@ -11915,7 +11961,7 @@ unsafe extern "system" fn last_chance_crash_dump_filter(
         let rec = unsafe { &*(*exception_info).ExceptionRecord };
         diag_raw_print(
             b"[diag-last-chance] code=0x",
-            rec.ExceptionCode as u32 as usize,
+            rec.ExceptionCode.cast_unsigned() as usize,
             b" addr=0x",
             rec.ExceptionAddress as usize,
         );
@@ -11947,7 +11993,12 @@ fn write_crash_minidump(exception_info: *mut EXCEPTION_POINTERS) {
     // the same reason the ring dump allocates nothing -- the heap is not trustworthy here, and on
     // a stack-exhaustion fault neither is a large frame.
     let mut path = [0u16; 320];
-    let temp_len = unsafe { GetTempPathW(path.len() as u32 - 64, path.as_mut_ptr()) } as usize;
+    let temp_len = unsafe {
+        GetTempPathW(
+            u32::try_from(path.len()).unwrap_or(u32::MAX) - 64,
+            path.as_mut_ptr(),
+        )
+    } as usize;
     // `GetTempPathW` returns 0 on failure; fall back to the current directory, which is always a
     // legal relative path, rather than giving up on the dump entirely.
     let mut pos = if temp_len == 0 || temp_len >= path.len() - 64 {
@@ -12068,6 +12119,9 @@ fn fmt_usize_hex(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
 // opposed to a raw guest-code store that never goes through litebox at all. Remove once the
 // investigation concludes.
 pub fn install_memcpy_watch_from_env() {
+    fn hook(dst: usize, size: usize) {
+        diag_raw_print(b"[memcpy-watch] dst=0x", dst, b" size=0x", size);
+    }
     let Some(spec) = std::env::var_os("LITEBOX_MEMCPY_WATCH") else {
         return;
     };
@@ -12081,9 +12135,6 @@ pub fn install_memcpy_watch_from_env() {
     ) else {
         return;
     };
-    fn hook(dst: usize, size: usize) {
-        diag_raw_print(b"[memcpy-watch] dst=0x", dst, b" size=0x", size);
-    }
     unsafe {
         litebox::mm::exception_table::set_memcpy_watch_range(start, end, Some(hook));
     }
@@ -12432,7 +12483,7 @@ pub(crate) const FORK_CHILD_SHARED_HEAP_BASE_ENV_VAR: &str =
 /// since `spawn_process_fork_child` wires the child's stderr into the parent's) is the most direct
 /// possible evidence the two processes are looking at the SAME physical pages through this
 /// section, not two independent copies.
-const SHARED_HEAP_PROBE_MAGIC: usize = 0xC0FF_EE00_DEAD_BEEF_u64 as usize;
+const SHARED_HEAP_PROBE_MAGIC: usize = word_as_usize(0xC0FF_EE00_DEAD_BEEF);
 
 /// Reserves and maps the fixed-base shared kernel heap on this process's first host allocation.
 ///
@@ -12444,6 +12495,7 @@ const SHARED_HEAP_PROBE_MAGIC: usize = 0xC0FF_EE00_DEAD_BEEF_u64 as usize;
 /// A losing thread spins on [`SHARED_KERNEL_HEAP_STATE`] rather than blocking, for the same
 /// reason.
 fn init_shared_kernel_heap() {
+    const MAX_ATTEMPTS: u32 = 8;
     loop {
         match SHARED_KERNEL_HEAP_STATE.compare_exchange(
             SHARED_KERNEL_HEAP_STATE_UNINIT,
@@ -12579,7 +12631,6 @@ fn init_shared_kernel_heap() {
     let size_u64 = SHARED_KERNEL_HEAP_SIZE as u64;
     // Intentional truncation: `CreateFileMappingW` takes the 64-bit size split into high/low
     // 32-bit halves, not a single 64-bit parameter (same pattern as `create_shared_memory`).
-    #[expect(clippy::cast_possible_truncation)]
     let size_high = (size_u64 >> 32) as u32;
     #[expect(clippy::cast_possible_truncation)]
     let size_low = size_u64 as u32;
@@ -12590,7 +12641,6 @@ fn init_shared_kernel_heap() {
     // number of times with a short backoff before giving up (this project's own "bounded retry,
     // then surface" standard) rather than a single transient failure `abort()`ing the whole fork
     // child outright (guest-visible as an unexplained `Killed`).
-    const MAX_ATTEMPTS: u32 = 8;
     let mut section = core::ptr::null_mut();
     let mut last_err: u32 = 0;
     for attempt in 0..MAX_ATTEMPTS {
@@ -12796,6 +12846,7 @@ fn init_shared_kernel_heap() {
 /// be marked inheritable, in which case the caller falls back to letting the child create its own
 /// private section, exactly as it did before this pass.
 pub(crate) fn shared_kernel_heap_export_for_fork_child() -> Option<(usize, usize)> {
+    const HANDLE_FLAG_INHERIT: u32 = 1;
     if SHARED_KERNEL_HEAP_STATE.load(Ordering::Acquire) != SHARED_KERNEL_HEAP_STATE_READY {
         init_shared_kernel_heap();
     }
@@ -12807,7 +12858,6 @@ pub(crate) fn shared_kernel_heap_export_for_fork_child() -> Option<(usize, usize
     if handle_val == 0 {
         return None;
     }
-    const HANDLE_FLAG_INHERIT: u32 = 1;
     // SAFETY: `handle_val` is this process's own live section handle (either just created or
     // already inherited from an earlier fork), never closed for the process's lifetime -- see
     // `init_shared_kernel_heap`'s own "the section handle is never closed" comment.
@@ -12911,7 +12961,7 @@ pub fn diag_private_memory_breakdown(tag: &str) {
             });
     }
     let mut totals: std::collections::BTreeMap<(&'static str, u32), (u64, u64, u64)> =
-        Default::default();
+        std::collections::BTreeMap::default();
     let mut largest: Vec<(usize, usize, u32, &'static str, u64)> = Vec::new();
     let mut addr: usize = 0;
     let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
@@ -12981,7 +13031,7 @@ pub fn diag_private_memory_breakdown(tag: &str) {
             );
         }
     }
-    largest.sort_by(|a, b| b.1.cmp(&a.1));
+    largest.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (base, size, prot, kind, resident) in largest.iter().take(14) {
         eprintln!(
             "[mem_breakdown]   top {kind} base={base:#x} size={}MB resident={}MB prot={prot:#x}",
@@ -13017,7 +13067,8 @@ fn diag_resident_bytes(base: usize, size: usize) -> u64 {
             windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(
                 windows_sys::Win32::System::Threading::GetCurrentProcess(),
                 batch.as_mut_ptr().cast::<c_void>(),
-                (batch.len() * core::mem::size_of::<WorkingSetEx>()) as u32,
+                u32::try_from(batch.len() * core::mem::size_of::<WorkingSetEx>())
+                    .unwrap_or(u32::MAX),
             )
         };
         if ok == 0 {
@@ -13786,7 +13837,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             let n = unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
                     1,
-                    frames.len() as u32,
+                    u32::try_from(frames.len()).unwrap_or(u32::MAX),
                     frames.as_mut_ptr(),
                     core::ptr::null_mut(),
                 )
@@ -13810,18 +13861,18 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
             }
         }
 
-        if diag_alloc_enabled() {
-            if let Some((addr, _)) = result {
-                let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-                let offset = addr.wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
-                diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
-                diag_raw_print(
-                    b"[diag_alloc]   size=0x",
-                    size,
-                    b" layout_size=0x",
-                    layout.size(),
-                );
-            }
+        if diag_alloc_enabled()
+            && let Some((addr, _)) = result
+        {
+            let n = DIAG_ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            let offset = addr.wrapping_sub(HOST_ALLOCATOR_REGION_MIN);
+            diag_raw_print(b"[diag_alloc] n=0x", n, b" off=0x", offset);
+            diag_raw_print(
+                b"[diag_alloc]   size=0x",
+                size,
+                b" layout_size=0x",
+                layout.size(),
+            );
         }
         result
     }
@@ -13974,7 +14025,7 @@ unsafe extern "C-unwind" fn exception_handler(
                     let queried = unsafe {
                         Win32_Memory::VirtualQuery(
                             faulting_address as *const c_void,
-                            &mut mbi,
+                            &raw mut mbi,
                             core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
                         )
                     };
@@ -14027,7 +14078,7 @@ unsafe extern "C-unwind" fn exception_handler(
             // `STATUS_SINGLE_STEP`: SIGTRAP, as Linux' #DB handler raises TF-step traps.
             (Exception::BREAKPOINT, 0, 0)
         }
-        code if (0xc000008e..=0xc0000093).contains(&(code as u32)) => {
+        code if (0xc000008e..=0xc0000093).contains(&(code.cast_unsigned())) => {
             // The `STATUS_FLOAT_*` family: SIGFPE, as Linux' #MF handler raises for an unmasked
             // floating-point trap.
             (Exception::DIVIDE_ERROR, 0, 0)
@@ -14037,7 +14088,7 @@ unsafe extern "C-unwind" fn exception_handler(
             // loops on a trap it cannot handle must not bury the log (standing repo rule).
             static UNHANDLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let seen = UNHANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if seen < 8 || seen % 1024 == 0 {
+            if seen < 8 || seen.is_multiple_of(1024) {
                 litebox_util_log::error!(
                     code:% = code, seen:% = seen + 1;
                     "unhandled Win32 exception code; delivering SIGSEGV to the guest"
@@ -14203,8 +14254,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // healing pass"; the deadlock it feared is same-thread re-entry, which the depth count now
         // handles directly, so waiting for a DIFFERENT thread's bounded healing pass is simply
         // correct rather than dangerous.
-        let guard = lock_fork_verify_heal_reentrant();
-        guard
+        lock_fork_verify_heal_reentrant()
     }
 
     fn current_thread_fork_relocations(&self) -> Option<Arc<litebox::mm::AddressRelocations>> {
@@ -14486,32 +14536,31 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                 .get_or_insert_with(Default::default)
                 .get(&host_pid)
                 .copied();
-            let handle = match cached {
-                Some(h) => h,
-                None => {
-                    let name = signal_wake_event_name(host_pid);
-                    let event = unsafe {
-                        Win32_Threading::OpenEventW(
-                            Win32_Threading::EVENT_MODIFY_STATE,
-                            0,
-                            name.as_ptr(),
-                        )
-                    };
-                    if event.is_null() {
-                        return false;
-                    }
-                    let mut map = HANDLES.lock().unwrap();
-                    let map = map.get_or_insert_with(Default::default);
-                    if map.len() >= 256 {
-                        for (_, stale) in map.drain() {
-                            unsafe {
-                                Win32_Foundation::CloseHandle(stale as _);
-                            }
+            let handle = if let Some(h) = cached {
+                h
+            } else {
+                let name = signal_wake_event_name(host_pid);
+                let event = unsafe {
+                    Win32_Threading::OpenEventW(
+                        Win32_Threading::EVENT_MODIFY_STATE,
+                        0,
+                        name.as_ptr(),
+                    )
+                };
+                if event.is_null() {
+                    return false;
+                }
+                let mut map = HANDLES.lock().unwrap();
+                let map = map.get_or_insert_with(Default::default);
+                if map.len() >= 256 {
+                    for (_, stale) in map.drain() {
+                        unsafe {
+                            Win32_Foundation::CloseHandle(stale as _);
                         }
                     }
-                    map.insert(host_pid, event as usize);
-                    event as usize
                 }
+                map.insert(host_pid, event as usize);
+                event as usize
             };
             if unsafe { Win32_Threading::SetEvent(handle as _) } != 0 {
                 return true;
@@ -14671,8 +14720,7 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
             use litebox::platform::RawConstPointer as _;
             const PAGE: usize = litebox::mm::linux::PAGE_SIZE;
             let len = range.len();
-            let mut out = std::vec::Vec::new();
-            out.resize(len, 0u8);
+            let mut out = vec![0u8; len];
             let mut any_readable = false;
             let mut off = 0usize;
             while off < len {
@@ -14870,6 +14918,48 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         argv: &[alloc::ffi::CString],
         envp: &[alloc::ffi::CString],
     ) -> Option<litebox::platform::ExecCollisionChildResult> {
+        // A per-call sequence number, not just this process's own pid: several guest THREADS of
+        // this SAME process can each hit their own collision and call this concurrently, and a
+        // pid-only name would let two of them share one file, each truncating/overwriting the
+        // other's write mid-flight. Same pattern as `export_parent_writable_layer_for_child`'s
+        // own `SEQ` for the identical reason.
+        static EXEC_COLLISION_SEQ: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        const EXEC_COLLISION_POLL_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(500);
+        const EXEC_COLLISION_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+        const EXEC_COLLISION_ABSOLUTE_CAP: std::time::Duration =
+            std::time::Duration::from_secs(120);
+
+        fn child_cpu_time_100ns(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+            let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
+            let mut user = windows_sys::Win32::Foundation::FILETIME::default();
+            let ok = unsafe {
+                windows_sys::Win32::System::Threading::GetProcessTimes(
+                    handle,
+                    &raw mut creation,
+                    &raw mut exit,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            };
+            if ok == 0 {
+                return None;
+            }
+            let as_u64 = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
+                (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+            };
+            Some(as_u64(kernel) + as_u64(user))
+        }
+
+        // Same threshold and reasoning as `run_external_fault_watchdog_child`'s own
+        // `MEANINGFUL_CPU_DELTA_100NS`: a real tick of scheduler/measurement noise, not
+        // a claim of genuine work, so only a delta clearly above it resets the stall
+        // clock.
+        const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
+
         let exe = std::env::current_exe().ok()?;
         let mut cmd = std::process::Command::new(exe);
 
@@ -14914,13 +15004,6 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // would silently become part of the GUEST's own argv instead of being parsed as a flag
         // at all. Confirmed live: exactly that, no error, `cli_args.export_writable_layer` stayed
         // `None`, and nothing was ever written.
-        // A per-call sequence number, not just this process's own pid: several guest THREADS of
-        // this SAME process can each hit their own collision and call this concurrently, and a
-        // pid-only name would let two of them share one file, each truncating/overwriting the
-        // other's write mid-flight. Same pattern as `export_parent_writable_layer_for_child`'s
-        // own `SEQ` for the identical reason.
-        static EXEC_COLLISION_SEQ: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
         let export_path = std::env::temp_dir().join(format!(
             "litebox-execwrite-{}-{}.tar",
             std::process::id(),
@@ -15022,34 +15105,6 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
         // `SIGSEGV`, which its own supervisor loop already respawns) is strictly better than an
         // unrecoverable, silent, whole-boot hang, and changes nothing for the overwhelmingly common
         // case where the child actually exits.
-        const EXEC_COLLISION_POLL_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(500);
-        const EXEC_COLLISION_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
-        const EXEC_COLLISION_ABSOLUTE_CAP: std::time::Duration =
-            std::time::Duration::from_secs(120);
-
-        fn child_cpu_time_100ns(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
-            let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
-            let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
-            let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
-            let mut user = windows_sys::Win32::Foundation::FILETIME::default();
-            let ok = unsafe {
-                windows_sys::Win32::System::Threading::GetProcessTimes(
-                    handle,
-                    &raw mut creation,
-                    &raw mut exit,
-                    &raw mut kernel,
-                    &raw mut user,
-                )
-            };
-            if ok == 0 {
-                return None;
-            }
-            let as_u64 = |ft: windows_sys::Win32::Foundation::FILETIME| -> u64 {
-                (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
-            };
-            Some(as_u64(kernel) + as_u64(user))
-        }
 
         let status = match cmd.spawn() {
             Ok(mut child) => {
@@ -15078,11 +15133,6 @@ impl litebox::platform::ForkChildVerificationProvider for WindowsUserland {
                         ));
                     }
                     let cpu_now = child_cpu_time_100ns(handle);
-                    // Same threshold and reasoning as `run_external_fault_watchdog_child`'s own
-                    // `MEANINGFUL_CPU_DELTA_100NS`: a real tick of scheduler/measurement noise, not
-                    // a claim of genuine work, so only a delta clearly above it resets the stall
-                    // clock.
-                    const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
                     let made_progress = match (cpu_at_stall_start, cpu_now) {
                         (Some(before), Some(after)) => {
                             after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS
@@ -15304,8 +15354,7 @@ fn spawn_fork_child_pipe_pump(
                 // `already_forwarded` stops the drain below from delivering those bytes twice.
                 let mut already_forwarded = 0usize;
                 if !fork_pipe_peek_disabled() {
-                    let mut snapshot = std::vec::Vec::new();
-                    snapshot.resize(SNAPSHOT_BYTES, 0u8);
+                    let mut snapshot = vec![0u8; SNAPSHOT_BYTES];
                     let peeked = end.peek(&mut snapshot);
                     if peeked > 0 {
                         if process_fork::write_all_to_inherited_handle(local, &snapshot[..peeked]) {
@@ -15571,6 +15620,10 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
     /// well inside what the host can actually satisfy while still being truthful in shape (it
     /// tracks real pressure: report less when the host genuinely has less).
     fn memory_info_kb(&self) -> (u64, u64) {
+        /// Never advertise more than this much available memory, however much the host has free.
+        /// A guest sizing a pool from a very large figure is the failure mode this whole function
+        /// exists to prevent; past this point more headroom buys nothing real.
+        const AVAIL_CEILING_KB: u64 = 2 * 1024 * 1024;
         let mut status = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
             dwLength: u32::try_from(core::mem::size_of::<
                 windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX,
@@ -15589,10 +15642,6 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
             return (1024 * 1024, 512 * 1024);
         }
         let total_kb = status.ullTotalPhys / 1024;
-        /// Never advertise more than this much available memory, however much the host has free.
-        /// A guest sizing a pool from a very large figure is the failure mode this whole function
-        /// exists to prevent; past this point more headroom buys nothing real.
-        const AVAIL_CEILING_KB: u64 = 2 * 1024 * 1024;
         let avail_kb = (status.ullAvailPhys / 1024 / 2).min(AVAIL_CEILING_KB);
         (total_kb.max(1), avail_kb.max(64 * 1024))
     }
@@ -15640,9 +15689,16 @@ impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
     }
 }
 
+/// Name of host process `host_pid`'s cross-process signal wake event, NUL-terminated UTF-16.
+fn signal_wake_event_name(host_pid: u32) -> std::vec::Vec<u16> {
+    format!(r"Local\litebox-sigwake-{host_pid}")
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
     use crate::WindowsUserland;
@@ -15905,12 +15961,4 @@ mod tests {
             "no stdin handle attached at all must report ready (matches EOF semantics)"
         );
     }
-}
-
-/// Name of host process `host_pid`'s cross-process signal wake event, NUL-terminated UTF-16.
-fn signal_wake_event_name(host_pid: u32) -> std::vec::Vec<u16> {
-    format!(r"Local\litebox-sigwake-{host_pid}")
-        .encode_utf16()
-        .chain(core::iter::once(0))
-        .collect()
 }

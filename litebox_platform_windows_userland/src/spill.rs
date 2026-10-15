@@ -25,6 +25,7 @@ pub fn open_spill_file(slot: u32) -> Option<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .ok()
 }

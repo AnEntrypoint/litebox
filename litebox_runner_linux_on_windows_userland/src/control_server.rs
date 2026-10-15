@@ -49,7 +49,7 @@ struct HeaderLayout {
     offset_hi: u32,
 }
 
-const HEADER_SECTION_SIZE: usize = 4096;
+const HEADER_SECTION_SIZE: u32 = 4096;
 
 struct HeaderSection {
     handle: HANDLE,
@@ -72,7 +72,7 @@ impl HeaderSection {
                 core::ptr::null(),
                 PAGE_READWRITE,
                 0,
-                HEADER_SECTION_SIZE as u32,
+                HEADER_SECTION_SIZE,
                 core::ptr::null(),
             )
         };
@@ -90,7 +90,7 @@ impl HeaderSection {
                 FILE_MAP_WRITE | FILE_MAP_READ,
                 0,
                 0,
-                HEADER_SECTION_SIZE,
+                HEADER_SECTION_SIZE as usize,
             )
         };
         if ptr.Value.is_null() {
@@ -119,6 +119,13 @@ impl HeaderSection {
     /// `Release` ordering -- see [`HeaderLayout`]'s own doc comment for why the order matters.
     fn publish(&self, width: u32, height: u32, pitch: u32, format: u32, offset: u64, seq: u64) {
         let base = self.ptr.cast::<HeaderLayout>();
+        // The `as u32` truncation is the intent: `offset` is split into its low and high 32-bit
+        // words (the high word is taken by shifting first, so it fits without a cast lint).
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "splitting a u64 into its low 32-bit word is the intended truncation"
+        )]
+        let offset_lo = offset as u32;
         // SAFETY: `base` points at a `HEADER_SECTION_SIZE`-byte mapped view (>= `size_of::<HeaderLayout>()`)
         // owned by this `HeaderSection` for its whole lifetime; only this method and
         // `AtomicU64::from_ptr` below ever touch it, and this method is only ever called from the
@@ -129,7 +136,7 @@ impl HeaderSection {
             (&raw mut (*base).height).write_volatile(height);
             (&raw mut (*base).pitch).write_volatile(pitch);
             (&raw mut (*base).format).write_volatile(format);
-            (&raw mut (*base).offset_lo).write_volatile(offset as u32);
+            (&raw mut (*base).offset_lo).write_volatile(offset_lo);
             (&raw mut (*base).offset_hi).write_volatile((offset >> 32) as u32);
         }
         // SAFETY: `seq_ptr()` is validly aligned (the section is page-aligned, `frame_seq` is the
@@ -449,12 +456,17 @@ fn handle_screenshot<FS: ShimFS>(shared: &Arc<Shared<FS>>, path: &str) -> Reply 
     // view of it here is exactly what a presenter process would otherwise do with a duplicated
     // copy of the same handle value -- the runner needs no duplication since it already owns the
     // handle outright.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the low 32-bit word of a u64 offset is the intended truncation for MapViewOfFile"
+    )]
+    let offset_lo = snap.offset as u32;
     let view = unsafe {
         MapViewOfFile(
             snap.handle as HANDLE,
             FILE_MAP_READ,
             (snap.offset >> 32) as u32,
-            snap.offset as u32,
+            offset_lo,
             snap.size,
         )
     };
@@ -611,11 +623,7 @@ fn handle_connection<FS: ShimFS>(shared: Arc<Shared<FS>>, pipe: PipeHandle) {
     };
     let mut reader = LineReader::new();
     let mut became_presenter = false;
-    loop {
-        let line = match reader.read_line(&pipe) {
-            Ok(Some(l)) => l,
-            Ok(None) | Err(_) => break,
-        };
+    while let Ok(Some(line)) = reader.read_line(&pipe) {
         let reply = match Request::parse(&line) {
             Ok(req) => dispatch(&shared, client_pid, &mut became_presenter, req),
             Err(e) => Reply::err(ErrorCode::IoError, e.0),
@@ -625,21 +633,21 @@ fn handle_connection<FS: ShimFS>(shared: Arc<Shared<FS>>, pipe: PipeHandle) {
         // `show`/`hide` from OTHER connections can write into it, then continue this loop reading
         // further requests (`key`/`rel`) from `pipe` directly, unlocked -- see this module's doc
         // comment for why the two handle values are kept independent.
-        if became_presenter
+        // The presenter lock is released at the end of this `let`, before the duplicate below
+        // re-locks it to store the handle.
+        let presenter_free = became_presenter
             && shared
                 .presenter
                 .lock()
                 .expect("presenter mutex poisoned")
-                .is_none()
-        {
-            if let Ok(dup) = duplicate_into_current_process(pipe.raw()) {
-                *shared.presenter.lock().expect("presenter mutex poisoned") = Some(PresenterConn(
-                    // SAFETY: `dup` was just freshly duplicated above by
-                    // `duplicate_into_current_process`; nothing else holds or will close this
-                    // specific value.
-                    unsafe { PipeHandle::from_raw(dup) },
-                ));
-            }
+                .is_none();
+        if presenter_free && let Ok(dup) = duplicate_into_current_process(pipe.raw()) {
+            *shared.presenter.lock().expect("presenter mutex poisoned") = Some(PresenterConn(
+                // SAFETY: `dup` was just freshly duplicated above by
+                // `duplicate_into_current_process`; nothing else holds or will close this
+                // specific value.
+                unsafe { PipeHandle::from_raw(dup) },
+            ));
         }
         for l in reply.to_lines() {
             if pipe::write_line(&pipe, &l).is_err() {
@@ -697,6 +705,10 @@ pub fn spawn_and_maybe_show<FS: ShimFS>(
 /// interactively-shown presenter's window to be closed by the user (mirroring the old
 /// `gui_presenter_thread` join's "keep the process alive until the window closes" behavior) before
 /// the runner process itself exits.
+///
+/// # Panics
+///
+/// Panics if the presenter mutex is poisoned.
 #[must_use]
 pub fn is_presenter_connected<FS: ShimFS>(shared: &Shared<FS>) -> bool {
     shared
@@ -710,6 +722,10 @@ pub fn is_presenter_connected<FS: ShimFS>(shared: &Shared<FS>) -> bool {
 /// matches `docs/presenter-process-design.md` section 4.3's "always" requirement (headless or
 /// not). `presenter_exe` is the path to `litebox-presenter.exe` used for every `show`-triggered
 /// spawn.
+///
+/// # Panics
+///
+/// Panics if the `litebox-control-server` accept thread cannot be spawned.
 pub fn start<FS: ShimFS>(
     shim: LinuxShim<Platform, FS>,
     presenter_exe: PathBuf,

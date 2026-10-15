@@ -107,6 +107,9 @@ fn filetime_to_u64(ft: FILETIME) -> u64 {
 /// AGENTS.md-recorded default `EnvFilter`, which silences most `debug!` call sites by default).
 fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
     unsafe {
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
         let pid = GetProcessId(handle);
         let mut creation = core::mem::zeroed::<FILETIME>();
         let mut exit = core::mem::zeroed::<FILETIME>();
@@ -130,9 +133,6 @@ fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_
         };
         let mut exit_code: u32 = 0;
         let got_exit_code = GetExitCodeProcess(handle, &raw mut exit_code) != 0;
-        const WAIT_OBJECT_0: u32 = 0;
-        const WAIT_TIMEOUT_V: u32 = 258;
-        const WAIT_FAILED_V: u32 = u32::MAX;
         let wait_str = match wait_result {
             WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
             WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
@@ -163,6 +163,9 @@ fn diag_log_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_
 /// only -- the process-handle-based callers keep using [`diag_log_wait_evidence`] unchanged.
 fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, get_last_error: u32) {
     unsafe {
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_V: u32 = 258;
+        const WAIT_FAILED_V: u32 = u32::MAX;
         let pid = GetProcessIdOfThread(handle);
         let mut creation = core::mem::zeroed::<FILETIME>();
         let mut exit = core::mem::zeroed::<FILETIME>();
@@ -186,9 +189,6 @@ fn diag_log_thread_wait_evidence(tag: &str, handle: HANDLE, wait_result: u32, ge
         };
         let mut exit_code: u32 = 0;
         let got_exit_code = GetExitCodeThread(handle, &raw mut exit_code) != 0;
-        const WAIT_OBJECT_0: u32 = 0;
-        const WAIT_TIMEOUT_V: u32 = 258;
-        const WAIT_FAILED_V: u32 = u32::MAX;
         let wait_str = match wait_result {
             WAIT_OBJECT_0 => "WAIT_OBJECT_0(signaled/exited)",
             WAIT_TIMEOUT_V => "WAIT_TIMEOUT(still running)",
@@ -970,18 +970,18 @@ pub fn fork_child_guest_identity() -> Option<litebox::platform::ForkChildIdentit
     let raw = std::env::var(FORK_CHILD_GUEST_IDENTITY_ENV_VAR).ok()?;
     let mut parts = raw.split(':').map(str::parse::<i32>);
     let pid = parts.next()?.ok()?;
-    let ppid = parts.next()?.ok()?;
-    let pgid = parts.next()?.ok()?;
+    let parent_pid = parts.next()?.ok()?;
+    let process_group = parts.next()?.ok()?;
     let pid_ns = parts.next().and_then(Result::ok).unwrap_or(0);
     let ns_pid = parts.next().and_then(Result::ok).unwrap_or(pid);
-    let ns_tid = parts.next().and_then(Result::ok).unwrap_or(ns_pid);
+    let namespace_tid = parts.next().and_then(Result::ok).unwrap_or(ns_pid);
     (pid > 0).then_some(litebox::platform::ForkChildIdentity {
         pid,
-        ppid,
-        pgid,
+        ppid: parent_pid,
+        pgid: process_group,
         pid_ns,
         ns_pid,
-        ns_tid,
+        ns_tid: namespace_tid,
     })
 }
 
@@ -1276,7 +1276,7 @@ pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
     }
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(text.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let s = core::str::from_utf8(pair).ok()?;
         out.push(u8::from_str_radix(s, 16).ok()?);
     }
@@ -1875,6 +1875,10 @@ pub fn diagnostic_spawn_and_copy(
 /// Every failure path explicitly `TerminateProcess`+`CloseHandle`s the child itself before
 /// returning `Err`/`Ok(None)` -- there is deliberately no `Drop`-based guard here, since the
 /// success path's entire point is to hand back a live, un-closed handle.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "public entry point called from other modules of this crate; its parameters are the fork inputs, and reshaping the signature is out of scope for a lint pass"
+)]
 pub fn spawn_process_fork_child(
     group_relocations: &[(Range<usize>, usize)],
     vma_layout: &[(Range<usize>, u32, bool)],
@@ -1890,6 +1894,8 @@ pub fn spawn_process_fork_child(
     identity: litebox::platform::ForkChildIdentity,
     lazy_file_map_path: Option<&str>,
 ) -> Result<Option<(u32, HANDLE, HANDLE)>, String> {
+    static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
     let exe = std::env::current_exe().map_err(|e| format!("current_exe() failed: {e}"))?;
     let mut exe_wide: Vec<u16> = exe
         .as_os_str()
@@ -2025,20 +2031,17 @@ pub fn spawn_process_fork_child(
             .iter()
             .map(|r| r.len().div_ceil(4096))
             .sum();
-        match crate::lazy_fork_commit::try_claim_guard_cow_table(total_pages) {
-            Some(claim) => {
-                child_env.push((
-                    crate::lazy_fork_commit::FORK_CHILD_GUARD_COW_TABLE_ENV_VAR,
-                    crate::lazy_fork_commit::guard_cow_claim_table_base(&claim).to_string(),
-                ));
-                guard_cow_claim = Some(claim);
-            }
-            None => {
-                // Another live child from this same parent still holds the slot -- fall this
-                // whole fork back to fully eager (every group), not partially lazy.
-                lazy_eligible = vec![false; lazy_eligible.len()];
-                lazy_group_ranges.clear();
-            }
+        if let Some(claim) = crate::lazy_fork_commit::try_claim_guard_cow_table(total_pages) {
+            child_env.push((
+                crate::lazy_fork_commit::FORK_CHILD_GUARD_COW_TABLE_ENV_VAR,
+                crate::lazy_fork_commit::guard_cow_claim_table_base(&claim).to_string(),
+            ));
+            guard_cow_claim = Some(claim);
+        } else {
+            // Another live child from this same parent still holds the slot -- fall this
+            // whole fork back to fully eager (every group), not partially lazy.
+            lazy_eligible = vec![false; lazy_eligible.len()];
+            lazy_group_ranges.clear();
         }
     }
     if !lazy_group_ranges.is_empty() {
@@ -2294,10 +2297,7 @@ pub fn spawn_process_fork_child(
     let (process, thread, pid, _stdout_read, _stdin_write) = spawn_result?;
     close_child_side();
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
-        eprintln!(
-            "[diag_alloc_vec] spawned child pid={} process={:p} thread={:p}",
-            pid, process, thread
-        );
+        eprintln!("[diag_alloc_vec] spawned child pid={pid} process={process:p} thread={thread:p}");
     }
 
     // From here on, any early-return path must explicitly tear the child down itself -- there is
@@ -2329,9 +2329,9 @@ pub fn spawn_process_fork_child(
     for ((source_group, dest_base), lazy) in group_relocations.iter().zip(lazy_eligible.iter()) {
         let process = core::hint::black_box(process);
         if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
-            let process_addr = &process as *const _ as usize;
+            let process_addr = &raw const process as usize;
             let dummy = 0u8;
-            let stack_addr = &dummy as *const _ as usize;
+            let stack_addr = &raw const dummy as usize;
             eprintln!(
                 "[diag_alloc_vec] pre-call process={:p} process_slot_addr={:#x} current_stack_addr={:#x} group={:#x}..{:#x} lazy={lazy}",
                 process, process_addr, stack_addr, source_group.start, source_group.end
@@ -2353,7 +2353,8 @@ pub fn spawn_process_fork_child(
                     group_slot_base,
                 )
             } else {
-                crate::lazy_fork_commit::reserve_group_lazy(process, source_group)
+                // SAFETY: `process` is the child handle this fork just created and still holds.
+                unsafe { crate::lazy_fork_commit::reserve_group_lazy(process, source_group) }
             }
         } else {
             copy_one_group(
@@ -2553,8 +2554,6 @@ pub fn spawn_process_fork_child(
     // investigation; for a lazy-fork-commit bug specifically, prefer unperturbed logging over this
     // diagnostic where possible, since even a correctly-passed-through exception still costs real
     // wall-clock time this mechanism's own timing-sensitive bugs may be exposed by.
-    static EXTERNAL_DEBUGGER_FORK_COUNT: std::sync::atomic::AtomicU32 =
-        std::sync::atomic::AtomicU32::new(0);
     let external_debugger_skip: u32 =
         std::env::var_os("LITEBOX_DIAG_PROCESS_FORK_EXTERNAL_DEBUGGER_SKIP")
             .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))
@@ -4197,6 +4196,10 @@ fn spawn_suspended_forcing_handle_inheritance(
 /// process handle inheritance"), and the only way to match real `fork()`+`exec()` semantics
 /// (child gets exactly the fds it should, nothing else) rather than the "inherit everything"
 /// Windows default.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "four independent spawn switches (stdout pipe, stdin pipe, stdio inheritance, handle inheritance) read at this private helper's call sites; a parameter type would only rename them"
+)]
 fn spawn_suspended_impl(
     exe_wide: &mut [u16],
     want_stdout_pipe: bool,
@@ -4206,6 +4209,7 @@ fn spawn_suspended_impl(
     force_inherit_handles: bool,
     extra_inheritable_handles: &[HANDLE],
 ) -> Result<SpawnSuspendedResult, String> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // Built up-front so the pointer handed to `CreateProcessW` stays valid for the whole call.
     let mut env_block = build_child_environment_block(extra_env);
     let mut startup_info: STARTUPINFOW = unsafe { core::mem::zeroed() };
@@ -4311,6 +4315,7 @@ fn spawn_suspended_impl(
         // probe's explicit `inherit_stdio=false` is respected again), and preserving this block's
         // per-handle validity guard as the only place `STARTF_USESTDHANDLES`/`hStd*` get set.
         unsafe {
+            const HANDLE_FLAG_INHERIT: u32 = 1;
             let stdout_h = windows_sys::Win32::System::Console::GetStdHandle(
                 windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
             );
@@ -4330,7 +4335,6 @@ fn spawn_suspended_impl(
             // ONLY wired into `startup_info` -- and only then counts toward `STARTF_USESTDHANDLES`
             // -- when it is neither null nor `INVALID_HANDLE_VALUE`; an invalid stream is left at
             // its zeroed default rather than ever being copied into the child's `STARTUPINFOW`.
-            const HANDLE_FLAG_INHERIT: u32 = 1;
             if !stdout_h.is_null()
                 && stdout_h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
             {
@@ -4387,7 +4391,6 @@ fn spawn_suspended_impl(
     // exactly what made every `LITEBOX_PROCESS_FORK=1` child (nginx, curl, mkdir, sed, ... --
     // every one of this session's dozens of test runs) flash a new terminal window on screen.
     // Mirrors the fault-watchdog spawn's own `CREATE_NO_WINDOW` use elsewhere in this file.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Build the explicit inheritance allow-list this call intends: its own wired stdio handles
     // plus whatever `extra_inheritable_handles` the caller asked for (bridge-pipe child ends,
@@ -4578,12 +4581,13 @@ fn copy_one_group_with_shared(
     shared: &[SharedRegionCarry],
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
 ) -> Result<(), u32> {
+    const PAGE_SIZE: usize = 4096;
     const GRAN: usize = 64 * 1024;
     // `ERROR_INVALID_HANDLE`: this process holds no live handle to the object it is trying to hand
     // the child, so there is nothing to map.
     const NO_SECTION_HANDLE: u32 = 6;
     let len = source_group.len();
-    if source_group.start % GRAN != 0 || len % GRAN != 0 {
+    if !source_group.start.is_multiple_of(GRAN) || !len.is_multiple_of(GRAN) {
         // A placeholder must be granularity-aligned and granularity-sized. Reservation groups are
         // by construction (pass 110), so reaching this means the group bookkeeping changed, not
         // that this region is uncarriable.
@@ -4622,7 +4626,6 @@ fn copy_one_group_with_shared(
     // boundary and both non-granularity-sized views succeed. Requiring 64KB alignment there is
     // what made every real group holding an odd-sized shared region uncarriable, which is the
     // whole regression -- a shared range is always page-aligned because it is an mmap.
-    const PAGE_SIZE: usize = 4096;
     if segments
         .iter()
         .any(|(segment, _)| segment.start % PAGE_SIZE != 0)
@@ -4732,135 +4735,132 @@ fn copy_one_group_with_shared(
 
     // Step 3: replace each placeholder segment with what actually belongs there.
     for (segment, carry) in &segments {
-        match carry {
-            Some(carry) => {
-                let Some(section) = shm_section_handle(carry.name.as_str()) else {
-                    cleanup();
-                    return Err(NO_SECTION_HANDLE);
+        if let Some(carry) = carry {
+            let Some(section) = shm_section_handle(carry.name.as_str()) else {
+                cleanup();
+                return Err(NO_SECTION_HANDLE);
+            };
+            // Widest first: a view can never exceed the section's protection ceiling, so the
+            // narrow retries are what a file-backed section whose ceiling fell back to
+            // `PAGE_READWRITE` needs. The widest protection is NOT what the guest asked for,
+            // so the view is narrowed back to `carry.perms` right after it is placed --
+            // `adopt_carried_shared` on the child side only does bookkeeping, and the child
+            // runs no instruction of its own before it is resumed, so this is the only place
+            // the child's initial protection can be made to equal the parent's.
+            //
+            // A `COPY_ON_WRITE` carry -- a guest `MAP_PRIVATE` file mapping, which one section
+            // serves for every process that maps that file -- must be mapped COPY-ON-WRITE, or
+            // the child's writes land in the shared object and every other mapper (including
+            // the parent) sees them: a "private" mapping that is not private. The child's own
+            // `mprotect(PROT_WRITE)` succeeds either way, so nothing but the bytes tells the
+            // two apart -- hence `cb70.sh`.
+            let protections: &[u32] =
+                if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
+                    &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
+                } else {
+                    &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
                 };
-                // Widest first: a view can never exceed the section's protection ceiling, so the
-                // narrow retries are what a file-backed section whose ceiling fell back to
-                // `PAGE_READWRITE` needs. The widest protection is NOT what the guest asked for,
-                // so the view is narrowed back to `carry.perms` right after it is placed --
-                // `adopt_carried_shared` on the child side only does bookkeeping, and the child
-                // runs no instruction of its own before it is resumed, so this is the only place
-                // the child's initial protection can be made to equal the parent's.
-                //
-                // A `COPY_ON_WRITE` carry -- a guest `MAP_PRIVATE` file mapping, which one section
-                // serves for every process that maps that file -- must be mapped COPY-ON-WRITE, or
-                // the child's writes land in the shared object and every other mapper (including
-                // the parent) sees them: a "private" mapping that is not private. The child's own
-                // `mprotect(PROT_WRITE)` succeeds either way, so nothing but the bytes tells the
-                // two apart -- hence `cb70.sh`.
-                let protections: &[u32] =
-                    if carry.perms.contains(MemoryRegionPermissions::COPY_ON_WRITE) {
-                        &[PAGE_EXECUTE_WRITECOPY, PAGE_WRITECOPY, PAGE_READONLY]
-                    } else {
-                        &[PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY]
-                    };
-                let mut view = 0usize;
-                let mut granted = 0u32;
-                for protection in protections {
-                    let mapped = unsafe {
-                        MapViewOfFile3(
-                            section as *mut c_void,
-                            child,
-                            segment.start as *mut c_void,
-                            0,
-                            segment.len(),
-                            PLACEHOLDER_REPLACE,
-                            *protection,
-                            core::ptr::null_mut(),
-                            0,
-                        )
-                    };
-                    if !mapped.Value.is_null() {
-                        view = mapped.Value as usize;
-                        granted = *protection;
-                        break;
-                    }
-                }
-                if view == 0 {
-                    let err = unsafe { GetLastError() };
-                    if diag {
-                        eprintln!(
-                            "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
-                            source_group.start,
-                            source_group.end,
-                            segment.start,
-                            segment.end,
-                            carry.name.as_str(),
-                            err
-                        );
-                    }
-                    cleanup();
-                    return Err(err);
-                }
-                if view != segment.start {
-                    // Should be unreachable: `MEM_REPLACE_PLACEHOLDER` with an explicit base
-                    // either replaces exactly that placeholder or fails.
-                    cleanup();
-                    return Err(0);
-                }
-                // Handing the child a wider view than its own mapping is not harmless: a guest
-                // `PROT_READ` `MAP_SHARED` region mapped `PAGE_EXECUTE_READWRITE` lets the child
-                // write into the object every other mapper -- including the parent -- sees, and
-                // leaves a guest write there unfaulted. `PROT_READ|PROT_EXEC` likewise must not
-                // arrive writable. Narrowing can legitimately fail (the same section ceiling that
-                // forced the wide map), and a too-wide view stays correct in the direction that
-                // matters -- nothing is taken away that the mapping needs -- so the failure is
-                // reported, not fatal.
-                let narrowed = crate::prot_flags(carry.perms);
-                if narrowed != granted {
-                    let mut previous = 0u32;
-                    let ok = unsafe {
-                        VirtualProtectEx(
-                            child,
-                            view as *mut c_void,
-                            segment.len(),
-                            narrowed,
-                            &mut previous,
-                        )
-                    };
-                    if ok == 0 && diag {
-                        eprintln!(
-                            "[diag-fork-shared] NARROW FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} granted={:#x} wanted={:#x} err={}",
-                            source_group.start,
-                            source_group.end,
-                            segment.start,
-                            segment.end,
-                            carry.name.as_str(),
-                            granted,
-                            narrowed,
-                            unsafe { GetLastError() }
-                        );
-                    }
-                }
-            }
-            None => {
-                let placed = unsafe {
-                    windows_sys::Win32::System::Memory::VirtualAlloc2(
+            let mut view = 0usize;
+            let mut granted = 0u32;
+            for protection in protections {
+                let mapped = unsafe {
+                    MapViewOfFile3(
+                        section as *mut c_void,
                         child,
                         segment.start as *mut c_void,
+                        0,
                         segment.len(),
-                        MEM_RESERVE | MEM_COMMIT | PLACEHOLDER_REPLACE,
-                        PAGE_READWRITE,
+                        PLACEHOLDER_REPLACE,
+                        *protection,
                         core::ptr::null_mut(),
                         0,
                     )
                 };
-                if placed.is_null() {
-                    let err = unsafe { GetLastError() };
-                    cleanup();
-                    return Err(err);
+                if !mapped.Value.is_null() {
+                    view = mapped.Value as usize;
+                    granted = *protection;
+                    break;
                 }
-                // The parent's real bytes for the non-shared part of the group: the same
-                // page-by-page copy `copy_one_group` does, restricted to this segment so an
-                // unreadable padding page stays zero-filled instead of failing the whole group.
-                if let Some(err) = copy_pages_into(child, segment, read_source_bytes) {
-                    cleanup();
-                    return Err(err);
+            }
+            if view == 0 {
+                let err = unsafe { GetLastError() };
+                if diag {
+                    eprintln!(
+                        "[diag-fork-shared] MAP FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} err={}",
+                        source_group.start,
+                        source_group.end,
+                        segment.start,
+                        segment.end,
+                        carry.name.as_str(),
+                        err
+                    );
                 }
+                cleanup();
+                return Err(err);
+            }
+            if view != segment.start {
+                // Should be unreachable: `MEM_REPLACE_PLACEHOLDER` with an explicit base
+                // either replaces exactly that placeholder or fails.
+                cleanup();
+                return Err(0);
+            }
+            // Handing the child a wider view than its own mapping is not harmless: a guest
+            // `PROT_READ` `MAP_SHARED` region mapped `PAGE_EXECUTE_READWRITE` lets the child
+            // write into the object every other mapper -- including the parent -- sees, and
+            // leaves a guest write there unfaulted. `PROT_READ|PROT_EXEC` likewise must not
+            // arrive writable. Narrowing can legitimately fail (the same section ceiling that
+            // forced the wide map), and a too-wide view stays correct in the direction that
+            // matters -- nothing is taken away that the mapping needs -- so the failure is
+            // reported, not fatal.
+            let narrowed = crate::prot_flags(carry.perms);
+            if narrowed != granted {
+                let mut previous = 0u32;
+                let ok = unsafe {
+                    VirtualProtectEx(
+                        child,
+                        view as *mut c_void,
+                        segment.len(),
+                        narrowed,
+                        &raw mut previous,
+                    )
+                };
+                if ok == 0 && diag {
+                    eprintln!(
+                        "[diag-fork-shared] NARROW FAILED group={:#x}..{:#x} segment={:#x}..{:#x} name={} granted={:#x} wanted={:#x} err={}",
+                        source_group.start,
+                        source_group.end,
+                        segment.start,
+                        segment.end,
+                        carry.name.as_str(),
+                        granted,
+                        narrowed,
+                        unsafe { GetLastError() }
+                    );
+                }
+            }
+        } else {
+            let placed = unsafe {
+                windows_sys::Win32::System::Memory::VirtualAlloc2(
+                    child,
+                    segment.start as *mut c_void,
+                    segment.len(),
+                    MEM_RESERVE | MEM_COMMIT | PLACEHOLDER_REPLACE,
+                    PAGE_READWRITE,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if placed.is_null() {
+                let err = unsafe { GetLastError() };
+                cleanup();
+                return Err(err);
+            }
+            // The parent's real bytes for the non-shared part of the group: the same
+            // page-by-page copy `copy_one_group` does, restricted to this segment so an
+            // unreadable padding page stays zero-filled instead of failing the whole group.
+            if let Some(err) = copy_pages_into(child, segment, read_source_bytes) {
+                cleanup();
+                return Err(err);
             }
         }
     }
@@ -4904,21 +4904,21 @@ fn copy_pages_into(
     let mut cursor = range.start;
     while cursor < range.end {
         let page_end = (cursor + PAGE_SIZE).min(range.end);
-        if let Some(bytes) = read_source_bytes(cursor..page_end) {
-            if !bytes.iter().all(|b| *b == 0) {
-                let mut written = 0usize;
-                let ok = unsafe {
-                    WriteProcessMemory(
-                        child,
-                        cursor as *mut c_void,
-                        bytes.as_ptr().cast::<c_void>(),
-                        bytes.len(),
-                        &raw mut written,
-                    )
-                };
-                if ok == 0 || written != bytes.len() {
-                    return Some(unsafe { GetLastError() });
-                }
+        if let Some(bytes) = read_source_bytes(cursor..page_end)
+            && !bytes.iter().all(|b| *b == 0)
+        {
+            let mut written = 0usize;
+            let ok = unsafe {
+                WriteProcessMemory(
+                    child,
+                    cursor as *mut c_void,
+                    bytes.as_ptr().cast::<c_void>(),
+                    bytes.len(),
+                    &raw mut written,
+                )
+            };
+            if ok == 0 || written != bytes.len() {
+                return Some(unsafe { GetLastError() });
             }
         }
         cursor = page_end;
@@ -4939,13 +4939,13 @@ fn copy_one_group(
     read_source_bytes: &mut impl FnMut(Range<usize>) -> Option<Vec<u8>>,
     carried_shared: &[SharedRegionCarry],
 ) -> GroupCopyResult {
+    const PAGE_SIZE: usize = 4096;
     if std::env::var_os("LITEBOX_DIAG_ALLOC_VEC").is_some() {
         eprintln!(
             "[diag_alloc_vec] copy_one_group ENTRY child={:p} group={:#x}..{:#x}",
             child, source_group.start, source_group.end
         );
     }
-    const PAGE_SIZE: usize = 4096;
     let len = source_group.len();
     let fail = |err: u32| GroupCopyResult {
         source_group: source_group.clone(),
@@ -5552,7 +5552,12 @@ pub fn mark_guest_started() {
 /// a regression, so failing to add supervision must never itself break an otherwise-working run.
 /// Skippable via `LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG=1` for an investigation that specifically
 /// wants to observe the whole-process freeze without any external supervision collecting it.
+///
+/// # Panics
+///
+/// Panics only if `STARTUPINFOW` no longer fits in a `u32`, which the Win32 ABI guarantees it does.
 pub fn spawn_external_fault_watchdog() {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     if std::env::var_os("LITEBOX_DIAG_NO_EXTERNAL_FAULT_WATCHDOG").is_some() {
         return;
     }
@@ -5608,7 +5613,6 @@ pub fn spawn_external_fault_watchdog() {
     // memory-copy/relocation machinery `spawn_process_fork_child` needs a suspended window for
     // applies here. `CREATE_NO_WINDOW` (`0x0800_0000`) keeps this invisible on a real console --
     // it has no user-facing output of its own (`diag_raw_print` only, gated on an env var).
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let ok = unsafe {
         CreateProcessW(
             core::ptr::null(),
@@ -5662,26 +5666,14 @@ pub fn spawn_external_fault_watchdog() {
 /// a DIFFERENT process against the frozen PID) was independently confirmed, every time this
 /// session it was tried, to succeed immediately with no error -- this function is that same
 /// working mechanism, automated and always-standing-by rather than manual.
+///
+/// # Panics
+///
+/// Panics only if the grace period divided by the poll interval no longer fits in a `u32` tick count;
+/// both are compile-time constants, so this cannot happen.
 pub fn run_external_fault_watchdog_child() -> ! {
-    let target_pid: u32 = std::env::var(WATCHDOG_TARGET_PID_ENV_VAR)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if target_pid == 0 {
-        std::process::exit(0);
-    }
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
-    let handle =
-        unsafe { windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid) };
-    if handle.is_null() {
-        // The target has already exited (or never existed) by the time this watchdog got
-        // scheduled -- nothing to watch. Not an error: a normal, fast-exiting run races this
-        // child's own startup routinely.
-        std::process::exit(0);
-    }
-
     fn process_cpu_time_100ns(handle: HANDLE) -> Option<u64> {
         let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
         let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
@@ -5704,6 +5696,24 @@ pub fn run_external_fault_watchdog_child() -> ! {
         };
         Some(as_u64(kernel) + as_u64(user))
     }
+    const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(500);
+    const EXTERNAL_GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(15);
+    let target_pid: u32 = std::env::var(WATCHDOG_TARGET_PID_ENV_VAR)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if target_pid == 0 {
+        std::process::exit(0);
+    }
+    let access = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let handle =
+        unsafe { windows_sys::Win32::System::Threading::OpenProcess(access, 0, target_pid) };
+    if handle.is_null() {
+        // The target has already exited (or never existed) by the time this watchdog got
+        // scheduled -- nothing to watch. Not an error: a normal, fast-exiting run races this
+        // child's own startup routinely.
+        std::process::exit(0);
+    }
 
     // Same poll cadence and CPU-progress safety gate as the in-process watchdog
     // (`fault_terminate_watchdog_thread_body`) -- see that function's own doc comment for the
@@ -5713,8 +5723,6 @@ pub fn run_external_fault_watchdog_child() -> ! {
     // one's -- it exists as the backstop for exactly the case where the in-process one could not
     // run at all, so it must tolerate that entire window plus the in-process watchdog's own grace
     // period elapsing first, without racing it.
-    const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(500);
-    const EXTERNAL_GRACE_PERIOD: core::time::Duration = core::time::Duration::from_secs(15);
     let grace_ticks = u32::try_from(EXTERNAL_GRACE_PERIOD.as_millis() / POLL_INTERVAL.as_millis())
         .expect("grace period fits in a u32 tick count");
     let mut stalled_ticks: u32 = 0;
@@ -5756,6 +5764,7 @@ pub fn run_external_fault_watchdog_child() -> ! {
         std::process::exit(0);
     }
     loop {
+        const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
         std::thread::sleep(POLL_INTERVAL);
         let arm_signalled =
             unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(armed_event, 0) }
@@ -5807,7 +5816,6 @@ pub fn run_external_fault_watchdog_child() -> ! {
         // watchdog measures a DIFFERENT process's CPU time via `OpenProcess`, so it is not
         // self-contaminating the same way, but the same threshold is applied for consistency and
         // as a margin against ordinary scheduler/measurement noise.
-        const MEANINGFUL_CPU_DELTA_100NS: u64 = 100_000;
         let made_progress = match (cpu_time_at_stall_start, cpu_now) {
             (Some(before), Some(after)) => {
                 after.saturating_sub(before) > MEANINGFUL_CPU_DELTA_100NS

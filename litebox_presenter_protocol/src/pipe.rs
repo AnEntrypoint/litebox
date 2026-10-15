@@ -84,7 +84,8 @@ fn overlapped_call(handle: HANDLE, issue: impl FnOnce(*mut OVERLAPPED) -> i32) -
         // SAFETY: `handle` is the same handle passed into `issue`; `overlapped` is the exact
         // structure just passed to it; a nonzero `bWait` blocks until this operation (and no
         // other) completes, per this structure's own private event.
-        let ok = unsafe { GetOverlappedResult(handle, &overlapped, &raw mut transferred, 1) };
+        let ok =
+            unsafe { GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1) };
         if ok == 0 {
             // SAFETY: `GetLastError` has no preconditions.
             return Err(io::Error::from_raw_os_error(unsafe {
@@ -193,14 +194,14 @@ pub fn create_and_accept_one_instance(name: &str) -> io::Result<PipeHandle> {
     // connected between `CreateNamedPipeW` and this call (`ERROR_PIPE_CONNECTED`) is the one
     // "error" that means success here, exactly as the non-overlapped version of this code treated
     // it.
-    if let Err(e) = overlapped_call(handle, |ov| unsafe { ConnectNamedPipe(handle, ov) }) {
-        if e.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-            // SAFETY: `handle` is a valid, still-owned handle not yet given to a `PipeHandle`.
-            unsafe {
-                CloseHandle(handle);
-            }
-            return Err(e);
+    if let Err(e) = overlapped_call(handle, |ov| unsafe { ConnectNamedPipe(handle, ov) })
+        && e.raw_os_error() != Some(ERROR_PIPE_CONNECTED.cast_signed())
+    {
+        // SAFETY: `handle` is a valid, still-owned handle not yet given to a `PipeHandle`.
+        unsafe {
+            CloseHandle(handle);
         }
+        return Err(e);
     }
     Ok(PipeHandle(handle))
 }
@@ -324,7 +325,7 @@ impl LineReader {
                     ReadFile(
                         handle.raw(),
                         chunk.as_mut_ptr(),
-                        chunk.len() as u32,
+                        u32::try_from(chunk.len()).unwrap_or(u32::MAX),
                         core::ptr::null_mut(),
                         ov,
                     )
@@ -335,7 +336,7 @@ impl LineReader {
                 Err(e) => {
                     if self.buf.is_empty()
                         && e.raw_os_error()
-                            == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32)
+                            == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE.cast_signed())
                     {
                         return Ok(None);
                     }
@@ -385,7 +386,7 @@ pub fn write_line(handle: &PipeHandle, line: &str) -> io::Result<()> {
                 WriteFile(
                     handle.raw(),
                     remaining.as_ptr(),
-                    remaining.len() as u32,
+                    u32::try_from(remaining.len()).unwrap_or(u32::MAX),
                     core::ptr::null_mut(),
                     ov,
                 )

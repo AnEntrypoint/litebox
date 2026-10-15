@@ -38,7 +38,7 @@ use windows_sys::Win32::System::Threading::{
 const CHUNK_SHIFT: usize = 16;
 const CHUNK_SIZE: usize = 1 << CHUNK_SHIFT;
 const PAGE_BYTES: usize = 4096;
-const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+const STATUS_ACCESS_VIOLATION: i32 = 0xC000_0005_u32.cast_signed();
 const ACCESS_KIND_WRITE: usize = 1;
 const ACCESS_KIND_EXECUTE: usize = 8;
 
@@ -151,7 +151,7 @@ impl DeadHolderLock {
                 return TableGuard(self);
             }
             spins += 1;
-            if spins % 64 == 0 {
+            if spins.is_multiple_of(64) {
                 let holder = self.owner.load(Ordering::Relaxed);
                 let holder_start = self.owner_start.load(Ordering::Acquire);
                 // Same id but a different creation time means the recorded owner is gone and its
@@ -172,7 +172,7 @@ impl DeadHolderLock {
                     self.owner_start.store(my_start, Ordering::Release);
                     return TableGuard(self);
                 }
-                if spins % (64 * 5000) == 0 {
+                if spins.is_multiple_of(64 * 5000) {
                     eprintln!(
                         "[lazy_file_map] lock wait: me={me} holder={holder} holder_start={holder_start} my_start={my_start} holder_alive={}",
                         holder != 0 && thread_alive(holder, holder_start)
@@ -197,7 +197,7 @@ fn current_thread_start() -> u64 {
             let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
             let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
             // SAFETY: querying the calling thread's own times.
-            unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+            unsafe { GetThreadTimes(GetCurrentThread(), &raw mut created, &raw mut exited, &raw mut kernel, &raw mut user) };
             filetime_to_u64(created)
         };
     }
@@ -224,7 +224,14 @@ fn thread_alive(tid: u32, expected_start: u64) -> bool {
                 dwHighDateTime: 0,
             };
             let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-            if GetThreadTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0 {
+            if GetThreadTimes(
+                handle,
+                &raw mut created,
+                &raw mut exited,
+                &raw mut kernel,
+                &raw mut user,
+            ) != 0
+            {
                 alive = filetime_to_u64(created) == expected_start;
             }
         }
@@ -274,7 +281,7 @@ fn span_is_still_unfilled_lazy_memory(span: &Range<usize>) -> bool {
         let queried = unsafe {
             VirtualQuery(
                 addr as *const _,
-                &mut info,
+                &raw mut info,
                 size_of::<MEMORY_BASIC_INFORMATION>(),
             )
         };
@@ -317,7 +324,7 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
             span.start as *const _,
             span.len(),
             PAGE_READWRITE,
-            &mut previous,
+            &raw mut previous,
         ) == 0
         {
             range.filled[chunk - range.first_chunk] = true;
@@ -337,7 +344,7 @@ fn fill_chunk(start: usize, range: &mut LazyRange, chunk: usize) {
                 span.start as *const _,
                 span.len(),
                 range.protection,
-                &mut previous,
+                &raw mut previous,
             );
         }
     }
@@ -439,7 +446,7 @@ fn access_now_allowed(addr: usize, kind: usize) -> bool {
     let queried = unsafe {
         VirtualQuery(
             addr as *const _,
-            &mut info,
+            &raw mut info,
             size_of::<MEMORY_BASIC_INFORMATION>(),
         )
     };
@@ -532,7 +539,7 @@ pub(crate) fn register(
             range.start as *const _,
             range.len(),
             PAGE_NOACCESS,
-            &mut previous,
+            &raw mut previous,
         )
     };
     if armed == 0 {
@@ -633,7 +640,7 @@ pub(crate) fn forget(range: Range<usize>) {
 fn sources() -> MutexGuard<'static, Vec<(usize, usize)>> {
     SOURCES
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Declares that `data` is source number `index`. The numbering must be the same in every process
@@ -666,6 +673,8 @@ fn locate_source(slice: &[u8]) -> Option<(usize, usize)> {
 /// the child refills them from the file on first touch instead of receiving hundreds of MiB of
 /// executable image it never reads.
 pub(crate) fn export_for_fork() -> (Option<String>, Vec<Range<usize>>) {
+    use std::fmt::Write as _;
+    static SEQUENCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     if !HAS_RANGES.load(Ordering::Acquire) {
         return (None, Vec::new());
     }
@@ -698,17 +707,16 @@ pub(crate) fn export_for_fork() -> (Option<String>, Vec<Range<usize>>) {
         if !bits.contains('0') {
             continue;
         }
-        lines.push_str(&format!(
-            "{start:x} {:x} {index} {offset:x} {:x} {:x} {bits}
-",
+        let _ = writeln!(
+            lines,
+            "{start:x} {:x} {index} {offset:x} {:x} {:x} {bits}",
             lazy.end, lazy.source_len, lazy.protection
-        ));
+        );
     }
     drop(map);
     if lines.is_empty() {
         return (None, pristine_spans);
     }
-    static SEQUENCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let path = std::env::temp_dir().join(format!(
         "litebox-lazyfile-{}-{}.txt",
         std::process::id(),
@@ -722,6 +730,11 @@ pub(crate) fn export_for_fork() -> (Option<String>, Vec<Range<usize>>) {
 
 /// Child side of [`export_for_fork`]: re-arms every described range against this process's own
 /// mapping of the same source, then deletes the file.
+///
+/// # Panics
+///
+/// Panics if the descriptor file is unreadable or malformed, if a field does not fit its type, or
+/// if it names a source this process did not register.
 pub fn adopt_from_file(path: &str) {
     let Ok(text) = std::fs::read_to_string(path) else {
         panic!("lazy file map descriptor {path} unreadable");
@@ -754,7 +767,8 @@ pub fn adopt_from_file(path: &str) {
             end,
             source: base + offset,
             source_len: hex(source_len),
-            protection: hex(protection) as PAGE_PROTECTION_FLAGS,
+            protection: u32::try_from(hex(protection)).expect("descriptor protection flags")
+                as PAGE_PROTECTION_FLAGS,
             first_chunk: start >> CHUNK_SHIFT,
             filled: bits.chars().map(|bit| bit == '1').collect(),
             dirty: bits.chars().map(|bit| bit == '1').collect(),
@@ -770,7 +784,7 @@ pub fn adopt_from_file(path: &str) {
                         span.start as *const _,
                         span.len(),
                         PAGE_NOACCESS,
-                        &mut previous,
+                        &raw mut previous,
                     );
                 }
             }

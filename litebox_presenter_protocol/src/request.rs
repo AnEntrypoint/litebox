@@ -83,7 +83,7 @@ impl Request {
     /// Returns [`ParseError`] if `line` is not a recognized command or has the wrong number/shape
     /// of arguments.
     pub fn parse(line: &str) -> Result<Self, ParseError> {
-        let mut tokens = line.trim().split_whitespace();
+        let mut tokens = line.split_whitespace();
         let cmd = tokens.next().ok_or_else(|| bad("empty line"))?;
         match cmd {
             "scanout" => Ok(Self::Scanout),

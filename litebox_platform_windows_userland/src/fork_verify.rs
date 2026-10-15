@@ -1852,9 +1852,8 @@ fn translate_memory_operand_registers(
             if matches!(reg, Register::None | Register::RIP | Register::EIP) {
                 continue;
             }
-            let value = match register_value(reg, context) {
-                Some(value) => value,
-                None => continue,
+            let Some(value) = register_value(reg, context) else {
+                continue;
             };
             let Some(translated) = relocations.translate(value) else {
                 continue;
@@ -1924,12 +1923,20 @@ fn xmm_lanes(context: &CONTEXT, index: usize) -> Option<[usize; 2]> {
     let lane = registers.get(index)?;
     // `M128A::High` is signed in `windows-sys`; the bit pattern is what matters, and `usize` is 64
     // bits wide on this crate's only target.
-    #[allow(clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "usize is 64 bits on this crate's only target (x86_64 Windows), so u64 and i64 lanes map to usize without loss; the sign is the bit pattern, not a value"
+    )]
     Some([lane.Low as usize, lane.High as usize])
 }
 
 /// Writes `value` into one 64-bit half of `xmm[index]`, returning `false` (and writing nothing) when
 /// `context` carries no floating-point state -- see [`xmm_lanes`].
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "usize is 64 bits on this crate's only target; the value is written as its bit pattern into the i64 lane"
+)]
 fn write_xmm_lane(context: &mut CONTEXT, index: usize, lane: usize, value: usize) -> bool {
     if context.ContextFlags & CONTEXT_FLOATING_POINT_AMD64 == 0 {
         return false;
@@ -2037,8 +2044,7 @@ fn heal_xmm_store_lanes(
         return false;
     };
     let mut healed_any = false;
-    for lane in 0..lane_count {
-        let value = lanes[lane];
+    for (lane, &value) in lanes.iter().enumerate().take(lane_count) {
         let Some(translated) = translate(value) else {
             continue;
         };
@@ -2212,6 +2218,10 @@ fn readable_and_writable(addr: usize, len: usize) -> (bool, bool) {
 /// `VirtualQuery`-per-page cost on this, the READ side, was the actual bottleneck all along. A
 /// single query per region instead of per page turns ~42,000 kernel round-trips into one.
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "no caller in this crate at present (rustc dead_code); kept as the single-query primitive measured in the doc comment above"
+)]
 pub(crate) fn readable_region(addr: usize) -> Option<core::ops::Range<usize>> {
     use windows_sys::Win32::System::Memory as Win32_Memory;
     const NO_ACCESS: u32 = Win32_Memory::PAGE_NOACCESS | Win32_Memory::PAGE_GUARD;
@@ -2989,16 +2999,13 @@ pub(crate) fn begin(
         // call it's observing.
         let diag_claimed_ranges_occupied = crate::CLAIMED_RANGES
             .try_lock()
-            .map(|c| c.iter().filter(|s| s.is_some()).count())
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |c| c.iter().filter(|s| s.is_some()).count());
         let diag_active_threads_len = crate::ACTIVE_THREADS
             .try_lock()
-            .map(|t| t.len())
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |t| t.len());
         let diag_live_thread_stacks_len = crate::LIVE_THREAD_STACKS
             .try_lock()
-            .map(|t| t.len())
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |t| t.len());
         let diag_next_claim_seq = crate::NEXT_CLAIM_SEQ.load(core::sync::atomic::Ordering::Relaxed);
         let diag_real_win_tid =
             unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
@@ -3148,8 +3155,8 @@ mod xmm_store_heal_tests {
     use super::{CONTEXT, CONTEXT_FLOATING_POINT_AMD64, heal_xmm_store_lanes};
     use iced_x86::{Decoder, DecoderOptions, Instruction};
 
-    const PARENT: usize = 0x1a03_639a_6a0;
-    const CHILD: usize = 0x15af_aeda_6a0;
+    const PARENT: usize = 0x1a0_3639_a6a0;
+    const CHILD: usize = 0x15a_faed_a6a0;
     const NON_POINTER: usize = 0x1122_3344_5566_7788;
 
     fn decode(code: &[u8]) -> Instruction {
@@ -3159,6 +3166,10 @@ mod xmm_store_heal_tests {
         instruction
     }
 
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "test fixture: usize is 64 bits on this target and the values are written as bit patterns"
+    )]
     fn context_with_xmm0(low: usize, high: usize) -> CONTEXT {
         let mut context: CONTEXT = unsafe { core::mem::zeroed() };
         context.ContextFlags = CONTEXT_FLOATING_POINT_AMD64;
@@ -3169,6 +3180,10 @@ mod xmm_store_heal_tests {
         context
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "test fixture: usize is 64 bits on this target, so the u64/i64 lanes fit exactly"
+    )]
     fn xmm0(context: &CONTEXT) -> [usize; 2] {
         let low = unsafe { context.Anonymous.FltSave.XmmRegisters[0].Low } as usize;
         #[allow(clippy::cast_sign_loss)]

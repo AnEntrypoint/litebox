@@ -56,7 +56,7 @@ mod imp {
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn main() {
-    imp::main()
+    imp::main();
 }
 
 /// Everywhere else: still a buildable example, so `--all-targets` builds, but there is nothing

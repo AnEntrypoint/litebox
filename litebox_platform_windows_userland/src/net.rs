@@ -264,7 +264,7 @@ impl GatewayState {
         let pending: Vec<InboundConnection> = rx.try_iter().collect();
         for conn in pending {
             let local_port = self.next_ephemeral_port;
-            self.next_ephemeral_port = if self.next_ephemeral_port >= 65535 {
+            self.next_ephemeral_port = if self.next_ephemeral_port == u16::MAX {
                 49152
             } else {
                 self.next_ephemeral_port + 1
@@ -339,10 +339,10 @@ impl GatewayState {
             };
             match ipv4.next_header() {
                 IpProtocol::Tcp => {
-                    if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) {
-                        if !self.port_is_claimed_by_an_inbound_flow(tcp.dst_port()) {
-                            self.ensure_listening(tcp.dst_port());
-                        }
+                    if let Ok(tcp) = TcpPacket::new_checked(ipv4.payload())
+                        && !self.port_is_claimed_by_an_inbound_flow(tcp.dst_port())
+                    {
+                        self.ensure_listening(tcp.dst_port());
                     }
                 }
                 IpProtocol::Udp => {
@@ -400,7 +400,7 @@ impl GatewayState {
     fn diag_gateway_state(&self) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEEN: AtomicU32 = AtomicU32::new(0);
-        if SEEN.fetch_add(1, Ordering::Relaxed) % 256 != 0 {
+        if !SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(256) {
             return;
         }
         let mut flow_states = String::new();
@@ -760,7 +760,7 @@ fn diag_pump(
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
-    if n >= 400 && n % 64 != 0 {
+    if n >= 400 && !n.is_multiple_of(64) {
         return;
     }
     let state = format!("{:?}", socket.state());
@@ -1074,7 +1074,7 @@ pub(crate) fn owns_ip_interface() -> bool {
 fn diag_pkt(dir: &'static str, packet: &[u8]) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
-    if SEEN.fetch_add(1, Ordering::Relaxed) % 512 != 0 {
+    if !SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(512) {
         return;
     }
     let Ok(ip) = Ipv4Packet::new_checked(packet) else {
@@ -1111,6 +1111,10 @@ fn diag_pkt(dir: &'static str, packet: &[u8]) {
     );
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Result is the platform send-hook contract shared with other call sites; this path cannot fail today, and changing the signature belongs to those files"
+)]
 pub(crate) fn send_ip_packet(
     slot: &OnceLock<NatGateway>,
     packet: &[u8],

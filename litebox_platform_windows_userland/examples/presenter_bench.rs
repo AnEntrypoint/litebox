@@ -65,6 +65,8 @@ mod imp {
         let bytes_sent_producer = bytes_sent.clone();
 
         std::thread::spawn(move || {
+            const PATTERN_COUNT: usize = 8;
+
             let width = 1920u32;
             let height = 1080u32;
             let pitch = width * 4;
@@ -84,12 +86,11 @@ mod imp {
             // (identical bytes would let a future upload path skip work and flatter the result), so
             // keep several genuinely different frames and cycle them; just stop paying to synthesize
             // them inside the measurement window.
-            const PATTERN_COUNT: usize = 8;
             let patterns: Vec<Vec<u8>> = (0..PATTERN_COUNT)
                 .map(|p| {
-                    let phase = (p * 32) as u8;
+                    let phase = u8::try_from(p * 32).unwrap_or(0);
                     (0..frame_size)
-                        .map(|i| ((i as u32).wrapping_add(u32::from(phase)) % 256) as u8)
+                        .map(|i| u8::try_from(i % 256).unwrap_or(0).wrapping_add(phase))
                         .collect()
                 })
                 .collect();
@@ -128,10 +129,14 @@ mod imp {
                     let n = sends_completed_producer.load(Ordering::Relaxed);
                     let (presents, _) =
                         litebox_platform_windows_userland::presentation::present_stats();
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "sends and presents are per-run event counts far below 2^53, so the u64 to f64 conversions are exact"
+                    )]
+                    let (sends_per_s, presents_per_s) =
+                        (n as f64 / elapsed, presents as f64 / elapsed);
                     eprintln!(
-                        "[presenter_bench] t={elapsed:.1}s sends={n} ({:.1}/s) presents={presents} ({:.1}/s)",
-                        n as f64 / elapsed,
-                        presents as f64 / elapsed
+                        "[presenter_bench] t={elapsed:.1}s sends={n} ({sends_per_s:.1}/s) presents={presents} ({presents_per_s:.1}/s)"
                     );
                     last_report = now;
                 }
@@ -148,11 +153,19 @@ mod imp {
             // "throughput".
             let (presents, present_nanos) =
                 litebox_platform_windows_userland::presentation::present_stats();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "present_nanos and presents are per-run counters far below 2^53, so the u64 to f64 conversions are exact"
+            )]
             let mean_present_ms = if presents > 0 {
                 (present_nanos as f64 / presents as f64) / 1.0e6
             } else {
                 f64::NAN
             };
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "presents and frame_size are per-run counters far below 2^53, so the conversions to f64 are exact"
+            )]
             let presented_bytes_per_s = (presents as f64 * frame_size as f64) / elapsed;
             // p99 present latency: sort the recent-sample snapshot from `presentation.rs`'s bounded
             // ring and index the 99th percentile directly -- exactly the kind of occasional-stall
@@ -160,25 +173,35 @@ mod imp {
             let mut samples =
                 litebox_platform_windows_userland::presentation::present_latency_samples_nanos();
             samples.sort_unstable();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a latency sample is a nanosecond count far below 2^53, so the u64 to f64 conversion is exact"
+            )]
             let p99_present_ms = if samples.is_empty() {
                 f64::NAN
             } else {
-                let idx = ((samples.len() as f64) * 0.99).floor() as usize;
+                let idx = (samples.len() * 99) / 100;
                 let idx = idx.min(samples.len() - 1);
                 samples[idx] as f64 / 1.0e6
             };
-            println!(
-                "PRESENTER_BENCH_RESULT duration_s={elapsed:.3} sends={total_sends} sends_per_s={:.2} presents={presents} presents_per_s={:.2} mean_present_ms={mean_present_ms:.3} p99_present_ms={p99_present_ms:.3} presented_mb_per_s={:.2} coalesced_dropped={} coalesced_drop_rate={:.4} sent_mb_per_s={:.2}",
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sends, presents, byte totals and nanosecond counters are per-run values far below 2^53, so the conversions to f64 are exact"
+            )]
+            let (sends_per_s, presents_per_s, coalesced_drop_rate, sent_mb_per_s) = (
                 total_sends as f64 / elapsed,
                 presents as f64 / elapsed,
-                presented_bytes_per_s / (1024.0 * 1024.0),
-                total_sends.saturating_sub(presents),
                 if total_sends > 0 {
                     total_sends.saturating_sub(presents) as f64 / total_sends as f64
                 } else {
                     0.0
                 },
-                (total_bytes as f64 / elapsed) / (1024.0 * 1024.0)
+                (total_bytes as f64 / elapsed) / (1024.0 * 1024.0),
+            );
+            println!(
+                "PRESENTER_BENCH_RESULT duration_s={elapsed:.3} sends={total_sends} sends_per_s={sends_per_s:.2} presents={presents} presents_per_s={presents_per_s:.2} mean_present_ms={mean_present_ms:.3} p99_present_ms={p99_present_ms:.3} presented_mb_per_s={:.2} coalesced_dropped={} coalesced_drop_rate={coalesced_drop_rate:.4} sent_mb_per_s={sent_mb_per_s:.2}",
+                presented_bytes_per_s / (1024.0 * 1024.0),
+                total_sends.saturating_sub(presents),
             );
             if presents == 0 {
                 eprintln!(
@@ -195,7 +218,7 @@ mod imp {
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn main() {
-    imp::main()
+    imp::main();
 }
 
 /// Everywhere else: still a buildable example, so `--all-targets` builds, but there is nothing

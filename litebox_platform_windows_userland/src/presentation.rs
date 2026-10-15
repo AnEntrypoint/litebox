@@ -135,17 +135,43 @@ pub fn encode_bmp(width: usize, height: usize, pitch: usize, bytes: &[u8]) -> Ve
     let mut out = Vec::with_capacity(file_size);
     // BITMAPFILEHEADER
     out.extend_from_slice(b"BM");
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "BMP stores the file size in a 32-bit field; frame dimensions are u32 guest scanout sizes, so the product stays within the format"
+    )]
     out.extend_from_slice(&(file_size as u32).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "data_offset is the constant 14 + 40 = 54"
+    )]
     out.extend_from_slice(&(data_offset as u32).to_le_bytes());
     // BITMAPINFOHEADER
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "info_header_size is the constant 40"
+    )]
     out.extend_from_slice(&(info_header_size as u32).to_le_bytes());
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "BMP stores width as a signed 32-bit field; width is a u32 guest scanout size widened to usize"
+    )]
     out.extend_from_slice(&(width as i32).to_le_bytes());
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "BMP stores height as a signed 32-bit field; height is a u32 guest scanout size widened to usize"
+    )]
     out.extend_from_slice(&(height as i32).to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes()); // planes
     out.extend_from_slice(&32u16.to_le_bytes()); // bpp
     out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB, uncompressed
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "BMP stores the pixel data size in a 32-bit field; same bound as the file size above"
+    )]
     out.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
     out.extend_from_slice(&2835i32.to_le_bytes()); // x ppm (~72 dpi)
     out.extend_from_slice(&2835i32.to_le_bytes()); // y ppm
@@ -224,10 +250,6 @@ pub fn count_pixel_stats(
 /// itself no longer blocks this call -- same file names (`litebox_frame_dump_<n>.bmp` unless
 /// `LITEBOX_DUMP_FRAMES_PATH` overrides it), same numbering, same BMP bytes, every frame.
 pub fn dump_frame_diagnostic(frame: &Frame) {
-    let width = frame.width as usize;
-    let height = frame.height as usize;
-    let pitch = frame.pitch as usize;
-
     // AGENTS.md pass 270: number each dumped frame so a run that transitions through multiple
     // distinct states (e.g. black -> real content -> black again, confirmed live this pass) can
     // be inspected frame-by-frame instead of only ever seeing the LAST write, which silently
@@ -239,6 +261,11 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
     // numbering in surviving file names reflects real flip position in the run, not a
     // renumbered-from-zero sample index.
     static FRAME_COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let pitch = frame.pitch as usize;
+
     let n = FRAME_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     let every: usize = std::env::var("LITEBOX_DUMP_FRAMES_EVERY")
@@ -246,7 +273,7 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
         .and_then(|s| s.parse().ok())
         .filter(|&v: &usize| v > 0)
         .unwrap_or(1);
-    if n % every != 0 {
+    if !n.is_multiple_of(every) {
         return;
     }
 
@@ -271,9 +298,10 @@ pub fn dump_frame_diagnostic(frame: &Frame) {
         return;
     }
 
-    let out_path = std::env::var("LITEBOX_DUMP_FRAMES_PATH")
-        .map(|base| format!("{base}.{n}"))
-        .unwrap_or_else(|_| format!("litebox_frame_dump_{n}.bmp"));
+    let out_path = std::env::var("LITEBOX_DUMP_FRAMES_PATH").map_or_else(
+        |_| format!("litebox_frame_dump_{n}.bmp"),
+        |base| format!("{base}.{n}"),
+    );
 
     let queued = QueuedDumpFrame {
         frame_number: n,
@@ -513,6 +541,10 @@ impl FrameSender {
     /// [`Self::take_free_buffer`] -- rather than simply dropped, so a steady-state producer that
     /// calls `take_free_buffer` before every `send` allocates a fresh `Vec` only on the very first
     /// flip (or after a genuine resolution change), not on every single one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the frame-slot or free-buffer mutex is poisoned.
     pub fn send(&self, frame: Frame) {
         let previous = {
             let mut pending = self.slot.pending.lock().expect("frame slot mutex poisoned");
@@ -546,6 +578,10 @@ impl FrameSender {
     /// out of the mapping is genuinely required for correctness; what this removes is the
     /// PER-FRAME ALLOCATION that copy previously always paid for, by reusing a `Vec` this same
     /// pipeline already owns instead of asking the allocator for a brand new one every single flip.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the free-buffer list mutex is poisoned.
     #[must_use]
     pub fn take_free_buffer(&self) -> Vec<u8> {
         self.slot
@@ -935,10 +971,7 @@ impl PresenterApp {
         // regression that stalled the presenter entirely (or silently disabled the texture pool)
         // would leave every producer-side number unchanged, which is exactly the blind spot that
         // makes a "throughput" figure meaningless. See `present_stats`.
-        let elapsed_nanos = present_started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
+        let elapsed_nanos = u64::try_from(present_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         PRESENTS_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         PRESENT_NANOS_TOTAL.fetch_add(elapsed_nanos, core::sync::atomic::Ordering::Relaxed);
         // Bounded recent-latency ring, so a caller (e.g. `presenter_bench`) can compute a real
@@ -1427,15 +1460,15 @@ impl ApplicationHandler<PresenterCommand> for PresenterApp {
                     })
                 });
                 if let Some((last_x, last_y)) = self.last_cursor_pos {
-                    let scaled_x = position.x * scale_x;
-                    let scaled_y = position.y * scale_y;
+                    let mapped_x = position.x * scale_x;
+                    let mapped_y = position.y * scale_y;
                     // A real mouse's per-event motion never approaches a delta anywhere near
                     // `i32`'s range, so this narrowing is exact in practice, not a real precision
                     // loss to guard against.
                     #[allow(clippy::cast_possible_truncation)]
-                    let dx = (scaled_x - last_x) as i32;
+                    let dx = (mapped_x - last_x) as i32;
                     #[allow(clippy::cast_possible_truncation)]
-                    let dy = (scaled_y - last_y) as i32;
+                    let dy = (mapped_y - last_y) as i32;
                     // ONE report for one physical movement, not two: see `InputSignal::RelMotion`.
                     // A zero delta on an axis is omitted by the receiver, and an all-zero move
                     // queues nothing at all.

@@ -405,24 +405,24 @@
 //! sub-region so a mixed-protection group is handled correctly), with a `'static`-leaked
 //! [`GuardSnapshotSlot`] table (one slot per guest page across every guarded group, `state: AtomicU8`
 //! + `bytes: UnsafeCell<[u8; 4096]>`, `#[repr(C)]` so both processes -- literally the same compiled
-//! binary, `current_exe()`-respawned -- agree on layout with no hand-computed offsets, using
-//! `core::mem::offset_of!` instead) reachable by the child through one new env var
-//! ([`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`], a plain `usize` address) over the SAME
-//! `PROCESS_VM_READ` handle [`lazy_commit_veh`] already opens on the parent -- no new IPC
-//! primitive. [`guard_cow_write_fault_veh`] is installed (once, lazily, `OnceLock`-guarded) on the
-//! PARENT the first time it ever grants a guarded fork; it declines (`EXCEPTION_CONTINUE_SEARCH`)
-//! every fault that is not a WRITE to a currently-guarded page, and for one that is, takes
-//! `VIRTUAL_PROTECT_LOCK` for the whole query-flip-copy-restore span (the exact precedent
-//! `fork_verify::write_usize_fault_tolerant` already established for this lock from inside VEH
-//! dispatch), snapshots the page's pre-write bytes into its slot, publishes `state=1` with
-//! `Ordering::Release`, restores the region's own recorded `old_protect` (never a blanket
-//! `PAGE_READWRITE` -- a sub-range that was already read-only in the guest keeps that meaning
-//! after healing), and returns `EXCEPTION_CONTINUE_EXECUTION`. [`lazy_commit_veh`] implements the
-//! double-checked-state protocol exactly as designed: live `ReadProcessMemory` FIRST, THEN a
-//! second, separate `ReadProcessMemory` of the slot's `state` byte -- if that post-read check now
-//! reads `1`, the live read is DISCARDED and a fresh `ReadProcessMemory` of the slot's `bytes`
-//! is used instead, never the reverse (see the 87th pass's own proof of why this ordering, not
-//! "check-then-branch", is the one that is actually race-free).
+//!   binary, `current_exe()`-respawned -- agree on layout with no hand-computed offsets, using
+//!   `core::mem::offset_of!` instead) reachable by the child through one new env var
+//!   ([`FORK_CHILD_GUARD_COW_TABLE_ENV_VAR`], a plain `usize` address) over the SAME
+//!   `PROCESS_VM_READ` handle [`lazy_commit_veh`] already opens on the parent -- no new IPC
+//!   primitive. [`guard_cow_write_fault_veh`] is installed (once, lazily, `OnceLock`-guarded) on the
+//!   PARENT the first time it ever grants a guarded fork; it declines (`EXCEPTION_CONTINUE_SEARCH`)
+//!   every fault that is not a WRITE to a currently-guarded page, and for one that is, takes
+//!   `VIRTUAL_PROTECT_LOCK` for the whole query-flip-copy-restore span (the exact precedent
+//!   `fork_verify::write_usize_fault_tolerant` already established for this lock from inside VEH
+//!   dispatch), snapshots the page's pre-write bytes into its slot, publishes `state=1` with
+//!   `Ordering::Release`, restores the region's own recorded `old_protect` (never a blanket
+//!   `PAGE_READWRITE` -- a sub-range that was already read-only in the guest keeps that meaning
+//!   after healing), and returns `EXCEPTION_CONTINUE_EXECUTION`. [`lazy_commit_veh`] implements the
+//!   double-checked-state protocol exactly as designed: live `ReadProcessMemory` FIRST, THEN a
+//!   second, separate `ReadProcessMemory` of the slot's `state` byte -- if that post-read check now
+//!   reads `1`, the live read is DISCARDED and a fresh `ReadProcessMemory` of the slot's `bytes`
+//!   is used instead, never the reverse (see the 87th pass's own proof of why this ordering, not
+//!   "check-then-branch", is the one that is actually race-free).
 //!
 //! **Verification this pass (both debug and release, all real command executions with real
 //! stdout/exit-code/`LITEBOX_DIAG_LAZY_FORK_COMMIT=1`/`LITEBOX_DIAG_FORK_TIMING=1` evidence, no
@@ -892,8 +892,12 @@ fn deserialize_lazy_ranges(s: &str) -> Vec<Range<usize>> {
 /// discipline) but stopping there -- no `WriteProcessMemory`, no per-page loop. The actual
 /// population happens later, lazily, in the CHILD, via this module's VEH handler
 /// ([`lazy_commit_veh`]), once [`install_if_configured`] has told it which ranges to expect.
+/// # Safety
+///
+/// `child` must be a process handle with `PROCESS_VM_OPERATION` access, and it must stay valid for
+/// the duration of the call.
 #[must_use]
-pub fn reserve_group_lazy(child: Handle, source_group: &Range<usize>) -> GroupCopyResult {
+pub unsafe fn reserve_group_lazy(child: Handle, source_group: &Range<usize>) -> GroupCopyResult {
     let len = source_group.len();
     let fail = |err: u32| GroupCopyResult {
         source_group: source_group.clone(),
@@ -1148,6 +1152,8 @@ pub fn install_if_configured() {
 static VEH_ENTRY_COUNT_DIAG: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const EXECUTE_ACCESS: usize = 8;
     // 114th pass, investigation-only: unconditional, allocation-free entry marker (same
     // `diag_raw_print` mechanism `lib.rs`'s own VEH uses on its hazardous-stack path) -- proves
     // whether this handler's own Rust body is even reached for a given fault, before anything
@@ -1193,7 +1199,6 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
         return EXCEPTION_CONTINUE_SEARCH;
     };
     let rec = unsafe { &*(*info).ExceptionRecord };
-    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -1210,7 +1215,6 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
     // so any address that lands inside a tracked lazy range for a reason this classification
     // couldn't foresee (a future case in the same class as the 104th pass's sigreturn-trampoline
     // bug) fails safe -- an honest crash/real-handler dispatch, never a silent infinite loop.
-    const EXECUTE_ACCESS: usize = 8;
     if rec.ExceptionInformation.first().copied() == Some(EXECUTE_ACCESS) {
         if diag {
             eprintln!(
@@ -1248,7 +1252,7 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
                 page_addr as *const c_void,
                 buf.as_mut_ptr().cast(),
                 PAGE_SIZE,
-                &mut read_len,
+                &raw mut read_len,
             )
         } != 0
             && read_len == PAGE_SIZE;
@@ -1278,7 +1282,7 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
                     (slot_addr + state_offset) as *const c_void,
                     state_byte.as_mut_ptr().cast(),
                     1,
-                    &mut sl,
+                    &raw mut sl,
                 )
             } != 0
                 && sl == 1;
@@ -1290,7 +1294,7 @@ unsafe extern "system" fn lazy_commit_veh(info: *mut EXCEPTION_POINTERS) -> i32 
                         (slot_addr + bytes_offset) as *const c_void,
                         buf.as_mut_ptr().cast(),
                         PAGE_SIZE,
-                        &mut snap_len,
+                        &raw mut snap_len,
                     )
                 } != 0
                     && snap_len == PAGE_SIZE;
@@ -1641,7 +1645,7 @@ fn guard_one_page(
                 page as *mut c_void,
                 PAGE_SIZE,
                 true_original_protect,
-                &mut discard_old,
+                &raw mut discard_old,
             );
         }
         if diag {
@@ -1681,7 +1685,7 @@ fn guard_one_page(
                 page as *mut c_void,
                 PAGE_SIZE,
                 PAGE_READONLY,
-                &mut old_protect,
+                &raw mut old_protect,
             ) != 0
         }
     };
@@ -1777,7 +1781,7 @@ fn try_guard_region_batched(
                 region_start as *mut c_void,
                 region_end - region_start,
                 PAGE_READONLY,
-                &mut old_protect,
+                &raw mut old_protect,
             ) != 0
         }
     };
@@ -1850,7 +1854,8 @@ fn reserve_group_lazy_guarded(
     source_group: &Range<usize>,
     group_slot_base: usize,
 ) -> GroupCopyResult {
-    let result = reserve_group_lazy(child, source_group);
+    // SAFETY: `child` is the caller's live child process handle, forwarded unchanged.
+    let result = unsafe { reserve_group_lazy(child, source_group) };
     if !result.succeeded {
         return result;
     }
@@ -2070,7 +2075,7 @@ pub fn abort_guard_cow_claim(claim: GuardCowClaim) {
                     *page_addr as *mut c_void,
                     PAGE_SIZE,
                     entry.true_original_protect,
-                    &mut discard_old,
+                    &raw mut discard_old,
                 );
             }
         }
@@ -2183,6 +2188,7 @@ pub fn invalidate_guarded_range(range: &Range<usize>) {
 /// pre-existing `fork_verify`/main VEH machinery is responsible for -- unchanged by this handler's
 /// mere presence.
 unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     let rec = unsafe { &*(*info).ExceptionRecord };
     // 114th pass, investigation-only: see `lazy_commit_veh`'s own identical (throttled) marker.
     if std::env::var_os("LITEBOX_DIAG_VEH_ENTRY_MARKERS").is_some() {
@@ -2198,7 +2204,6 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
             );
         }
     }
-    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
     if rec.ExceptionCode.cast_unsigned() != EXCEPTION_ACCESS_VIOLATION {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -2305,7 +2310,7 @@ unsafe extern "system" fn guard_cow_write_fault_veh(info: *mut EXCEPTION_POINTER
             page_addr as *mut c_void,
             PAGE_SIZE,
             entry.true_original_protect,
-            &mut discard_old,
+            &raw mut discard_old,
         ) != 0
     };
     if !restored {

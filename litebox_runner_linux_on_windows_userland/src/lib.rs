@@ -63,6 +63,10 @@ pub enum GuiMode {
 /// archive via `--initial-files`. The program path refers to a path inside the
 /// tar archive.
 #[derive(Parser, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent CLI flag that clap maps to its own --option; a state machine would not describe them"
+)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
@@ -457,13 +461,13 @@ impl std::io::Write for FlushingStderr {
 
 impl Drop for FlushingStderr {
     fn drop(&mut self) {
+        use std::io::Write as _;
         if self.0.is_empty() {
             return;
         }
         // One lock acquisition spanning BOTH the write and the flush -- unlike the two-call
         // version this replaces, no other thread's `std::io::stderr()` caller can interleave
         // bytes between them, because they all contend on this same global lock.
-        use std::io::Write as _;
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
         let _ = lock.write_all(&self.0);
@@ -523,6 +527,13 @@ struct BootLock {
 fn acquire_boot_lock() -> Result<BootLock> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
+    // Readers admitted, a second writer refused. Sharing READ is what lets the error path below
+    // still read the current holder's PID out of the file while the holder keeps the lock.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    // `ERROR_SHARING_VIOLATION` -- the OS refusing this open precisely because another live
+    // process holds the file. This, not a timestamp, is the lock's contention signal.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
     // Explicit, narrow escape hatch for deliberate multi-runner testing (e.g. an Xorg server in
     // one runner and an X client connecting to it via --publish in another -- both need to be
     // their own pid 1, so a single-runner arrangement cannot express this). The caller is
@@ -544,19 +555,12 @@ fn acquire_boot_lock() -> Result<BootLock> {
     // already promises.
     let lock_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".litebox-cache");
     std::fs::create_dir_all(&lock_dir)
         .with_context(|| format!("failed to create lock directory {}", lock_dir.display()))?;
     let lock_path = lock_dir.join("boot.lock");
-
-    // Readers admitted, a second writer refused. Sharing READ is what lets the error path below
-    // still read the current holder's PID out of the file while the holder keeps the lock.
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    // `ERROR_SHARING_VIOLATION` -- the OS refusing this open precisely because another live
-    // process holds the file. This, not a timestamp, is the lock's contention signal.
-    const ERROR_SHARING_VIOLATION: i32 = 32;
 
     // `create(true)` + `truncate(true)`, deliberately not `create_new(true)`: a lockfile left on
     // disk by a previous run is not itself the lock (the handle is), so an unheld leftover file
@@ -648,7 +652,24 @@ pub fn init_logging() {
         .try_init();
 }
 
+/// Runs the guest described by `cli_args`.
+///
+/// # Panics
+///
+/// Panics if `cli_args` has neither an OCI image nor an initial files archive. Clap's
+/// `required_unless_present` rejects that combination at parse time, so only a hand-built
+/// `CliArgs` can reach it.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    enum RootfsSource {
+        Tar {
+            mmap: MmappedFile,
+        },
+        OciLayers {
+            layers: Vec<std::borrow::Cow<'static, [u8]>>,
+            resolved_layers_json: String,
+        },
+    }
+
     // One fixed, well-known tar path for this whole boot tree's shared filesystem continuity --
     // see `process_fork::CONTAINER_FS_SNAPSHOT_ENV_VAR`'s own doc comment for the full "approximates
     // a real container's one shared mount namespace" reasoning. Set ONLY if not already inherited:
@@ -760,16 +781,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // on the same `Cow<'static, [u8]>` layer list before the shared `default_fs`-family call
     // below, so everything downstream of rootfs construction (in-mem upper layer, resume-from
     // import, guest boot) is identical regardless of which source was used.
-    enum RootfsSource {
-        Tar {
-            mmap: MmappedFile,
-        },
-        OciLayers {
-            layers: Vec<std::borrow::Cow<'static, [u8]>>,
-            resolved_layers_json: String,
-        },
-    }
-
     let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
         eprintln!("Pulling OCI image (runtime, in-memory): {image_ref}");
         // `pull_layers_in_memory_with_resolved_digests` pulls, decompresses, AND rewrites each
@@ -942,17 +953,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 resolved_layers_json,
             } => {
                 register_layer_sources(&layers);
-                match read_merged_rootfs_index_cache(&resolved_layers_json) {
-                    Some(entries) => shim_builder
-                        .default_fs_multi_layer_with_cached_merge(in_mem, layers, entries),
-                    None => {
-                        let (fs, freshly_built) =
-                            shim_builder.default_fs_multi_layer(in_mem, layers);
-                        if let Some(entries) = &freshly_built {
-                            write_merged_rootfs_index_cache(&resolved_layers_json, entries);
-                        }
-                        fs
+                if let Some(entries) = read_merged_rootfs_index_cache(&resolved_layers_json) {
+                    shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, layers, entries)
+                } else {
+                    let (fs, freshly_built) = shim_builder.default_fs_multi_layer(in_mem, layers);
+                    if let Some(entries) = &freshly_built {
+                        write_merged_rootfs_index_cache(&resolved_layers_json, entries);
                     }
+                    fs
                 }
             }
         }
@@ -1075,7 +1083,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 continue;
             };
             match env_pairs.iter_mut().find(|(known, _)| known == name) {
-                Some(slot) => slot.1 = value.to_owned(),
+                Some(slot) => value.clone_into(&mut slot.1),
                 None => env_pairs.push((name.to_owned(), value.to_owned())),
             }
         }
@@ -1364,6 +1372,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// and never returns) -- never from the normal (non-fork-diagnostic) `run()` path,
 /// and never in a way that feeds back into the real, unmodified thread-based `do_clone` fork
 /// path this crate's normal execution still uses exclusively.
+///
+/// # Panics
+///
+/// Panics if the guest-execution thread cannot be spawned, or if that thread panics.
 pub fn diag_process_fork_globalstate_probe() {
     // ROOT-CAUSE FIX (2026-09-17): everything this function goes on to do -- rebuilding the
     // rootfs, constructing `GlobalState`, adopting the parent's `PageManager`, and above all
@@ -1610,18 +1622,17 @@ fn diag_process_fork_globalstate_probe_inner() {
     // guest execution).
     register_layer_sources(&tar_layers);
     let fs = match &layer_digests_json {
-        Some(digests_json) => match read_merged_rootfs_index_cache(digests_json) {
-            Some(entries) => {
+        Some(digests_json) => {
+            if let Some(entries) = read_merged_rootfs_index_cache(digests_json) {
                 shim_builder.default_fs_multi_layer_with_cached_merge(in_mem, tar_layers, entries)
-            }
-            None => {
+            } else {
                 let (fs, freshly_built) = shim_builder.default_fs_multi_layer(in_mem, tar_layers);
                 if let Some(entries) = &freshly_built {
                     write_merged_rootfs_index_cache(digests_json, entries);
                 }
                 fs
             }
-        },
+        }
         None => shim_builder.default_fs_multi_layer(in_mem, tar_layers).0,
     };
     diag_elapsed!("default_fs_multi_layer returned (rootfs indexed/merged)");
@@ -1977,7 +1988,7 @@ fn diag_process_fork_task_resume_probe(
         comm,
         sigreturn_trampoline,
         identity.map(|id| id.pgid),
-        identity.map(|id| (id.pid_ns as u32, id.ns_pid, id.ns_tid)),
+        identity.map(|id| (id.pid_ns.cast_unsigned(), id.ns_pid, id.ns_tid)),
     );
 
     // Reopen the regular-file fds the parent held.
@@ -2681,8 +2692,13 @@ fn write_merged_rootfs_index_cache(resolved_layers_json: &str, flat_index: &[u8]
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
+    // Best-effort like the rest of this cache: an entry whose key cannot fit the 32-bit length
+    // prefix is skipped, not written with a wrong prefix.
+    let Ok(json_len) = u32::try_from(resolved_layers_json.len()) else {
+        return;
+    };
     let mut bytes = Vec::with_capacity(4 + resolved_layers_json.len());
-    bytes.extend_from_slice(&(resolved_layers_json.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&json_len.to_le_bytes());
     bytes.extend_from_slice(resolved_layers_json.as_bytes());
     bytes.extend_from_slice(flat_index);
 
@@ -2847,7 +2863,9 @@ fn merge_pieces(
     let (Some(blocks), Some(block)) = (&adopted.blocks, merge_block_size(adopted.len)) else {
         return whole();
     };
-    let adopted_len = adopted.len as usize;
+    let Ok(adopted_len) = usize::try_from(adopted.len) else {
+        return whole();
+    };
 
     // Re-hash the child's first `adopted_len` bytes on the ADOPTED file's own grid: that is the
     // only way to tell "grew past what I adopted" from "rewrote what I adopted" without keeping
@@ -3180,7 +3198,7 @@ fn import_writable_layer(
                 let mut contents = Vec::new();
                 std::io::Read::read_to_end(&mut entry, &mut contents)
                     .map_err(|e| anyhow!("failed to read {path} from archive: {e}"))?;
-                seeded_payload = contents.clone();
+                seeded_payload.clone_from(&contents);
                 // Some archives (e.g. ones built by appending individual files with
                 // `tarfile.open(path, 'a')` or GNU `tar -r` rather than a full
                 // directory-recursive `tar -c`) omit the intermediate `Directory`
