@@ -3516,7 +3516,9 @@ mod tests {
     use litebox::platform::PageManagementProvider;
     #[cfg(target_os = "linux")]
     use litebox_common_linux::MRemapFlags;
-    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    use litebox_common_linux::errno::Errno;
+    use litebox_common_linux::{MapFlags, ProtFlags};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};

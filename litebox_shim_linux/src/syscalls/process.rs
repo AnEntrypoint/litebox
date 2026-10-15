@@ -10625,9 +10625,11 @@ mod tests {
                 "nanosleep should have been interrupted"
             );
             let millis = remain.tv_sec.cast_unsigned() * 1000 + remain.tv_nsec / 1_000_000;
-            // Allow tolerance for timer imprecision (especially on Windows).
+            // Allow tolerance for timer imprecision (especially on Windows and macOS, whose
+            // timers have fired up to ~150 ms early in CI).
+            let low = if cfg!(target_os = "linux") { 1900 } else { 1700 };
             assert!(
-                (1900..=2100).contains(&millis),
+                (low..=2100).contains(&millis),
                 "expected ~2s remaining, got {millis:?}"
             );
 
