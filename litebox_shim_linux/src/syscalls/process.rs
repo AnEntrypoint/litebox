@@ -2706,9 +2706,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = clear_child_tid.write_at_offset::<Platform>(0, 0);
             // Cast from *i32 to *u32
             let clear_child_tid = UserPtrMut::from_usize(clear_child_tid.as_usize());
+            // The kernel wakes this word with shared (non-private) semantics, whatever the joiner
+            // used: a `pthread_join` on a thread in another host process waits without
+            // `FUTEX_PRIVATE_FLAG`. A private wake here goes to this process's own table and never
+            // reaches that waiter, so the joiner parks forever.
             let _ = self.sys_futex(litebox_common_linux::FutexArgs::Wake {
                 addr: clear_child_tid,
-                flags: litebox_common_linux::FutexFlags::PRIVATE,
+                flags: litebox_common_linux::FutexFlags::empty(),
                 count: 1,
             });
             litebox_util_log::debug!(tid:% = self.tid.get(); "DIAG prepare_for_exit: clear_child_tid futex wake done");
