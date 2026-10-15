@@ -5093,8 +5093,8 @@ mod unix_tests {
             panic!("autobind must assign an abstract-namespace address");
         };
 
-        assert!(!addr1.is_empty());
-        assert!(!addr2.is_empty());
+        assert_ne!(addr1.len(), 0);
+        assert_ne!(addr2.len(), 0);
         assert_ne!(
             addr1, addr2,
             "two autobind calls must get distinct addresses"

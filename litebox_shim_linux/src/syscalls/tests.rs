@@ -60,6 +60,7 @@ const BUILD_STACK_SIZE: usize = 8 << 20;
 /// than fail -- see [`init_tun_platform`]. This probes the device directly instead of asking
 /// `test_platform`, because that one is a process-wide `OnceLock` any earlier test may already
 /// have initialized *without* a TUN device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn tun_device_available() -> bool {
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     {
@@ -82,6 +83,7 @@ pub(crate) fn tun_device_available() -> bool {
 /// Same reasoning as [`tun_device_available`]: a test that shells out to a host daemon (`diod`,
 /// for the 9P tests) is testing the shim, not the host's package selection, so a missing daemon
 /// is a skip rather than a failure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn host_program_available(prog: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
         return false;
@@ -103,6 +105,7 @@ pub(crate) fn host_program_available(prog: &str) -> bool {
 /// [`init_platform`] for a test that needs a TUN device: `None` when this host has none, so the
 /// caller can `let Some(task) = ... else { return; }` and report as skipped.
 #[must_use]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn init_tun_platform(
     tun_device_name: &str,
 ) -> Option<crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>>> {
