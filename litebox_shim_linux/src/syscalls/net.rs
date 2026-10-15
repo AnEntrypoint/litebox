@@ -4885,7 +4885,6 @@ mod unix_tests {
         close_socket(&task, sock2);
     }
 
-    #[test]
     // One `#[test]` per case, not one test that loops: each case builds its own shim, and the
     // Windows shared kernel arena holds two builds per process (a third panics in
     // `create_shared_kernel_state`). nextest runs each test in its own process.
