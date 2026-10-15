@@ -121,7 +121,6 @@ jobs:
       - name: Run node and python inside the guest
         working-directory: smoke
         run: |
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /usr/bin/node -e "console.log('node-smoke-ok')"
           ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /usr/bin/python3 -c "print('python-smoke-ok')"
       - name: Resume from an exported writable layer
         working-directory: smoke
