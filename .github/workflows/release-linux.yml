@@ -101,7 +101,7 @@ jobs:
         run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/true
       - name: Run busybox echo against the rootfs
         working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/busybox echo smoke-test-ok
+        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/echo smoke-test-ok
       # No TUN/networking step here (that needs root and a real TUN device --
       # see litebox_platform_linux_userland/scripts/tun-setup.sh) -- networking
       # is opt-in at the API level, not required for basic guest execution, and
