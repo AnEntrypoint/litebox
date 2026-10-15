@@ -238,7 +238,7 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
                 && self
                     .pair
                     .eof_pending
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                     .is_ok()
             {
                 return Ok(0);
@@ -510,7 +510,7 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
     fn slave_closed(&self, host: u32) {
         for (h, c) in self.slave_hosts.iter().zip(&self.slave_counts) {
             if h.load(Ordering::Acquire) == host
-                && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                && c.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
             {
                 return;
@@ -557,7 +557,7 @@ impl<Platform: ShimPlatform> SharedPtySlot<Platform> {
     fn master_released(&self, host: u32) {
         for (h, c) in self.master_hosts.iter().zip(&self.master_counts) {
             if h.load(Ordering::Acquire) == host
-                && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                && c.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
             {
                 return;
@@ -840,7 +840,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
         } else if !for_master
             && slot
                 .eof_pending
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
                 .is_ok()
         {
             Ok(0)

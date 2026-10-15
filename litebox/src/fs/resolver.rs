@@ -273,7 +273,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
-        assert!(!components.is_empty());
+        assert_ne!(components.len(), 0);
         self.walk_path_following_symlinks(
             context,
             from,
