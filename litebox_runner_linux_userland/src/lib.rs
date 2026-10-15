@@ -641,8 +641,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     });
 
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = if cli_args.tun_device_name.is_some() {
+    // The shim's network runs in manual mode: only this worker moves packets. Without it, even
+    // loopback traffic between two guest processes queues forever, because a connect() never
+    // leaves SYN-SENT. So the worker runs on every run, not only with a TUN device.
+    let net_worker = {
         let shim = shim.clone();
+        let tun_present = cli_args.tun_device_name.is_some();
+        // Waits for ingress on the TUN device when there is one. Without one there is nothing to
+        // poll, so this sleeps the bounded timeout, which keeps loopback delivery under a millisecond.
+        let wait_for_packets = move |timeout: core::time::Duration| {
+            if tun_present {
+                platform.wait_on_tun(Some(timeout));
+            } else {
+                std::thread::sleep(timeout);
+            }
+        };
         let shutdown_clone = shutdown.clone();
         let child = litebox_platform_linux_userland::spawn_host_thread(move || {
             const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
@@ -661,19 +674,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 // TODO: We only wait for ingress packets on the TUN device and thus may block processing egress packets for up to `timeout`.
                 // Set a maximum timeout to ensure we don't wait too long. Alternatively, shim could notify us when there are egress packets to process,
                 // but that would require more invasive changes.
-                platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
+                wait_for_packets(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT));
             }
             // Final flush: give in-flight data (a server that wrote its response and exited)
             // up to two seconds to drain and be acknowledged, like a real kernel that keeps
             // sending after the owning process is gone.
             for _ in 0..200 {
                 while shim.perform_network_interaction().call_again_immediately() {}
-                platform.wait_on_tun(Some(core::time::Duration::from_millis(10)));
+                wait_for_packets(core::time::Duration::from_millis(10));
             }
         });
         Some(child)
-    } else {
-        None
     };
 
     let argv = cli_args

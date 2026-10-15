@@ -2578,7 +2578,10 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
+            // Without a TUN device there is no route off the host. Loopback traffic never reaches
+            // this point (the stack delivers it in-process), so only an external destination does.
+            // `SendError` has no variants, so the packet is dropped, as an unroutable one is.
+            return Ok(());
         };
         match unsafe {
             syscalls::syscall3(
@@ -2606,7 +2609,9 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     ) -> Result<usize, litebox::platform::ReceiveError> {
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
-            unimplemented!("networking without tun is unimplemented")
+            // Without a TUN device nothing arrives from outside; loopback packets are queued by the
+            // stack itself and never come through here.
+            return Err(litebox::platform::ReceiveError::WouldBlock);
         };
         unsafe {
             syscalls::syscall3(
