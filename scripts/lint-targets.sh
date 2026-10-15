@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Run clippy the way CI does for each target, and print warning and error counts per target.
 #
 # usage: scripts/lint-targets.sh [host|windows|macos|all]   (default: all)

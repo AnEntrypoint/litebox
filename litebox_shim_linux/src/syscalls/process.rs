@@ -10639,8 +10639,10 @@ mod tests {
 
             let elapsed_ms = elapsed.as_millis();
             std::println!("Alarm fired after {elapsed_ms} ms");
+            // macOS and Windows timers have fired ~130 ms late in CI, see the tolerance above.
+            let high = if cfg!(target_os = "linux") { 1100 } else { 1250 };
             assert!(
-                (900..=1100).contains(&elapsed_ms),
+                (900..=high).contains(&elapsed_ms),
                 "expected alarm after ~1000 ms, got {elapsed_ms} ms"
             );
 

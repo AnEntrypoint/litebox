@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Run one runner integration test with the stuck-thread diagnostic, and say where it stopped.
 #
 # usage: scripts/repro-test.sh <test-name> [cap-seconds]   (cap defaults to 300)

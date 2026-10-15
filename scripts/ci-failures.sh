@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # Summarise the failing jobs of the CI run for one commit, with their error lines.
 #
 # usage: scripts/ci-failures.sh <sha-prefix> [workflow]   (workflow defaults to CI)
