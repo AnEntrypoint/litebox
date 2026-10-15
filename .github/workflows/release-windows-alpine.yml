@@ -170,6 +170,10 @@ jobs:
       - name: Run 4 concurrent instances against the same rootfs tar (multi-agent fan-out safety)
         working-directory: smoke
         shell: pwsh
+        # This step exists to prove concurrent boots are safe, so it opts in to the runner's
+        # concurrent-boot escape hatch. Without it the host-wide boot lock refuses instances 2-4.
+        env:
+          LITEBOX_ALLOW_CONCURRENT_BOOT: "1"
         run: |
           $jobs = 1..4 | ForEach-Object {
             $i = $_
