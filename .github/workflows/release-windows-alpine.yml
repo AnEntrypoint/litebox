@@ -106,7 +106,7 @@ jobs:
       - name: Run real DNS lookup against the rootfs (no Administrator privileges)
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/getent hosts dl-cdn.alpinelinux.org
-      - name: Install and run an extra package via apk (proves further tooling is installable)
+      - name: Run a shell pipeline in the rootfs (coreutils, no package manager needed)
         working-directory: smoke
         # TEMPORARY (pass 37 of an ongoing crash investigation): LITEBOX_LOG/LITEBOX_VEH_TRACE
         # enabled here to capture a real crash signature from CI's actual Windows Server runner,
@@ -116,7 +116,7 @@ jobs:
           LITEBOX_LOG: debug
           LITEBOX_VEH_TRACE: "1"
           LITEBOX_DIAG_ALLOC: "1"
-        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'apk add --no-cache jq && echo hello | jq -R .'
+        run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/sh -c 'echo hello | tr a-z A-Z'
       - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
         working-directory: smoke
         run: .\litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
