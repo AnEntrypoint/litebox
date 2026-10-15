@@ -4886,13 +4886,36 @@ mod unix_tests {
     }
 
     #[test]
-    fn test_unix_socketpair_bidirectional() {
+    // One `#[test]` per case, not one test that loops: each case builds its own shim, and the
+    // Windows shared kernel arena holds two builds per process (a third panics in
+    // `create_shared_kernel_state`). nextest runs each test in its own process.
+    #[test]
+    fn test_unix_socketpair_bidirectional_stream() {
         unix_socketpair_bidirectional(SockType::Stream, false);
-        unix_socketpair_bidirectional(SockType::Datagram, false);
-        unix_socketpair_bidirectional(SockType::SeqPacket, false);
+    }
 
+    #[test]
+    fn test_unix_socketpair_bidirectional_datagram() {
+        unix_socketpair_bidirectional(SockType::Datagram, false);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional_seqpacket() {
+        unix_socketpair_bidirectional(SockType::SeqPacket, false);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional_nonblocking_stream() {
         unix_socketpair_bidirectional(SockType::Stream, true);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional_nonblocking_datagram() {
         unix_socketpair_bidirectional(SockType::Datagram, true);
+    }
+
+    #[test]
+    fn test_unix_socketpair_bidirectional_nonblocking_seqpacket() {
         unix_socketpair_bidirectional(SockType::SeqPacket, true);
     }
 
