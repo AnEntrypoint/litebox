@@ -1632,12 +1632,6 @@ enum SharedRecordLockOutcome {
     Applied,
     /// A live process holds an incompatible claim over the range.
     Conflict,
-    /// This table cannot key the request: the caller falls back to its per-process table.
-    // Never constructed since merge 6a967c57 dropped its `return ...::Unavailable` lines; the
-    // fallback at the match on this variant is therefore unreachable. Restore the constructions
-    // (see `git log -m -G 'SharedRecordLockQuery::Unavailable'`) rather than deleting the fallback.
-    #[allow(dead_code)]
-    Unavailable,
     /// This table is the live one but has no room for the split: the guest gets `ENOLCK`.
     Full,
 }
@@ -1653,7 +1647,7 @@ pub(crate) enum SharedRecordLockQuery {
         start: u64,
         end: u64,
     },
-    /// Same meaning as [`SharedRecordLockOutcome::Unavailable`]: ask the per-process table.
+    /// This table cannot key the request: the caller asks its per-process table instead.
     Unavailable,
 }
 
@@ -2038,7 +2032,6 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
                 region, platform, dev, path, host, guest, start, end, write, unlock,
             ) {
                 SharedRecordLockOutcome::Applied => return Some(Ok(())),
-                SharedRecordLockOutcome::Unavailable => return None,
                 SharedRecordLockOutcome::Full => return Some(Err(Errno::ENOLCK)),
                 SharedRecordLockOutcome::Conflict => {
                     if nonblocking {
