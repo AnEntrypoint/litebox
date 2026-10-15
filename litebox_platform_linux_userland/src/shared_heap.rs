@@ -348,9 +348,13 @@ fn report_big_alloc(size: usize) {
     for i in (0..nd).rev() {
         put(&[digits[i]], &mut buf, &mut n);
     }
-    let mut rbp: usize;
+    // The frame-pointer walk is x86_64 only. Elsewhere rbp stays 0 and the loop below ends at once.
+    let mut rbp: usize = 0;
+    #[cfg(target_arch = "x86_64")]
     // SAFETY: reads the frame-pointer register only.
-    unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) rbp)
+    };
     for _ in 0..12 {
         if rbp < 0x1000 || !rbp.is_multiple_of(8) {
             break;
