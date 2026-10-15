@@ -3,23 +3,25 @@
 
 use core::ops::Range;
 
+#[cfg(target_os = "linux")]
 use alloc::vec;
+#[cfg(target_os = "linux")]
 use alloc::vec::Vec;
 
+use crate::platform::{
+    RawConstPointer,
+    trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+};
+#[cfg(target_os = "linux")]
 use crate::{
     mm::linux::{CreatePagesFlags, NonZeroAddress},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::MemoryRegionPermissions,
-        trivial_providers::{TransparentConstPtr, TransparentMutPtr},
-    },
+    platform::{PageManagementProvider, page_mgmt::MemoryRegionPermissions},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::linux::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError,
-    VmemResizeError, is_private_data_range,
-};
+#[cfg(target_os = "linux")]
+use super::linux::{NonZeroPageSize, PageRange, Vmem, VmemProtectError, VmemResizeError};
+use super::linux::{PAGE_SIZE, VmArea, VmFlags, is_private_data_range};
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
@@ -93,6 +95,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
 }

@@ -328,6 +328,7 @@ fn diag_near_null_write(dst: usize) {
     }
     while v > 0 {
         hpos -= 1;
+        #[expect(clippy::cast_possible_truncation, reason = "masked to four bits")]
         let nib = (v & 0xf) as u8;
         hexbuf[hpos] = if nib < 10 {
             b'0' + nib
@@ -342,6 +343,9 @@ fn diag_near_null_write(dst: usize) {
     pos += n;
     line[pos] = b'\n';
     pos += 1;
+    let Ok(len) = u32::try_from(pos) else {
+        return;
+    };
     unsafe {
         use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
         let handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -350,7 +354,7 @@ fn diag_near_null_write(dst: usize) {
             windows_sys::Win32::Storage::FileSystem::WriteFile(
                 handle,
                 line.as_ptr(),
-                pos as u32,
+                len,
                 &raw mut written,
                 core::ptr::null_mut(),
             );

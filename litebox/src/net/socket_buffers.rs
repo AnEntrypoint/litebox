@@ -146,6 +146,10 @@ impl SocketBuffers {
         let (idx, slot) = self.meta.alloc()?;
         claim.meta[usize::from(claim.nmeta)] = idx;
         claim.nmeta += 1;
+        #[allow(
+            clippy::cast_ptr_alignment,
+            reason = "the slot is aligned to SLOT_ALIGN, which the const assertions above check against PacketMetadata"
+        )]
         let ptr = slot.as_mut_ptr().cast::<PacketMetadata<udp::UdpMetadata>>();
         for i in 0..MAX_PACKET_COUNT {
             // SAFETY: the slot is `META_SLOT_SIZE` bytes, aligned to `SLOT_ALIGN`, and the const
