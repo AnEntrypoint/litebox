@@ -257,6 +257,10 @@ impl LinuxUserland {
         litebox::fs::ident::set_thread_id_fn(cached_host_tid);
         litebox::fs::ident::set_thread_alive_fn(|tid| {
             // SAFETY: signal 0 only probes for existence.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "kernel thread ids are small positive integers, far below i64::MAX"
+            )]
             let r = unsafe { libc::syscall(libc::SYS_tkill, tid as libc::c_long, 0) };
             r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
         });

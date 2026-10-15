@@ -4134,7 +4134,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok()
                     .zip(self.carriable_file_for_raw_fd(*raw_fd))
                 {
-                    _ if let Some((name, size, flags)) = self.carriable_shm_for_raw_fd(*raw_fd) => {
+                    _ if self.carriable_shm_for_raw_fd(*raw_fd).is_some() => {
+                        let (name, size, flags) = self
+                            .carriable_shm_for_raw_fd(*raw_fd)
+                            .expect("checked just above");
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(), fd:% = raw_fd, name:% = name, size:% = size;
                             "clone: carrying a shared-memory file into the cross-process child by object name"
@@ -4204,10 +4207,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // A pty SLAVE is carried by reopening `/dev/pts/<id>` in the child (see
                     // `carriable_pty_slave_for_raw_fd`): it is the stdio of a `forkpty()` child
                     // and of every command a shell inside a terminal runs.
-                    None if let Some(fd) = i32::try_from(*raw_fd).ok()
-                        && let Some((path, flags)) =
-                            self.carriable_pty_slave_for_raw_fd(*raw_fd) =>
+                    None if i32::try_from(*raw_fd).is_ok()
+                        && self.carriable_pty_slave_for_raw_fd(*raw_fd).is_some() =>
                     {
+                        let fd = i32::try_from(*raw_fd).expect("checked just above");
+                        let (path, flags) = self
+                            .carriable_pty_slave_for_raw_fd(*raw_fd)
+                            .expect("checked just above");
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(), fd:% = fd, path:% = path;
                             "clone: carrying a pty slave into the cross-process child"
@@ -4224,7 +4230,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // which uses the inherited master before `exec` (`ioctl(master, TIOCGPTPEER)`).
                     // Dropping it is only right for the `forkpty()` shape, where the child opens the
                     // slave by path and never touches the master.
-                    None if let Some(id) = self.carriable_pty_master_for_raw_fd(*raw_fd) => {
+                    None if self.carriable_pty_master_for_raw_fd(*raw_fd).is_some() => {
+                        let id = self
+                            .carriable_pty_master_for_raw_fd(*raw_fd)
+                            .expect("checked just above");
                         litebox_util_log::debug!(
                             tid:% = self.tid.get(), fd:% = raw_fd, pty:% = id;
                             "clone: carrying a published pty master into the cross-process child"

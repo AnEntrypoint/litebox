@@ -684,6 +684,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
         let task = crate::syscalls::tests::init_platform(None);
 

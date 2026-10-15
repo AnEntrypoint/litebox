@@ -2322,7 +2322,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         }
         .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
-        let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
+        let new_range = PageRange::new(new_addr, new_addr + length.as_usize())
+            .ok_or(AllocationError::Unaligned)?;
         let behavior = if fixed_addr {
             if flags.contains(CreatePagesFlags::NOREPLACE) {
                 FixedAddressBehavior::NoReplace

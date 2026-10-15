@@ -415,6 +415,10 @@ fn put_dec(mut v: usize, out: &mut [u8], n: &mut usize) {
 )]
 fn report_lock_owner(owner: usize, me: usize) {
     // SAFETY: tkill with signal 0 only probes for the thread's existence.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "kernel thread ids are small positive integers, far below i64::MAX"
+    )]
     let probe = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) };
     let probe_err = if probe == -1 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as usize
@@ -510,6 +514,10 @@ impl<'a> Guard<'a> {
                 let owner = h.lock.load(Ordering::Relaxed);
                 if owner != 0 && owner != me {
                     // SAFETY: tkill with signal 0 only probes for the thread's existence.
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "kernel thread ids are small positive integers, far below i64::MAX"
+                    )]
                     let gone = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) }
                         == -1
                         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);

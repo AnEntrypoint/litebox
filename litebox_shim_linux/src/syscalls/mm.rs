@@ -3523,6 +3523,7 @@ mod tests {
     use litebox::mm::linux::PAGE_SIZE;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_anonymous_mmap() {
         let task = init_platform(None);
 
@@ -3543,6 +3544,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_file_backed_mmap() {
         let task = init_platform(None);
 
@@ -3573,6 +3575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_mremap() {
         let task = init_platform(None);
 
@@ -3622,6 +3625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_mmap_fixed_noreplace() {
         let task = init_platform(None);
 
@@ -4310,6 +4314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_madvise() {
         let task = init_platform(None);
 
@@ -4362,6 +4367,7 @@ mod tests {
     /// must return `Ok`; `MADV_REMOVE`/`MADV_HWPOISON`/`MADV_SOFT_OFFLINE` must fail cleanly
     /// with `EINVAL` rather than panicking.
     #[test]
+    #[cfg(target_os = "linux")]
     fn madvise_covers_every_behavior_without_panicking() {
         use litebox_common_linux::MadviseBehavior;
 
