@@ -36,7 +36,7 @@ pub(crate) struct PipeStatusFlags(OFlags);
 /// Both ends of a freshly created Linux pipe.
 ///
 /// `PipeFd` does not release the pipe on `Drop`; ends must either be inserted
-/// into the fd table or explicitly released via [`GlobalState::close_linux_pipe`].
+/// into the fd table or explicitly released via `GlobalState::close_linux_pipe`.
 pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) reader: PipeFd<Platform>,
     pub(crate) writer: PipeFd<Platform>,

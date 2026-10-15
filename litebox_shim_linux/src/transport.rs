@@ -56,7 +56,7 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     /// Create a TCP socket, connect it to `addr`, and return a transport.
     ///
     /// The socket is created via [`litebox::net::Network::socket`] and initialised
-    /// with [`GlobalState::initialize_socket`] so that the channel-based proxy is
+    /// with `GlobalState::initialize_socket` so that the channel-based proxy is
     /// set up, but the socket is **not** assigned a guest fd number.
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,

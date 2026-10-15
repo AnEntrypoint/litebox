@@ -913,7 +913,7 @@ pub struct Termios2 {
     pub c_ospeed: tcflag_t,
 }
 
-/// The low 4 bits of `c_cflag`, holding an index into [`BAUD_TABLE`].
+/// The low 4 bits of `c_cflag`, holding an index into `BAUD_TABLE`.
 pub const CBAUD: tcflag_t = 0o000017;
 /// Set when `c_cflag`'s baud index belongs to the extended range (`B57600` and up), in which
 /// case Linux adds 15 to the index before looking it up.
@@ -1180,7 +1180,7 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC020_64B9;
 /// uses this specifically for DPMS (`connector Virtual-1: Failed to set DPMS property: Invalid
 /// argument`, confirmed live as labwc's exact failure when this ioctl was entirely unhandled and
 /// fell through to the dispatch's `EINVAL` default arm). See
-/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why accepting this is a safe,
+/// `DrmSubsystem::connector_set_property`'s own doc comment for why accepting this is a safe,
 /// honest no-op in a single-address-space shim with no real hardware DPMS state to change.
 pub const DRM_IOCTL_MODE_CONNECTOR_SETPROPERTY: u32 = 0xC010_64AB;
 /// `DRM_IOCTL_MODE_OBJ_SETPROPERTY = DRM_IOWR(0xba, struct drm_mode_obj_set_property)`,
@@ -1207,7 +1207,7 @@ pub const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC018_64BA;
 /// `u32`s then a `u64`, same independent-re-verification discipline as the constant above). Real
 /// clients reach this after `OBJ_GETPROPERTIES` returns a blob-typed property (this device's
 /// [`VIRTUAL_CONNECTOR_EDID_PROP_ID`]) to fetch the blob's raw bytes -- see
-/// [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID this backs.
+/// `DrmSubsystem::get_prop_blob`'s own doc comment for the synthesized EDID this backs.
 pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC010_64AC;
 /// `DRM_MODE_OBJECT_CONNECTOR` -- the `obj_type` a real client passes when asking
 /// `DRM_IOCTL_MODE_OBJ_GETPROPERTIES` about a connector (as opposed to a CRTC, encoder, or
@@ -1216,18 +1216,18 @@ pub const DRM_IOCTL_MODE_GETPROPBLOB: u32 = 0xC010_64AC;
 /// current ioctl surface).
 pub const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 /// `DRM_MODE_OBJECT_PLANE` (real kernel `drm_mode.h` value) -- used by
-/// [`DrmSubsystem::obj_get_properties`]/[`DrmSubsystem::get_property`] to report the plane's
+/// `DrmSubsystem::obj_get_properties`/`DrmSubsystem::get_property` to report the plane's
 /// `type` property, which real legacy (non-atomic) DRM clients using universal planes --
 /// including weston's `drm-backend.so`, per `libweston/backend-drm/drm.c`'s
 /// `drm_output_find_special_plane` -- query to find the primary plane before enabling an output.
 pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 /// `DRM_MODE_PROP_ENUM` (`1<<3`, real kernel `drm_mode.h` value) -- marks a property as an
-/// enumerated type with named values, resolved by [`DrmSubsystem::get_property`]'s `type`
+/// enumerated type with named values, resolved by `DrmSubsystem::get_property`'s `type`
 /// property response.
 pub const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 /// A fixed, arbitrary, non-zero object ID for the plane's one `type` property -- real DRM
 /// property IDs are driver-internal opaque values from userspace's perspective (see
-/// [`VIRTUAL_CONNECTOR_ID`]-style constants' own doc comments for the same reasoning).
+/// `VIRTUAL_CONNECTOR_ID`-style constants' own doc comments for the same reasoning).
 pub const VIRTUAL_PLANE_TYPE_PROP_ID: u32 = 100;
 /// The real, on-the-wire numeric value this device's plane reports for its `type` property.
 /// Real DRM clients (weston's `drm_property_info_populate`) resolve an enum property's meaning
@@ -1240,8 +1240,8 @@ pub const VIRTUAL_PLANE_TYPE_VALUE: u64 = 1;
 /// (as [`DRM_MODE_PROP_ENUM`]'s plane `type` property is).
 pub const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 /// A fixed, arbitrary, non-zero property ID for the virtual connector's `DPMS` property --
-/// see [`DrmSubsystem::obj_get_properties`]'s connector branch and
-/// [`DrmSubsystem::connector_set_property`]'s own doc comment for why this device accepts a
+/// see `DrmSubsystem::obj_get_properties`'s connector branch and
+/// `DrmSubsystem::connector_set_property`'s own doc comment for why this device accepts a
 /// DPMS set as a no-op rather than tracking real display-power state.
 pub const VIRTUAL_CONNECTOR_DPMS_PROP_ID: u32 = 101;
 /// The on-the-wire value this device's connector reports for its `DPMS` property -- `DRM_MODE_
@@ -1249,7 +1249,7 @@ pub const VIRTUAL_CONNECTOR_DPMS_PROP_ID: u32 = 101;
 /// "on" (there is no real backlight/power state to report otherwise).
 pub const VIRTUAL_CONNECTOR_DPMS_VALUE: u64 = 0;
 /// A fixed, arbitrary, non-zero property ID for the virtual connector's `EDID` blob property --
-/// see [`DrmSubsystem::get_prop_blob`]'s own doc comment for the synthesized EDID bytes this
+/// see `DrmSubsystem::get_prop_blob`'s own doc comment for the synthesized EDID bytes this
 /// resolves to.
 pub const VIRTUAL_CONNECTOR_EDID_PROP_ID: u32 = 102;
 /// A fixed, arbitrary, non-zero blob ID for the virtual connector's synthesized EDID -- real DRM
@@ -1318,7 +1318,7 @@ pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: u32 = 0xC00C_642D;
 /// one higher per the real kernel `drm.h`). Confirmed live-reachable immediately after every
 /// `PRIME_HANDLE_TO_FD` call in this device's own real client traffic: wlroots'
 /// `render/allocator/drm_dumb.c` self-imports the fd it just exported to obtain a GEM handle for
-/// the new buffer object it constructs around it -- see [`DrmSubsystem::lookup_handle_by_map_offset`]
+/// the new buffer object it constructs around it -- see `DrmSubsystem::lookup_handle_by_map_offset`
 /// (`litebox_shim_linux`) for why this device's single-client, no-real-dma-buf model makes that
 /// self-import a same-handle round-trip rather than needing genuine cross-device import.
 pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
@@ -1330,7 +1330,7 @@ pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = 0xC00C_642E;
 /// as wlroots' own logged "drmCloseBufferHandle failed: Invalid argument" (non-fatal in wlroots,
 /// but a real, silently-broken ioctl surface). This device has no per-handle GEM refcounting (a
 /// dumb-buffer handle's real lifetime is governed entirely by `DRM_IOCTL_MODE_DESTROY_DUMB`, see
-/// that ioctl's own handler) -- [`DrmSubsystem::gem_close`]'s own doc comment (`litebox_shim_linux`)
+/// that ioctl's own handler) -- `DrmSubsystem::gem_close`'s own doc comment (`litebox_shim_linux`)
 /// explains why a real no-op-success is the correct, non-fabricated answer here rather than
 /// something requiring genuine reference-count bookkeeping.
 pub const DRM_IOCTL_GEM_CLOSE: u32 = 0x4008_6409;

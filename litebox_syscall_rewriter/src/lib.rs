@@ -470,7 +470,7 @@ fn hook_aarch64_elf(
 /// mesa consumer failed to load. `xfwm4` retried that load about three times a second forever,
 /// never created a single X window, and the XFCE desktop stayed black.
 ///
-/// The ahead-of-time [`patch_binary`] path never had this bug: it patches `text_sections` only.
+/// The ahead-of-time `patch_binary` path never had this bug: it patches `text_sections` only.
 /// This function gives the runtime path the same notion of "code", from the same source of truth.
 ///
 /// A section qualifies exactly when it is `SHF_ALLOC | SHF_EXECINSTR` and actually occupies file
@@ -1211,7 +1211,7 @@ struct SyscallSite {
 ///
 /// # Why this is address-independent, and why that matters
 ///
-/// Scanning is by far the expensive half of patching (see [`scan_section`]), and it is a pure
+/// Scanning is by far the expensive half of patching (see `scan_section`), and it is a pure
 /// function of the segment's BYTES. Keeping the result addressed relative to the segment start
 /// means one scan of a file can be reused every time that file is mapped, at whatever address.
 ///

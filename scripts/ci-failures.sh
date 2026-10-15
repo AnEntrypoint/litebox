@@ -28,7 +28,8 @@ fi
 
 while read -r rid name conclusion; do
   echo "== run $rid [$name] $conclusion"
-  if [ "$conclusion" != "failure" ]; then continue; fi
+  # A cancelled run still carries the logs of the jobs that failed before the cancel.
+  if [ "$conclusion" = "success" ]; then continue; fi
   log="$cache/$rid.log"
   if [ ! -s "$log" ]; then
     gh run view "$rid" --log-failed 2>/dev/null | sed -E 's/(\x1b|\^\[)\[[0-9;]*m//g' > "$log" || true

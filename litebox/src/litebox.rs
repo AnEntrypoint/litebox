@@ -158,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// thread already holds the table.
     ///
     /// For a caller that cannot afford to park because it is itself holding a lock other threads
-    /// need -- [`crate::net::Network::attempt_to_close_queued`] runs with the cross-process
+    /// need -- `crate::net::Network::attempt_to_close_queued` runs with the cross-process
     /// `net_lock` held, so blocking here would freeze every process in the fork family behind a
     /// guest thread that holds the table and then asks for `net_lock`. Skipping the pass and
     /// retrying on the next tick is always safe: this is maintenance work, not a request.

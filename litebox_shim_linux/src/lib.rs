@@ -1080,7 +1080,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// decisive live cross-process presence-table proof -- see
     /// `syscalls::process::Task::try_cross_process_fork`'s matching parent-side inserts, mirroring
     /// `diag_next_thread_id`'s own `GLOBALSTATE_SHARE_PROBE` pattern exactly). `kind` is
-    /// [`syscalls::unix::UNIX_ADDR_KIND_PATH`]/[`syscalls::unix::UNIX_ADDR_KIND_ABSTRACT`].
+    /// `syscalls::unix::UNIX_ADDR_KIND_PATH`/`syscalls::unix::UNIX_ADDR_KIND_ABSTRACT`.
     pub fn diag_unix_addr_presence_insert(&self, kind: u32, key: &[u8], owner_pid: u32) -> bool {
         self.0.unix_addr_presence.insert(kind, key, owner_pid)
     }
@@ -1129,7 +1129,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Clone for LinuxShim<Platform, FS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// Install (or replace) the host-side callback invoked on every real DRM page-flip (see
-    /// [`syscalls::drm::DrmFlipLocal::add_flip_callback`]'s doc comment for the exact contract and
+    /// `syscalls::drm::DrmFlipLocal::add_flip_callback`'s doc comment for the exact contract and
     /// why it deliberately takes plain pixel bytes rather than a platform-specific handle) -- the
     /// sole public entry point into the shim's own `/dev/dri/card0` emulation, since
     /// `syscalls::drm::SharedDrmTable` itself stays a private implementation detail. A runner binary that depends
@@ -1139,7 +1139,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     ///
     /// ADDITIVE: each call installs an ADDITIONAL observer rather than replacing the previous
     /// one, so a `--gui` window and a `LITEBOX_DUMP_FRAMES` capture can both watch the same
-    /// frames. See [`syscalls::drm::DrmFlipLocal::callbacks`] for why that matters.
+    /// frames. See `syscalls::drm::DrmFlipLocal::callbacks` for why that matters.
     pub fn add_drm_flip_callback(
         &self,
         callback: impl Fn(&[u8], u32, u32, u32, u32) + Send + Sync + 'static,
@@ -1161,7 +1161,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     }
 
     /// Push a real keyboard/mouse-button transition into the shim's `/dev/input/event0` queue --
-    /// see [`syscalls::evdev::SharedEvdevTable::push_key`]'s doc comment for the `code`/`value`
+    /// see `syscalls::evdev::SharedEvdevTable::push_key`'s doc comment for the `code`/`value`
     /// contract. The sole public entry point into the shim's own evdev emulation, mirroring
     /// [`Self::add_drm_flip_callback`]'s role for DRM; a runner binary with a concrete
     /// presentation/input layer (e.g. `litebox_platform_windows_userland`'s winit-backed window)
@@ -1173,7 +1173,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     }
 
     /// Push a real relative mouse-motion or wheel event into the shim's `/dev/input/event0`
-    /// queue -- see [`syscalls::evdev::SharedEvdevTable::push_rel`]'s doc comment for the
+    /// queue -- see `syscalls::evdev::SharedEvdevTable::push_rel`'s doc comment for the
     /// `code`/`value` contract.
     pub fn push_input_rel(&self, code: u16, value: i32) {
         self.0
@@ -1183,7 +1183,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
 
     /// Push one 2D mouse movement as a SINGLE evdev report (`REL_X`, `REL_Y`, one `SYN_REPORT`),
     /// which is what real hardware emits for one physical motion -- see
-    /// [`syscalls::evdev::SharedEvdevTable::push_rel_motion`]. Prefer this over two
+    /// `syscalls::evdev::SharedEvdevTable::push_rel_motion`. Prefer this over two
     /// `push_input_rel` calls for cursor movement: those produce two separately-synced reports,
     /// making a client process the motion twice.
     pub fn push_input_rel_motion(&self, dx: i32, dy: i32) {
@@ -1583,7 +1583,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         advice
     }
 
-    /// Force the exact same recovery [`GlobalStateHandle::net_lock`]'s own dead-holder path
+    /// Force the exact same recovery `GlobalStateHandle::net_lock`'s own dead-holder path
     /// already performs (see `litebox::net::Network::reset_after_poisoning`'s doc comment) --
     /// for a caller that caught a panic escaping [`Self::perform_network_interaction`] (e.g.
     /// smoltcp's own `"handle does not refer to a valid socket"`, `socket_set.rs:116`, seen live
@@ -4871,7 +4871,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 
 impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     /// Runs `f` with every shim-WIDE lock held, for the one caller that genuinely needs it:
-    /// [`syscalls::process::Task::try_cross_process_fork`]'s native-`fork()` path (see
+    /// `syscalls::process::Task::try_cross_process_fork`'s native-`fork()` path (see
     /// [`litebox::platform::ForkChildVerificationProvider::native_fork`]'s doc comment).
     ///
     /// This is the shim-level half of the same discipline glibc's own `__libc_fork` uses

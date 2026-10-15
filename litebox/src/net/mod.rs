@@ -48,7 +48,7 @@ pub const SOCKET_BUFFER_SIZE: usize = 65536;
 /// A TCP socket costs two slots, so `MAX_DATA_SLOTS / 2` is how many sockets the pool can hold and
 /// `MAX_DATA_SLOTS * SOCKET_RING_SIZE` is the whole pool. Both numbers are set together against
 /// the shared arena's budget -- the arena also carries every `GlobalState` of the session, and
-/// [`socket_buffers::Pool::new`] silently halves a request it cannot grant, so a too-large pool
+/// `socket_buffers::Pool::new` silently halves a request it cannot grant, so a too-large pool
 /// silently becomes a too-small one. 32 KiB rings buy twice the sockets for the same 16 MiB, and
 /// a desktop session runs out of SOCKETS long before it runs out of per-socket window: chrD97
 /// measured 128 sockets all in use, 104 of them merely armed backlog slots of 13 listening ports,
@@ -136,9 +136,9 @@ const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::fr
 /// A LiteBox `Network` is parametric in the platform it runs on.
 ///
 /// An important decision that must be made by a user of a `Network` is decided by
-/// [`set_platform_interaction`](Self::set_platform_interaction), whose docs explain this further.
+/// `set_platform_interaction`, whose docs explain this further.
 ///
-/// A user of `Network` who care about [events](crate::event) should call [set_socket_proxy](Self::set_socket_proxy)
+/// A user of `Network` who care about [events](crate::event) should call `set_socket_proxy`
 /// to set up a proxy for each socket created, so that events can be notified properly.
 /// A tag that is stable within one host process and differs between them, for diagnostics that run
 /// from every process of the cross-process-fork family. The log carries no pid, so without a tag
@@ -1468,7 +1468,7 @@ where
     /// [`Self::new`] itself establishes -- `socket_set`, `closing_in_background`,
     /// `queued_for_closure`, and `local_port_allocator`'s refcount table -- WITHOUT reallocating
     /// `socket_set`'s shared-kernel-arena backing storage (that arena is an append-only bump
-    /// allocator with no free list, see [`alloc_shared_socket_storage`]'s own doc comment, so
+    /// allocator with no free list, see `alloc_shared_socket_storage`'s own doc comment, so
     /// re-running [`Self::new`] on every call here would slowly exhaust the bounded 64 MiB arena
     /// over a long-lived boot that hits this path repeatedly under a fork-heavy workload).
     ///
@@ -1492,7 +1492,7 @@ where
     /// # What this does NOT fix
     ///
     /// `interface`'s own smoltcp-internal state (ARP/route caches) is left untouched -- it holds no
-    /// per-socket handles and is not implicated in this bug class. A [`SocketFd`]/[`LocalPort`]
+    /// per-socket handles and is not implicated in this bug class. A [`SocketFd`]/`LocalPort`
     /// token some OTHER, still-alive process minted before this reset and continues to hold becomes
     /// stale the instant this runs (its handle/port no longer names anything real) -- using it
     /// afterward can still panic exactly as before. This is the accepted, disclosed trade-off: a
@@ -2975,7 +2975,7 @@ where
     /// would have decided.
     ///
     /// The tick leaves a fork-family-shared socket's RX in smoltcp (see
-    /// [`Self::drain_socket_channel_buffers`]), so a read -- blocking, non-blocking, or one that
+    /// `Self::drain_socket_channel_buffers`), so a read -- blocking, non-blocking, or one that
     /// lost the race against another process's tick -- has to fetch for itself rather than report
     /// "no data".
     ///

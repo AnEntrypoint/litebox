@@ -1568,7 +1568,7 @@ pub enum SysDrmFile {
     Subsystem,
     /// `<name>/device/uevent` -- the *device's own* uevent file, one level below
     /// [`SysDrmFile::Uevent`]; libdrm's `drmGetDevice2()` fails without it. Deliberately absent
-    /// from [`SysDrmFile::ALL`], which covers only the real `<name>/` directory, and therefore
+    /// from `SysDrmFile::ALL`, which covers only the real `<name>/` directory, and therefore
     /// reachable solely via [`SysDrmDirHandle::DeviceOf`].
     DeviceUevent,
 }
@@ -2216,7 +2216,7 @@ const UDEV_DB_EVENT0_CONTENT: &[u8] = b"E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_I
 /// A [`super::backend::Backend`] serving exactly one file, `/run/udev/data/c13:64` -- eudev's
 /// per-device database entry. Its mere openability sets `udev_device->is_initialized`, without
 /// which `libinput_udev_create_context()` silently skips the one virtual input device
-/// [`InputDevices`] exposes; its contents matter too, see [`UDEV_DB_EVENT0_CONTENT`].
+/// [`InputDevices`] exposes; its contents matter too, see `UDEV_DB_EVENT0_CONTENT`.
 pub struct UdevDb<Platform>
 where
     Platform: RawSyncPrimitivesProvider + 'static,

@@ -40,7 +40,7 @@ pub fn init_env_filtered_subscriber(env_var_name: &str) {
 }
 
 /// Wraps the fmt subscriber so every call that can touch its per-thread heap state (line buffer,
-/// filter scope stack) runs inside a private-allocation scope. See [`set_private_alloc_hook`].
+/// filter scope stack) runs inside a private-allocation scope. See `set_private_alloc_hook`.
 #[cfg(feature = "tracing_subscriber_init")]
 struct PrivateAlloc<S>(S);
 

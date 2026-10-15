@@ -16,8 +16,8 @@
 //!
 //! * `getpid`/`gettid`/`fork`'s return value -- the pid this task has in its own namespace (or its
 //!   parent's, for `fork`'s), read straight out of the task.
-//! * `kill`/`tgkill`/`wait4`'s pid argument -- [`Self::translate`], the caller's namespace in.
-//! * `wait4`'s result, `siginfo`'s `si_pid`, `SCM_CREDENTIALS`' `pid` -- [`Self::pid_in`], the
+//! * `kill`/`tgkill`/`wait4`'s pid argument -- `Self::translate`, the caller's namespace in.
+//! * `wait4`'s result, `siginfo`'s `si_pid`, `SCM_CREDENTIALS`' `pid` -- `Self::pid_in`, the
 //!   reader's namespace in.
 //!
 //! The table is a pointer-free field of `GlobalState`, so it lives in the cross-process shared

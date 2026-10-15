@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! `litebox-presenter.exe` -- a TARGET DISPATCHER, nothing more. The real program is [`win`].
+//! `litebox-presenter.exe` -- a TARGET DISPATCHER, nothing more. The real program is `win`.
 //!
 //! Why this file is not the program: the presenter owns a Win32 window, `wgpu`/`winit`
 //! presentation and a Windows named pipe, and the two crates that give it those

@@ -55,7 +55,7 @@ use object::endian::LittleEndian;
 static COW_MMAP_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Enable (or disable) the copy-on-write file-mapping fast path. See [`COW_MMAP_ENABLED`].
+/// Enable (or disable) the copy-on-write file-mapping fast path. See `COW_MMAP_ENABLED`.
 ///
 /// The shim is `no_std` and cannot read an environment variable itself, so the runner forwards
 /// `LITEBOX_COW_MMAP` on its behalf -- the same arrangement `set_mapping_guard_gap_disabled`
@@ -769,11 +769,11 @@ pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
 /// it. Deliberately NOT the path: two paths can be one file, and one path can become two files.
 pub(crate) type SegmentScanKey = (u64, u64, usize, usize);
 
-/// Executable code ranges per file; see [`crate::GlobalState::exec_ranges_cache`].
+/// Executable code ranges per file; see `crate::GlobalState::exec_ranges_cache`.
 pub(crate) type ExecRangesCache =
     BTreeMap<(u64, u64), alloc::sync::Arc<alloc::vec::Vec<core::ops::Range<u64>>>>;
 
-/// Scans shared by every mapping of a file; see [`crate::GlobalState::segment_scan_cache`].
+/// Scans shared by every mapping of a file; see `crate::GlobalState::segment_scan_cache`.
 pub(crate) type SegmentScanCache =
     BTreeMap<SegmentScanKey, alloc::sync::Arc<litebox_syscall_rewriter::SegmentScanTemplate>>;
 
@@ -1718,7 +1718,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Copying such a file into every mapper's private memory multiplies it by the process count:
     /// every glibc program maps the multi-hundred-megabyte locale archive, so a desktop of sixty
     /// processes spent gigabytes on sixty identical copies. The object is shared but the VIEW of it
-    /// is copy-on-write (see [`Vmem::map_existing_shared_pages_file_private_cow`]), so sharing it is
+    /// is copy-on-write (see `Vmem::map_existing_shared_pages_file_private_cow`), so sharing it is
     /// indistinguishable from a private copy for the guest -- including after an
     /// `mprotect(PROT_READ|PROT_WRITE)`, which Linux always lets succeed on a `MAP_PRIVATE` file
     /// mapping and which now yields this process's own pages -- while a process that never writes

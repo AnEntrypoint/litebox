@@ -288,7 +288,7 @@ impl<Platform: ShimPlatform> SharedDumbBufferSlot<Platform> {
     }
 }
 
-/// Returned by [`SharedDrmTable::scanout_snapshot`] -- the current front buffer's identity, for a
+/// Returned by `SharedDrmTable::scanout_snapshot` -- the current front buffer's identity, for a
 /// host-side control channel (`docs/presenter-process-design.md` section 2) to duplicate the
 /// handle into an external presenter process. `pub`, not `pub(crate)`, so it can be re-exported
 /// at this crate's root and named by a runner crate outside `litebox_shim_linux`.
@@ -768,7 +768,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// off to an external presenter process (`docs/presenter-process-design.md` section 2.2/2.3).
     /// Reads the exact same `crtc_fb`/`framebuffers`/`buffers` bookkeeping
     /// [`Self::notify_flip_callback`] already consults, but returns the platform's own
-    /// [`ShimPlatform::SharedMemoryHandle`] itself rather than mapping it and handing out bytes --
+    /// `ShimPlatform::SharedMemoryHandle` itself rather than mapping it and handing out bytes --
     /// unlike [`DrmFlipLocal::callbacks`] (a `Box<dyn Fn>` that cannot carry this associated type
     /// across a trait object, see that field's own doc comment), a plain generic method call from
     /// a caller that already knows the concrete `Platform` type (the runner) has no such
@@ -1410,7 +1410,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         Ok(0)
     }
 
-    /// `DRM_IOCTL_GET_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s own doc comment for why this
+    /// `DRM_IOCTL_GET_MAGIC` -- see `DRM_IOCTL_GET_MAGIC`'s own doc comment for why this
     /// device always hands back the same fixed magic value rather than a real per-client
     /// random one.
     #[allow(clippy::unnecessary_wraps)]
@@ -1425,7 +1425,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         Ok(0)
     }
 
-    /// `DRM_IOCTL_AUTH_MAGIC` -- see [`DRM_IOCTL_GET_MAGIC`]'s doc comment. Any magic value
+    /// `DRM_IOCTL_AUTH_MAGIC` -- see `DRM_IOCTL_GET_MAGIC`'s doc comment. Any magic value
     /// is accepted: this device has exactly one possible client, so there is no real
     /// mismatched-magic case to reject (real DRM's `EINVAL` here signals "no client is
     /// authenticated under that magic," which cannot happen when `GET_MAGIC` unconditionally
@@ -1568,7 +1568,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     }
 
     /// `DRM_IOCTL_MODE_OBJ_SETPROPERTY` -- the generic, object-type-carrying property-set ioctl.
-    /// See [`DRM_IOCTL_MODE_OBJ_SETPROPERTY`]'s own doc comment: this is the ioctl `drm-rs`'s
+    /// See `DRM_IOCTL_MODE_OBJ_SETPROPERTY`'s own doc comment: this is the ioctl `drm-rs`'s
     /// `Device::set_property` (used by `smithay`'s `backend_drm`, confirmed live via
     /// `docs/wayland-drm-backend-probe/`) actually sends, distinct from the legacy
     /// connector-only [`Self::connector_set_property`] above. Same accept-as-a-no-op semantics
@@ -1826,7 +1826,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// client always maps a dumb buffer before/around exporting it, but nothing in the UAPI
     /// actually requires that ordering, so this covers the export-first case too). The caller
     /// (`syscalls::file`'s ioctl dispatch) uses this offset to tag the freshly opened PRIME fd so
-    /// [`crate::syscalls::mm::Task::try_dri_dumb_buffer_mmap`] resolves an `mmap()` of that new fd
+    /// `crate::syscalls::mm::Task::try_dri_dumb_buffer_mmap` resolves an `mmap()` of that new fd
     /// back onto this SAME buffer's real shared-memory handle -- see that function's own doc
     /// comment for the tag-then-resolve mechanism.
     pub(crate) fn prime_export_offset(&self, handle: u32) -> Result<u64, Errno> {
@@ -2144,7 +2144,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// `drm_dumb.c` calls `PRIME_HANDLE_TO_FD` then immediately `PRIME_FD_TO_HANDLE` on the fd it
     /// just received, to obtain a GEM handle for the newly-imported buffer object, matching the
     /// real kernel's own self-import round-trip). Given the exported fd's own tagged `map_offset`
-    /// (looked up by the caller via [`DrmPrimeFdMarker`] in `syscalls::file`, mirroring
+    /// (looked up by the caller via `DrmPrimeFdMarker` in `syscalls::file`, mirroring
     /// `try_dri_dumb_buffer_mmap`'s identical resolution), this returns the SAME original
     /// dumb-buffer handle the export started from -- correct for a self-import, since there is
     /// only ever one buffer object involved, not a fresh second one.

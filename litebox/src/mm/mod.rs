@@ -698,7 +698,7 @@ where
     /// Like [`Self::new`], but for the ONE case where that is not enough: a `CLONE_VFORK` child
     /// detaching into its own fresh address space at `execve()` time, via
     /// `detach_pm_for_vfork_execve` in `litebox_shim_linux`. See
-    /// [`linux::Vmem::new_for_vfork_execve_detach`]'s doc comment for the full bug this closes
+    /// `linux::Vmem::new_for_vfork_execve_detach`'s doc comment for the full bug this closes
     /// (a real, delayed `STATUS_ACCESS_VIOLATION` in a still-live parent whose memory a vfork
     /// child's own `execve` silently overwrote) and why [`Self::new`] alone -- sufficient for
     /// every OTHER caller, including a plain `fork()` child's `execve` -- is not sufficient here.
@@ -1059,7 +1059,7 @@ where
     /// content-initializing `op` callback, since the pages already hold real, meaningful content
     /// from whichever earlier allocation created the handle.
     ///
-    /// See [`crate::mm::linux::Vmem::map_existing_shared_pages`]'s doc comment for the exact
+    /// See `crate::mm::linux::Vmem::map_existing_shared_pages`'s doc comment for the exact
     /// scenario this exists for and how it differs from [`Self::create_writable_pages`] (which
     /// always mints a brand-new handle rather than re-exposing an existing one).
     ///

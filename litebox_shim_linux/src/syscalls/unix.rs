@@ -653,7 +653,7 @@ impl<FS: ShimFS> AddrView<FS> {
 /// A file descriptor donated via `SCM_RIGHTS` ancillary data, tagged with which of litebox's
 /// eight fd-enabled subsystems it belongs to -- `sendmsg`'s cmsg payload is just raw `int` fd
 /// values with no type information of its own, so the sender resolves each one against its own
-/// [`crate::FilesState::run_on_raw_fd`] (the same per-subsystem dispatch `dup()`/`fork()` already
+/// `crate::FilesState::run_on_raw_fd` (the same per-subsystem dispatch `dup()`/`fork()` already
 /// use) and carries the *result* here, since the receiver has no way to re-discover which
 /// subsystem a bare `TypedFd` belongs to once it's already been duplicated out of that dispatch.
 pub(super) enum AnyDupFd<Platform: ShimPlatform, FS: ShimFS> {
@@ -677,7 +677,7 @@ pub(super) type AnyDupFds<Platform, FS> = Vec<AnyDupFd<Platform, FS>>;
 
 impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
     /// Inserts this fd into `files`' own raw fd table, allocating a fresh raw fd number --
-    /// exactly [`crate::FilesState::insert_raw_fd`]'s existing per-subsystem shape, used
+    /// exactly `crate::FilesState::insert_raw_fd`'s existing per-subsystem shape, used
     /// elsewhere for `socketpair()`'s own two freshly-inserted descriptors. `cloexec` sets
     /// `FD_CLOEXEC` on the new fd first (`MSG_CMSG_CLOEXEC`'s own contract), using the typed fd
     /// still on hand here -- the same `set_fd_metadata` primitive `dup()`/`fork()` already use,
@@ -726,7 +726,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> AnyDupFd<Platform, FS> {
         res.map_err(|()| Errno::EMFILE)
     }
 
-    /// Releases a duplicate [`crate::syscalls::net::Task::resolve_scm_rights_fds`] made for a
+    /// Releases a duplicate `crate::syscalls::net::Task::resolve_scm_rights_fds` made for a
     /// donation that is actually crossing a PROCESS boundary: that data plane carries a descriptor
     /// as a text spec (`RingFdMail`, rebuilt by the receiver) and never hands the `TypedFd` to
     /// anyone, so the duplicate would otherwise sit in the SENDER's descriptor table for the rest
@@ -1717,7 +1717,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         }
     }
 
-    /// [`Self::log_zero_read`]'s counterpart for an endpoint whose transport is still its own local
+    /// `Self::log_zero_read`'s counterpart for an endpoint whose transport is still its own local
     /// channel: EOF there means that channel's peer shut its write side, which no shared-slot
     /// bookkeeping records. Same `LITEBOX_DIAG_UNIXZERO` gate and `[diag-unixzero]` prefix.
     fn log_local_zero_read(&self, peek: bool) {
@@ -4963,7 +4963,7 @@ impl<Platform: ShimPlatform, const RING_BYTES: usize> SharedByteRing<Platform, R
     /// count (which may be `0` if the ring is full or shut down -- never blocks, never panics).
     /// Only used for the one case [`Self::try_write_all`] can never resolve no matter how empty
     /// the ring is -- a single message bigger than the whole ring -- see
-    /// [`RING_BYTES`]'s doc comment.
+    /// `RING_BYTES`'s doc comment.
     pub(crate) fn try_write(&self, data: &[u8]) -> usize {
         self.try_write_with_fds(data, None)
     }

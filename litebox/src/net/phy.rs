@@ -113,7 +113,7 @@ fn is_local_ipv4(packet: &[u8]) -> bool {
 }
 
 /// One `diag-loop` line for a guest-to-guest packet, at whichever end of [`Device::loopback`] it
-/// passes: `sent` is the push in [`TxToken::consume`], `delivered` the pop in [`Device::receive`].
+/// passes: `sent` is the push in `TxToken::consume`, `delivered` the pop in `Device::receive`.
 ///
 /// [`Device::loopback`] is the ONLY path such a packet takes and `platform`'s send/receive hooks
 /// never see it, so an instrument placed there is blind to exactly the traffic a probe generates

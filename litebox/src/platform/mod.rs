@@ -503,7 +503,7 @@ pub trait SharedKernelStateProvider {
     /// see `litebox_platform_windows_userland::SharedArc`'s own doc comment for why that is
     /// deliberate, not an oversight, for kernel-singleton-shaped state: this call is meant for
     /// FIXED, session-lifetime-sized allocations decided once up front, e.g.
-    /// [`litebox::net::Network`]'s own bounded socket-slot table, never for per-connection or
+    /// `litebox::net::Network`'s own bounded socket-slot table, never for per-connection or
     /// otherwise unboundedly-repeated allocation, which would exhaust a bounded shared pool).
     ///
     /// Returns `None` on allocation failure (arena exhaustion on a platform with a bounded
@@ -995,12 +995,12 @@ pub trait ForkChildVerificationProvider {
 
     /// Returns the CALLING thread's own currently-active relocation map, if the calling thread
     /// is itself a `fork()` descendant still under verification (i.e. `self` is running on a
-    /// thread that was itself a target of a prior [`begin_fork_child_verification`] call whose
-    /// matching [`end_fork_child_verification`] has not yet fired).
+    /// thread that was itself a target of a prior `begin_fork_child_verification` call whose
+    /// matching `end_fork_child_verification` has not yet fired).
     ///
     /// Called on the PARENT's own thread from `do_clone`, immediately after this fork's own
     /// `PageManager::duplicate` call, BEFORE the fresh relocation map is handed to the new
-    /// child's own [`begin_fork_child_verification`] -- lets a nested fork (a fork whose OWN
+    /// child's own `begin_fork_child_verification` -- lets a nested fork (a fork whose OWN
     /// parent is itself a fork descendant, e.g. a grandchild) fold the calling thread's inherited
     /// ancestor ranges into the grandchild's map via
     /// [`crate::mm::AddressRelocations::merge_ancestor_ranges`], so the grandchild transitively

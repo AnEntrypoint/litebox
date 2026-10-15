@@ -1275,7 +1275,7 @@ fn normalize_tar_filename(filename: &str) -> &str {
 
 /// Ensure every ancestor directory of `path` exists in `dirs`, returning the immediate parent's
 /// index and the final path component's name. Shared by both file and symlink tar entries when
-/// building the index in [`TarIndex::from_layers`].
+/// building the index in `TarIndex::from_layers`.
 fn ensure_ancestors(
     dirs: &mut Vec<IndexedDir>,
     dirs_by_path: &mut HashMap<String, usize>,

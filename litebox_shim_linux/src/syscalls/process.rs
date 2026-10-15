@@ -3805,10 +3805,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// space (safety: the spawn helper must not corrupt the caller's memory before `execve`), but
     /// shared fd table and signal-handler table for `posix_spawn`'s own contract. Real `fork()`/
     /// `vfork()` (no flags at all) falls out of the same `!CLONE_VM` test.
-    /// Blocks (bounded, never forever) until one of the [`CROSS_PROCESS_FORK_SLOT_COUNT`]
+    /// Blocks (bounded, never forever) until one of the `CROSS_PROCESS_FORK_SLOT_COUNT`
     /// `cross_process_fork_slots` is free, claims it, and returns its index; see that field's doc
     /// comment for what a slot bounds. Always returns eventually -- fails OPEN (`None`, proceeding
-    /// without a reserved slot) once [`ADMISSION_POLL_ITERATIONS`] real waits have elapsed, so a
+    /// without a reserved slot) once `ADMISSION_POLL_ITERATIONS` real waits have elapsed, so a
     /// slot that is somehow never released can never permanently wedge every future fork in the
     /// whole fork family -- correctness/liveness always wins over the RAM bound.
     ///
@@ -5192,7 +5192,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// promised: its own `pid`/`tid` (`new_pid`, real Linux's `pid == tid` for a freshly forked
     /// single-threaded process), its own fresh `Process` (empty children, parent pointing at
     /// the process that forked it, its own adopted [`litebox::mm::PageManager`]), and its own
-    /// cleared pending-signal state -- everything [`syscalls::process::ThreadState::new_process`]
+    /// cleared pending-signal state -- everything `syscalls::process::ThreadState::new_process`
     /// already builds correctly for the thread-based fork path's BRAND NEW `Task`, reused here
     /// verbatim rather than re-derived, just installed into the SAME `Task` instead of a new one.
     ///

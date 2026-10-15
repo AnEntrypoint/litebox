@@ -30,7 +30,7 @@
 //! error `winit` could report instead.
 //!
 //! **The consequence for this module's own API is the inverse of `litebox_platform_windows_
-//! userland::presentation::Presenter`: [`Presenter::run`] must be called from the actual process
+//! userland::presentation::Presenter`: `Presenter::run` must be called from the actual process
 //! main thread (the same thread `fn main()` starts on), and guest execution must move to a
 //! background thread instead** -- the opposite of how `litebox_runner_linux_on_windows_userland`/
 //! `litebox_runner_linux_userland` are structured today. The two crate-level entry points that
@@ -258,7 +258,7 @@ impl FrameSender {
 ///
 /// # Main-thread requirement (the one real difference from the Windows/Linux userland API)
 ///
-/// Both [`Presenter::new`] and [`Presenter::run`] must be called from the process's actual main
+/// Both [`Presenter::new`] and `Presenter::run` must be called from the process's actual main
 /// thread -- see this module's own doc comment for why Cocoa allows no exception to this, unlike
 /// every other platform this project targets. There is deliberately no `with_any_thread`-style
 /// escape hatch here: `winit` itself provides none for this backend (confirmed by reading its

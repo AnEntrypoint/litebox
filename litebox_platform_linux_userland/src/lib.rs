@@ -111,7 +111,7 @@ pub struct LinuxUserland {
     /// Host mappings that are not available for guest programs to use, read from
     /// `/proc/self/maps`.
     ///
-    /// Append-only and refreshed by [`Self::refresh_reserved_pages`]: the host keeps mapping
+    /// Append-only and refreshed by `Self::refresh_reserved_pages`: the host keeps mapping
     /// memory after startup (the `--gui` presenter alone pulls in Mesa, a Vulkan driver and its
     /// worker threads' stacks), and a guest mapping placed on top of one of those is silent
     /// corruption. Each range is leaked so the borrow this hands out can outlive the lock; the
@@ -2322,7 +2322,7 @@ impl<T> core::ops::Deref for ReclaimableHandle<T> {
 /// `Arc::new`, identical to what every call site did before this trait existed.
 ///
 /// The one Linux-specific addition is [`ReclaimableHandle`]: since nothing is really shared here,
-/// the arena blocks a state was built from can go back into [`ARENA_POOL`] when it dies.
+/// the arena blocks a state was built from can go back into `ARENA_POOL` when it dies.
 impl litebox::platform::SharedKernelStateProvider for LinuxUserland {
     type Handle<T: Send + Sync + 'static> = ReclaimableHandle<T>;
 
@@ -3446,7 +3446,7 @@ impl ThreadContext<'_> {
 }
 
 /// Clears this thread's registered-waker TLS slot WITHOUT dropping what it points to; see
-/// [`LinuxUserland::native_fork`]'s caller for why a forked child must not release it.
+/// `LinuxUserland::native_fork`'s caller for why a forked child must not release it.
 fn forget_inherited_waker() {
     #[cfg(target_arch = "x86_64")]
     {

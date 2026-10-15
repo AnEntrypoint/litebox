@@ -276,7 +276,7 @@ static MAINTHREAD_MS: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAINTHREAD_SLOTS];
 const MAINTHREAD_THROTTLE_MS: u64 = 250;
 
-/// Rate-limit one main-thread line for `pid` to [`MAINTHREAD_THROTTLE_MS`], per pid.
+/// Rate-limit one main-thread line for `pid` to `MAINTHREAD_THROTTLE_MS`, per pid.
 #[allow(
     clippy::cast_sign_loss,
     reason = "pid is a positive host pid; the u32 is only a slot key"
@@ -929,7 +929,7 @@ pub fn check_path_marker<Platform: litebox::platform::StdioProvider>(
 /// the syscall it makes -- can be named. `LITEBOX_SPIN_STACK=<syscall number>`: every
 /// [`SPIN_STACK_EVERY`]-th dispatch of that syscall prints 0x180 bytes from `rsp` as qwords, which
 /// for a `-fstack-protector` leaf like `base::TimeTicks::Now()` (push rbp; sub $0x20) puts the
-/// return address at [rsp], the saved rbp at [rsp+0x20] and ITS caller's return address at
+/// return address at `[rsp]`, the saved rbp at [rsp+0x20] and ITS caller's return address at
 /// [rsp+0x28] -- enough to walk the rbp chain by hand from the log.
 const SPIN_STACK_EVERY: u64 = 8192;
 
@@ -1078,7 +1078,7 @@ pub fn record_unresolved_syscall(syscall_number: usize, pid: i32, comm: &str) {
 }
 
 /// Record a syscall/ioctl/fcntl/prctl/setsockopt sub-command that returned one of
-/// [`NOTABLE_ERRNOS`]. `description` should identify the sub-command, e.g.
+/// `NOTABLE_ERRNOS`. `description` should identify the sub-command, e.g.
 /// `"ioctl(0x5413)"` or `"setsockopt(SOL_SOCKET, SO_REUSEPORT)"`. `errno_name` should be the
 /// `Debug`-formatted errno (e.g. `"ENOSYS"`).
 pub fn record_unsupported_subcommand(description: &str, errno_name: &str, pid: i32, comm: &str) {
@@ -1141,7 +1141,7 @@ const SYSCALL_TIMELINE_DEFAULT_COMMS: &[&str] =
 /// edited this constant.
 ///
 /// - unset or empty -> off
-/// - `1` / `true` / `yes` / `on` -> [`SYSCALL_TIMELINE_DEFAULT_COMMS`], the historical behavior
+/// - `1` / `true` / `yes` / `on` -> `SYSCALL_TIMELINE_DEFAULT_COMMS`, the historical behavior
 /// - anything else -> a comma-separated list of `comm` names, e.g. `mate-session,marco,caja`
 pub fn init_syscall_timeline(value: impl FnOnce() -> Option<String>) {
     // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
@@ -1400,7 +1400,7 @@ pub fn is_socket_read_target_comm(comm: &[u8]) -> bool {
         .any(|target| trimmed == target.as_bytes() || target.as_bytes().starts_with(trimmed))
 }
 
-/// Public wrapper around [`syscall_name`] for `lib.rs`'s per-syscall timeline trace (the
+/// Public wrapper around `syscall_name` for `lib.rs`'s per-syscall timeline trace (the
 /// original is private since it was only ever used inside this module's own summary printer
 /// before now).
 pub fn syscall_name_pub(number: usize) -> String {
@@ -1487,7 +1487,7 @@ impl FirstTrail {
 /// See [`FIRST_TRAIL_LEN`]. Also one per host process, also read at a fork child's exit.
 static FIRST_TRAIL: spin::Mutex<FirstTrail> = spin::Mutex::new(FirstTrail::NEW);
 
-/// Remembers a process's earliest syscalls, until [`FIRST_TRAIL_LEN`] of them have been seen.
+/// Remembers a process's earliest syscalls, until `FIRST_TRAIL_LEN` of them have been seen.
 pub fn record_first_trail(number: usize, args: [u64; 3]) {
     let mut trail = FIRST_TRAIL.lock();
     if trail.next >= FIRST_TRAIL_LEN {
@@ -1550,7 +1550,7 @@ impl LastTrail {
 /// See [`LAST_TRAIL_LEN`]. One per host process, like [`FIRST_TRAIL`], read at the same exit.
 static LAST_TRAIL: spin::Mutex<LastTrail> = spin::Mutex::new(LastTrail::NEW);
 
-/// Remembers a process's most recent syscalls, overwriting the oldest once [`LAST_TRAIL_LEN`] of
+/// Remembers a process's most recent syscalls, overwriting the oldest once `LAST_TRAIL_LEN` of
 /// them have been seen. Called after dispatch, so `ret` is the value the guest saw.
 ///
 /// Gated on the knob's budget, because unlike [`record_first_trail`] this one never fills up and
@@ -1735,9 +1735,9 @@ fn parse_child_trail_target(
 /// [`init_syscall_timeline`], including why the argument is a closure.
 ///
 /// - unset or empty -> off
-/// - `1` / `true` / `yes` / `on` -> [`DEFAULT_CHILD_EXIT_TRAIL_BUDGET`] children
+/// - `1` / `true` / `yes` / `on` -> `DEFAULT_CHILD_EXIT_TRAIL_BUDGET` children
 /// - a number -> that many children (any child, in exit order)
-/// - `<comm>` -> that `comm`, under [`CHILD_EXIT_TRAIL_COMM_BUDGET`]
+/// - `<comm>` -> that `comm`, under `CHILD_EXIT_TRAIL_COMM_BUDGET`
 /// - `<comm>:<count>` -> that `comm`, at most `count` of them
 ///
 /// Prints one `[diag-child-exit-init]` line per host process when it arms itself, so a run that

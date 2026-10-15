@@ -22,7 +22,7 @@ pub enum SocketError {
     #[error("Unsupported protocol {0}")]
     UnsupportedProtocol(u8),
     /// [`Network::socket_set`](crate::net::Network)'s fixed-capacity slot table
-    /// ([`crate::net::MAX_SOCKETS`]) is full. Unlike the `Vec`-backed table this replaced,
+    /// (`crate::net::MAX_SOCKETS`) is full. Unlike the `Vec`-backed table this replaced,
     /// `smoltcp::iface::SocketSet::add` panics on a full fixed-capacity table, so this is
     /// checked and returned as an ordinary error before ever calling `add`.
     #[error("Too many open sockets")]

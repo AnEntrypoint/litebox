@@ -547,12 +547,12 @@ pub mod ident {
     /// neither; the shim clears it when the host env sets `LITEBOX_PROC_USERNS_MAPS_OFF=1`.
     static ID_MAP_LINUX_SEMANTICS: AtomicBool = AtomicBool::new(false);
 
-    /// Turns [`ID_MAP_LINUX_SEMANTICS`] on or off.
+    /// Turns `ID_MAP_LINUX_SEMANTICS` on or off.
     pub fn set_id_map_linux_semantics(enabled: bool) {
         ID_MAP_LINUX_SEMANTICS.store(enabled, Ordering::Relaxed);
     }
 
-    /// Whether [`ID_MAP_LINUX_SEMANTICS`] is on.
+    /// Whether `ID_MAP_LINUX_SEMANTICS` is on.
     #[must_use]
     pub fn id_map_linux_semantics() -> bool {
         ID_MAP_LINUX_SEMANTICS.load(Ordering::Relaxed)

@@ -32,7 +32,7 @@ const LINUX_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/
 /// called [`run`] below -- for a normal (non-`--session-daemon`) invocation, that is this
 /// process's own main thread, whose real stack is Rust's ~1 MiB Windows default, not 8 MiB.
 /// Confirmed live: `weston --backend=drm-backend.so --use-pixman` crashes with a genuine host
-/// `STATUS_STACK_OVERFLOW` (Rust's own "thread '<unknown>' has overflowed its stack" message)
+/// `STATUS_STACK_OVERFLOW` (Rust's own "thread '`<unknown>`' has overflowed its stack" message)
 /// immediately after selecting its Pixman renderer, on the main thread specifically -- zero
 /// `clone()` syscalls occur before the crash, ruling out the already-correctly-sized spawned-
 /// thread path entirely. This mirrors an identical, already-fixed bug in this exact crate for the

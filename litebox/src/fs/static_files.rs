@@ -113,11 +113,11 @@ where
     }
 }
 
-/// Directory handle: an index into [`StaticFiles::dirs`].
+/// Directory handle: an index into `StaticFiles::dirs`.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticFilesDirHandle(usize);
 
-/// File handle: an index into [`StaticFiles::files`].
+/// File handle: an index into `StaticFiles::files`.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticFilesFileHandle(usize);
 

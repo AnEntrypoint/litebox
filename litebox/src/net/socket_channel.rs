@@ -1000,7 +1000,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Check if the socket is readable.
     ///
     /// A socket shared across the fork family also reports readable while its datagrams still sit
-    /// in smoltcp waiting for this process to pull them ([`Self::set_smoltcp_rx_pending`]), or a
+    /// in smoltcp waiting for this process to pull them (`Self::set_smoltcp_rx_pending`), or a
     /// `poll`/`epoll` waiter on it would never be told to run the read that fetches them.
     pub fn is_readable(&self) -> bool {
         self.inner.rx_count.load(Ordering::Acquire) > 0

@@ -47,7 +47,7 @@ pub struct ProcSelfInfo {
     /// `comm` field and `status`'s `Name:` field.
     pub comm: String,
     /// Parent pid, for `stat`'s `ppid` field and `status`'s `PPid:` field. `0` means "unknown",
-    /// which [`format_stat`] renders the way it always did (everything is init's child); only a
+    /// which `format_stat` renders the way it always did (everything is init's child); only a
     /// row that really knows its parent -- an `execve`'d or `clone`d process, or one rebuilt from
     /// the cross-process registry -- carries a value.
     pub ppid: i32,
@@ -390,7 +390,7 @@ fn pid_known(pid: i32) -> bool {
     f(pid)
 }
 
-/// Whether `/proc/<pid>` resolves for a pid that NONE of [`ProcSelfTable`], [`caller_pid`] or
+/// Whether `/proc/<pid>` resolves for a pid that NONE of [`ProcSelfTable`], `caller_pid` or
 /// [`pid_known`] can name. The shim sets this from `LITEBOX_PROC_PID_LENIENT_OFF`.
 ///
 /// A pid absent from every source here is not evidence that no process has it: a pid that crossed
@@ -404,7 +404,7 @@ fn pid_known(pid: i32) -> bool {
 /// shell is strictly closer to it than `ENOENT` is.
 static PID_LENIENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Registers whether `/proc/<pid>` resolves for a pid no source here can name; see [`PID_LENIENT`].
+/// Registers whether `/proc/<pid>` resolves for a pid no source here can name; see `PID_LENIENT`.
 pub fn set_pid_lenient(on: bool) {
     PID_LENIENT.store(on, core::sync::atomic::Ordering::Relaxed);
 }
@@ -1348,7 +1348,7 @@ impl ProcSelfTable {
     }
 
     /// The entry for a SPECIFIC pid, regardless of caller identity -- backs `/proc/<pid>/*`, unlike
-    /// [`Self::resolve`] which answers `/proc/self` for whichever process is asking.
+    /// `Self::resolve` which answers `/proc/self` for whichever process is asking.
     /// The `exe` path recorded for `pid`, if that process is known.
     pub fn get_exe_path(&self, pid: i32) -> Option<String> {
         self.get(pid)

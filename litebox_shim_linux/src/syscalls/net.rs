@@ -2184,7 +2184,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
     /// Parses `SCM_RIGHTS` cmsgs out of a raw `msg_control` byte buffer (already copied in from
     /// user memory), resolving each donated raw fd via the same per-subsystem
-    /// [`crate::FilesState::run_on_raw_fd`] dispatch `dup()`/`fork()` already use, then
+    /// `crate::FilesState::run_on_raw_fd` dispatch `dup()`/`fork()` already use, then
     /// [`litebox::fd::Descriptors::duplicate`]-ing it into a fresh global-table entry the sender
     /// no longer owns exclusively -- exactly `dup()`'s own primitive, giving the eventual
     /// receiver (a different `Task`, possibly a different process, with its own separate raw fd

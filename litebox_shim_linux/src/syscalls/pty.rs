@@ -358,7 +358,7 @@ impl<Platform: ShimPlatform> PtyHalf<Platform> {
 impl<Platform: ShimPlatform> PtyHalf<Platform> {
     /// Shuts this half's channel ends down, waking any peer blocked on them. Idempotent (see
     /// `common_functions_for_channel!`'s `shutdown`), so safe to call redundantly from both
-    /// [`crate::GlobalState::hangup_slave`] (an explicit early trigger fired at real process
+    /// `crate::GlobalState::hangup_slave` (an explicit early trigger fired at real process
     /// death, bypassing the registry's own extra `Arc` reference -- see that function's doc
     /// comment) and `Drop` (the eventual true last-`Arc`-reference release, which is what
     /// ordinarily performs this and remains the only trigger for the master side and for a slave
@@ -1214,7 +1214,7 @@ pub(crate) enum PtyEnd<Platform: ShimPlatform> {
 
 impl<Platform: ShimPlatform> PtyEnd<Platform> {
     /// Only ever called on a `Local` variant -- see the two call sites
-    /// ([`Self::pair`], now removed in favor of [`Self::pty_state`], and
+    /// (`Self::pair`, now removed in favor of [`Self::pty_state`], and
     /// [`crate::GlobalStateHandle::hangup_slave`]'s `shutdown_channel` call). `hangup_slave`
     /// resolves its entry exclusively through the LOCAL `pty_registry`, which by construction
     /// (see [`crate::GlobalStateHandle::pts_open`]'s own doc comment) never contains a `Shared*`

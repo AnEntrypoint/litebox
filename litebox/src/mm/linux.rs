@@ -53,7 +53,7 @@ pub const PAGE_SIZE: usize = 16384;
 static MAPPING_GUARD_GAP_DISABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Disable (or re-enable) the inter-mapping guard gap. See [`MAPPING_GUARD_GAP_DISABLED`].
+/// Disable (or re-enable) the inter-mapping guard gap. See `MAPPING_GUARD_GAP_DISABLED`.
 ///
 /// Intended to be called once, at startup, before any guest mapping is placed.
 pub fn set_mapping_guard_gap_disabled(disabled: bool) {
@@ -868,7 +868,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     ///
     /// A `CLONE_VFORK` child is different in exactly the way that reasoning depends on: it is
     /// never placed anywhere, because it never gets a copy at all -- `do_clone` hands it the
-    /// SAME [`PageManager`] `Arc` the parent is still using (see that function's own doc comment
+    /// SAME `PageManager` `Arc` the parent is still using (see that function's own doc comment
     /// on why this is safe up to this exact point: the parent is unconditionally blocked in
     /// `wait_for_vfork_done` for the whole window). When that child calls `execve()`,
     /// `detach_pm_for_vfork_execve` swaps in a brand-new `PageManager` for it -- correct per

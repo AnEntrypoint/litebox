@@ -664,7 +664,7 @@ fn handle_connection<FS: ShimFS>(shared: Arc<Shared<FS>>, pipe: PipeHandle) {
 }
 
 /// `--gui`/`--gui=hidden` startup per section 4.1: spawns `litebox-presenter.exe` and, for
-/// [`crate::GuiMode::Shown`] only, blocks (up to 5s, matching [`handle_show`]) until it is
+/// [`crate::GuiMode::Shown`] only, blocks (up to 5s, matching `handle_show`) until it is
 /// connected and ready, then pushes `show`. For [`crate::GuiMode::Hidden`] the process and window
 /// are created (so a LATER `show` is fast) but this call returns as soon as the spawn itself
 /// succeeds -- it does not block on `ready`, matching `--gui=hidden`'s own "no cold-start cost on
