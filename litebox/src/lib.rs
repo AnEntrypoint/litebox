@@ -12,6 +12,10 @@
 //! one obtains a Rust-friendly POSIX-like interface (i.e., "nix-like" interface) via the rest of
 //! the modules in this crate.
 
+#![allow(
+    deprecated,
+    reason = "fetch_update: try_update is nightly-only on the toolchains that build the no_std and LVBS jobs, and fetch_update is what the rest accept"
+)]
 #![no_std]
 
 extern crate alloc;

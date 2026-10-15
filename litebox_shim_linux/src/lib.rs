@@ -7,6 +7,10 @@
 //! The concrete platform is threaded in by the runner via [`LinuxShimBuilder::new`].
 
 #![no_std]
+#![allow(
+    deprecated,
+    reason = "fetch_update: try_update is nightly-only on the toolchains that build the no_std and LVBS jobs, and fetch_update is what the rest accept"
+)]
 #![expect(
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"

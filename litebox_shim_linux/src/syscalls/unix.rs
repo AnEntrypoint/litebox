@@ -5266,7 +5266,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             .zip(&self.holder_counts[side])
         {
             if h.load(Ordering::Acquire) == host
-                && c.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                && c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
             {
                 return true;
@@ -5274,7 +5274,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         }
         if platform.env_flag("LITEBOX_UNIX_PEER_GONE_STRICT") {
             self.untracked_holders[side]
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                 .ok();
         }
         false

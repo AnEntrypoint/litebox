@@ -1,4 +1,8 @@
-#!/bin/sh
+#! /bin/bash
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # wt.sh <rung 1-4> <hold secs> [extra chromium flags]
 # Boots the webtop stack rung by rung inside litebox.  Captures go to stdout as "XWD<n>" / "CXWD<n>"
 # blocks (raw xwd); the host decodes them.  Every X client runs under a 25 s watchdog, so a wedged

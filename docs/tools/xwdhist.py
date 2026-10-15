@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
 # xwdhist.py <out-file> : decode each "XWD<n>\n" + raw xwd + "\nEND-XWD" block printed by wt.sh.
 import sys, struct, collections
 d = open(sys.argv[1], 'rb').read()
