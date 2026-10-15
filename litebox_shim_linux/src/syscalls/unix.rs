@@ -3781,6 +3781,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         Ok(n)
     }
 
+    /// Whether this is a `SOCK_DGRAM` unix socket: the one kind whose zero-capacity receive still
+    /// dequeues a message (see `net.rs`'s `do_recvmsg`).
+    pub(super) fn is_datagram(&self) -> bool {
+        matches!(&self.inner, UnixSocketInner::Datagram(_))
+    }
+
     /// `recvfrom`'s own superset: also returns any `SCM_RIGHTS` fds delivered alongside the data
     /// read (always empty for a datagram socket or a message with no attached fds).
     /// The credentials to attach as `SCM_CREDENTIALS` to data this socket receives: those of the

@@ -1824,6 +1824,19 @@ type RecvMsgFds<Platform, FS> = (
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `sockfd` is an `AF_INET6` socket.
+    /// Whether `sockfd` is a `SOCK_DGRAM` unix socket (see `unix::Task::is_datagram`).
+    fn socket_is_unix_datagram(&self, sockfd: u32) -> bool {
+        self.files
+            .borrow()
+            .with_socket(
+                &self.global,
+                sockfd,
+                |_| Ok(false),
+                |entry| Ok(entry.is_datagram()),
+            )
+            .unwrap_or(false)
+    }
+
     fn socket_is_v6(&self, sockfd: u32) -> bool {
         self.files
             .borrow()
@@ -2729,7 +2742,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .try_reserve_exact(total_iov_capacity)
             .map_err(|_| Errno::ENOMEM)?;
         buffer.resize(total_iov_capacity, 0);
-        let recv_buf = &mut buffer[..];
+        // A zero-capacity receive on a unix datagram socket still dequeues one message, and Linux
+        // reports `MSG_TRUNC` when that message was non-empty. The unix layer copies nothing into
+        // an empty buffer, so receive into a one-byte probe instead: the message is dequeued, and
+        // `size > total_iov_capacity` marks it as non-empty. The probe byte is never copied to the
+        // caller. The size reported for a truncated read is then 1, not the datagram's length.
+        let mut probe = [0u8; 1];
+        let recv_buf: &mut [u8] = if total_iov_capacity == 0 && self.socket_is_unix_datagram(sockfd)
+        {
+            &mut probe
+        } else {
+            &mut buffer[..]
+        };
         let (size, fds, creds) = self.do_recvfrom_with_fds(
             sockfd,
             recv_buf,
