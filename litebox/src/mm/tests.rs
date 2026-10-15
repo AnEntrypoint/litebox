@@ -97,7 +97,10 @@ fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
 }
 
+// Runs only on Linux: it places fixed mappings in the address range Linux's layout provides; the
+// macOS host refuses that range and the test panics on the first page-range unwrap.
 #[test]
+#[cfg(target_os = "linux")]
 fn test_vmm_mapping() {
     let start_addr: usize = DummyVmemBackend::TASK_ADDR_MIN;
     let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
