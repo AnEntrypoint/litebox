@@ -1,0 +1,22 @@
+name: Webtop base image (reusable)
+
+# Nothing is built here. The release bundles package their rootfs straight from the
+# pinned webtop image, so this workflow only publishes that image reference.
+
+on:
+  workflow_call:
+    outputs:
+      image:
+        description: The webtop image ref the rootfs is packaged from (pulled, not built)
+        value: ${{ jobs.build_base_image.outputs.image }}
+
+jobs:
+  build_base_image:
+    name: Webtop base image (pulled, not built)
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image_ref.outputs.image }}
+    steps:
+      - name: Image ref
+        id: image_ref
+        run: echo "image=docker.io/linuxserver/webtop:debian-xfce" >> "$GITHUB_OUTPUT"

@@ -4,12 +4,10 @@ Contents:
 
 - `litebox_runner_linux_on_windows_userland.exe` — the LiteBox runner; runs
   unmodified Linux ELF binaries on Windows.
-- `alpine-rootfs.tar` — an Alpine Linux rootfs (BusyBox userland) with
-  `nodejs`, `npm`, `python3`, `py3-pip`, `build-base`, `git`, `bash`, `curl`,
-  `openssh-client`, and `tzdata` preinstalled, built from
-  [`dist_tools/base-image/Dockerfile`](base-image/Dockerfile), published to
-  `ghcr.io/<org>/litebox-alpine-base`, and pre-rewritten with the LiteBox
-  syscall rewriter via `litebox-packager --oci-image`.
+- `alpine-rootfs.tar` — the rootfs of the pinned webtop image
+  `docker.io/linuxserver/webtop:debian-xfce`, pulled (not built) and
+  pre-rewritten with the LiteBox syscall rewriter via
+  `litebox-packager --oci-image`.
 - `run-alpine.cmd` / `run-alpine.ps1` — launcher scripts.
 
 ## Usage

@@ -4,13 +4,11 @@ Contents:
 
 - `litebox_runner_linux_userland` — the LiteBox runner; runs Linux ELF
   binaries through LiteBox's own syscall-rewriting shim on a Linux host.
-- `alpine-rootfs.tar` — an Alpine Linux rootfs (BusyBox userland) with
-  `nodejs`, `npm`, `python3`, `py3-pip`, `build-base`, `git`, `bash`, `curl`,
-  `openssh-client`, and `tzdata` preinstalled, built from
-  [`dist_tools/base-image/Dockerfile`](base-image/Dockerfile), published to
-  `ghcr.io/<org>/litebox-alpine-base`, and pre-rewritten with the LiteBox
-  syscall rewriter via `litebox-packager --oci-image`. The same rootfs tar
-  used by the Windows bundle — guest content is host-architecture-agnostic.
+- `alpine-rootfs.tar` — the rootfs of the pinned webtop image
+  `docker.io/linuxserver/webtop:debian-xfce`, pulled (not built) and
+  pre-rewritten with the LiteBox syscall rewriter via
+  `litebox-packager --oci-image`. The same rootfs tar is used by the Windows
+  bundle — guest content is host-architecture-agnostic.
 - `run-alpine.sh` — launcher script.
 
 ## Usage

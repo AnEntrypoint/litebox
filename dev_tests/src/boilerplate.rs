@@ -155,7 +155,6 @@ const SKIP_FILES: &[&str] = &[
     "advisor/probes/forklock_probe",
     "advisor/probes/hello_probe",
     "advisor/probes/pty_fork_probe",
-    "dist_tools/base-image/Dockerfile",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",

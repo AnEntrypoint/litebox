@@ -21,8 +21,8 @@ env:
 
 jobs:
   build_base_image:
-    name: Build Alpine base image
-    uses: ./.github/workflows/build-alpine-base-image.yml
+    name: Webtop base image (pulled, not built)
+    uses: ./.github/workflows/webtop-base-image.yml
     permissions:
       contents: read
       packages: write
