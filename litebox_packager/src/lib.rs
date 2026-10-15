@@ -15,6 +15,7 @@ use rayon::prelude::*;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use tar::{Builder, Header};
 
@@ -274,7 +275,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
         });
     }
 
-    finalize_tar(tar_entries, &args)?;
+    finalize_tar(tar_entries.into_iter().map(Ok), &args)?;
 
     Ok(())
 }
@@ -317,51 +318,19 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
     let total_count = file_map.files.len();
     eprintln!("Found {total_count} files ({exec_count} executables to rewrite)");
 
-    // --- Phase 3: Rewrite ELFs in parallel ---
+    // --- Phase 3: Rewrite ELFs in parallel, streamed into the tar ---
     eprintln!("Rewriting {exec_count} executable ELF files...");
     let verbose = args.verbose;
-    let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
-
-    let par_results: Vec<anyhow::Result<TarEntry>> = file_entries
-        .into_par_iter()
-        .map(|(_key_path, entry)| {
-            // A symlink carries no payload: emit the link itself and never read, rewrite, or
-            // copy its target. Reading it here is exactly what flattened every layer, turning
-            // /bin/ls -> /bin/busybox into a second 804 KB copy of busybox.
-            if let Some(target) = entry.symlink_target {
-                return Ok(TarEntry {
-                    tar_path: entry.tar_path,
-                    data: Vec::new(),
-                    mode: entry.mode,
-                    symlink_target: Some(target),
-                });
-            }
-
-            let data = std::fs::read(&entry.read_path)
-                .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
-
-            let rewritten = if is_elf(&data) && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)
-            } else {
-                data
-            };
-
-            Ok(TarEntry {
-                tar_path: entry.tar_path,
-                data: rewritten,
-                mode: entry.mode,
-                symlink_target: None,
-            })
-        })
+    // Every tar path the rewrite emits is known before any payload is read, so the config entries
+    // below dedupe against this set rather than against collected payloads.
+    let mut added_tar_paths: BTreeSet<String> = file_map
+        .files
+        .values()
+        .map(|e| e.tar_path.clone())
         .collect();
-
-    let mut tar_entries: Vec<TarEntry> = Vec::with_capacity(par_results.len());
-    for result in par_results {
-        tar_entries.push(result?);
-    }
-
-    let mut added_tar_paths: BTreeSet<String> =
-        tar_entries.iter().map(|e| e.tar_path.clone()).collect();
+    let file_entries: Vec<(PathBuf, oci::RootfsEntry)> = file_map.files.into_iter().collect();
+    let rewritten = rewrite_stream(file_entries, no_rewrite, verbose);
+    let mut extra: Vec<TarEntry> = Vec::new();
 
     // --- Phase 4: Store config.json and generate config_and_run.sh from image config ---
 
@@ -375,7 +344,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                     extracted.config_json.len()
                 );
             }
-            tar_entries.push(TarEntry {
+            extra.push(TarEntry {
                 tar_path: CONFIG_JSON_TAR_PATH.to_string(),
                 data: extracted.config_json,
                 mode: 0o644,
@@ -393,7 +362,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
             if args.verbose {
                 eprintln!("  Generating {CONFIG_AND_RUN_TAR_PATH} from image config");
             }
-            tar_entries.push(TarEntry {
+            extra.push(TarEntry {
                 tar_path: CONFIG_AND_RUN_TAR_PATH.to_string(),
                 data: script.into_bytes(),
                 mode: 0o755,
@@ -406,7 +375,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    finalize_tar(tar_entries, args)?;
+    finalize_tar(rewritten.chain(extra.into_iter().map(Ok)), args)?;
 
     Ok(())
 }
@@ -416,10 +385,13 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Build the output tar and print a size summary.
-fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()> {
+fn finalize_tar(
+    entries: impl IntoIterator<Item = anyhow::Result<TarEntry>>,
+    args: &CliArgs,
+) -> anyhow::Result<()> {
     // Build tar.
     eprintln!("Creating {}...", args.output.display());
-    build_tar(&tar_entries, &args.output)?;
+    let entry_count = build_tar(entries, &args.output)?;
 
     let tar_size = std::fs::metadata(&args.output).map_or(0, |m| m.len());
     #[allow(clippy::cast_precision_loss)]
@@ -427,7 +399,7 @@ fn finalize_tar(tar_entries: Vec<TarEntry>, args: &CliArgs) -> anyhow::Result<()
     eprintln!(
         "Created {} ({} entries, {:.1} MB)",
         args.output.display(),
-        tar_entries.len(),
+        entry_count,
         tar_size_mb
     );
 
@@ -705,7 +677,84 @@ struct TarEntry {
     symlink_target: Option<String>,
 }
 
-fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
+/// How many executables are rewritten in parallel before their tar entries are handed on. The
+/// bound is what keeps the peak at a few payloads rather than the whole image: collecting every
+/// rewritten executable first peaked past 5 GB on a webtop image.
+const REWRITE_CHUNK: usize = 16;
+
+/// Rewrites each file entry, yielding its tar entry in the original order. Work is done
+/// `REWRITE_CHUNK` entries at a time in parallel, and a finished chunk is handed out before the
+/// next one starts, so the rewritten payloads in memory are bounded by the chunk.
+fn rewrite_stream(
+    files: Vec<(PathBuf, oci::RootfsEntry)>,
+    no_rewrite: BTreeSet<PathBuf>,
+    verbose: bool,
+) -> impl Iterator<Item = anyhow::Result<TarEntry>> {
+    let mut files = files.into_iter();
+    let mut ready: VecDeque<anyhow::Result<TarEntry>> = VecDeque::new();
+    std::iter::from_fn(move || {
+        loop {
+            if let Some(item) = ready.pop_front() {
+                return Some(item);
+            }
+            let chunk: Vec<oci::RootfsEntry> = files
+                .by_ref()
+                .take(REWRITE_CHUNK)
+                .map(|(_key_path, entry)| entry)
+                .collect();
+            if chunk.is_empty() {
+                return None;
+            }
+            ready.extend(
+                chunk
+                    .into_par_iter()
+                    .map(|entry| rewrite_one(entry, &no_rewrite, verbose))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    })
+}
+
+/// One file entry's tar entry: a symlink carries its target and no payload, and an ELF is
+/// rewritten unless it is on the no-rewrite list.
+fn rewrite_one(
+    entry: oci::RootfsEntry,
+    no_rewrite: &BTreeSet<PathBuf>,
+    verbose: bool,
+) -> anyhow::Result<TarEntry> {
+    // A symlink carries no payload: emit the link itself and never read, rewrite, or copy its
+    // target. Reading it here is exactly what flattened every layer, turning /bin/ls ->
+    // /bin/busybox into a second 804 KB copy of busybox.
+    if let Some(target) = entry.symlink_target {
+        return Ok(TarEntry {
+            tar_path: entry.tar_path,
+            data: Vec::new(),
+            mode: entry.mode,
+            symlink_target: Some(target),
+        });
+    }
+
+    let data = std::fs::read(&entry.read_path)
+        .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
+
+    let rewritten = if is_elf(&data) && !no_rewrite.contains(&entry.read_path) {
+        rewrite_elf(&data, &entry.read_path, verbose)
+    } else {
+        data
+    };
+
+    Ok(TarEntry {
+        tar_path: entry.tar_path,
+        data: rewritten,
+        mode: entry.mode,
+        symlink_target: None,
+    })
+}
+
+fn build_tar(
+    entries: impl IntoIterator<Item = anyhow::Result<TarEntry>>,
+    output: &Path,
+) -> anyhow::Result<usize> {
     // Copy-on-write mapping alignment. `MapViewOfFile3` (the Win32 primitive behind
     // `try_allocate_cow_pages`) requires a view's FILE OFFSET to be 64KiB-aligned -- unlike
     // Linux `mmap`, which needs only 4KiB. Tar's 512-byte block layout means a natural archive
@@ -728,7 +777,10 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     // builder itself emits: one header block, then the data rounded up to a block boundary.
     let mut offset: u64 = 0;
 
+    let mut count = 0usize;
     for entry in entries {
+        let entry = entry?;
+        count += 1;
         // Emit alignment padding BEFORE this entry's header when its data would otherwise
         // straddle a 64KiB boundary. The padding is a real tar entry (a regular file under
         // litebox/, ignored by the guest) rather than raw bytes, because a tar reader must be
@@ -797,7 +849,7 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     }
 
     builder.finish().context("failed to finalize tar archive")?;
-    Ok(())
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -828,7 +880,7 @@ mod symlink_emit_tests {
                 symlink_target: Some("busybox".to_string()),
             },
         ];
-        build_tar(&entries, &out).unwrap();
+        build_tar(entries.into_iter().map(Ok), &out).unwrap();
 
         let mut archive = tar::Archive::new(std::fs::File::open(&out).unwrap());
         let mut saw_symlink = false;
