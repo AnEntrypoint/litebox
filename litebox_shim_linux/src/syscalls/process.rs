@@ -5002,6 +5002,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the clone(2) arguments the x86_64 path takes as one set"
+    )]
     fn try_cross_process_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,

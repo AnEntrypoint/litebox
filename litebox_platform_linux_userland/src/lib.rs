@@ -3333,6 +3333,8 @@ unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
     fn exception_callback();
+    // The x86_64 trampoline is the only one that routes a trap through this symbol.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn syscall_trap_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
