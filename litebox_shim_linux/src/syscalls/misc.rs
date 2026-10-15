@@ -82,6 +82,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The same figures `/proc/meminfo` reports, so `sysconf(_SC_PHYS_PAGES)` and a read of
         // meminfo agree.
         let (total_kb, avail_kb) = self.global.platform.memory_info_kb();
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
         let total = usize::try_from(total_kb.saturating_mul(1024)).unwrap_or(usize::MAX);
         let avail =
             usize::try_from(avail_kb.min(total_kb).saturating_mul(1024)).unwrap_or(usize::MAX);

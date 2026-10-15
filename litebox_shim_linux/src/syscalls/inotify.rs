@@ -134,6 +134,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `raw_fd` is an inotify descriptor. An instance is fed by this process's own file
     /// system syscalls, so a cross-process fork child has nothing to receive on its copy and must
     /// not be given a pump for it.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn raw_fd_is_inotify(&self, raw_fd: usize) -> bool {
         self.inotify_instance_of(i32::try_from(raw_fd).unwrap_or(-1))
             .is_ok()

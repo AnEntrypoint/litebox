@@ -932,13 +932,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // about WHO wrote the frame, which is what has to be fixed -- see the `restorer == 0`
         // refusal in `write_signal_frame` for the one path that could hand the guest a zero
         // return address.
-        if uctx.mcontext.rip == 0 || uctx.mcontext.rsp == 0 {
+        #[cfg(target_arch = "x86_64")]
+        let (ip, sp) = (uctx.mcontext.rip, uctx.mcontext.rsp);
+        #[cfg(target_arch = "aarch64")]
+        let (ip, sp) = (uctx.mcontext.pc, uctx.mcontext.sp);
+        if ip == 0 || sp == 0 {
+            #[cfg(target_arch = "x86_64")]
             litebox_util_log::warn!(
                 pid:% = self.pid.get(), tid:% = self.tid.get(), uctx_addr:? = uctx_addr,
                 rip:? = uctx.mcontext.rip, rsp:? = uctx.mcontext.rsp, rax:? = uctx.mcontext.rax,
                 err:? = uctx.mcontext.err, trapno:? = uctx.mcontext.trapno,
                 fpstate:? = uctx.mcontext.fpstate;
                 "rt_sigreturn: guest ucontext carries a zero rip or rsp, refusing the restore"
+            );
+            #[cfg(target_arch = "aarch64")]
+            litebox_util_log::warn!(
+                pid:% = self.pid.get(), tid:% = self.tid.get(), uctx_addr:? = uctx_addr,
+                pc:? = ip, sp:? = sp;
+                "rt_sigreturn: guest ucontext carries a zero pc or sp, refusing the restore"
             );
             self.force_signal(Signal::SIGSEGV, false);
             return Err(Errno::EFAULT);

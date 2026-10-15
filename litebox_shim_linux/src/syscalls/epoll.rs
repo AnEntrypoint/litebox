@@ -783,6 +783,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
     /// `rebind_inherited` above already does for the in-process case. An interest whose target fd
     /// did not itself survive the fork cannot be restored, the same degradation any uncarriable
     /// fd already has.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn fork_carry_spec(&self) -> alloc::string::String {
         let interests = self.interests.lock();
         let mut spec = alloc::string::String::new();

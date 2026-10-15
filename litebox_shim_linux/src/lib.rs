@@ -2551,6 +2551,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // read something ELSE at the `cmp -0x30(%rbp),%rax`. The platform saves whatever FS
         // holds on entry, so a wrong FS base that survives into guest code is visible right
         // here, at the very next syscall that thread makes.
+        #[cfg(target_arch = "x86_64")]
         {
             // ONE atomic word, so the (tid, fs) pair a comparison is made against is always a
             // snapshot some thread really wrote -- two separate loads of two separate statics

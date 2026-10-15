@@ -162,6 +162,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
 
     /// Whether the unix socket at `raw_fd` can be carried into a cross-process fork child (see
     /// `UnixSocket::fork_carry_check`); `None` when `raw_fd` is not a unix socket.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn raw_fd_unix_carry_check(
         &self,
         global: &GlobalStateHandle<Platform, FS>,

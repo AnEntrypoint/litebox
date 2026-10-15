@@ -465,6 +465,7 @@ impl<Platform: ShimPlatform> SeccompState<Platform> {
     /// initialization `IMMEDIATE_CRASH`es -- a bare `int3`, SIGTRAP, no message -- about 0.1s
     /// into every renderer's life. `Arc` cannot cross the OS process boundary, but a filter
     /// program is plain bytes, so it can.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn to_spec(&self) -> alloc::string::String {
         use core::fmt::Write as _;
         let mut out = alloc::format!("{:02x}{:02x}", self.mode(), u8::from(self.no_new_privs()));

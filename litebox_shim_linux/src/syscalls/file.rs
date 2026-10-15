@@ -10590,6 +10590,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// The pty id of `raw_fd` when it is a MASTER of a published (cross-process-visible) pty, else
     /// `None`. Such a master carries nothing process-private -- it is just the id -- so a
     /// cross-process fork child can re-attach it; see [`Self::install_pty_master_at_fd`].
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn carriable_pty_master_for_raw_fd(&self, raw_fd: usize) -> Option<u32> {
         let files = self.files.borrow();
         files
@@ -11158,6 +11159,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn raw_fd_unix_carry_check(
         &self,
         raw_fd: usize,
@@ -11360,6 +11362,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// Unlike every other carry this one ships no shared object and no reopenable name: it ships
     /// the interest list, which the child re-registers against its own rebuilt descriptors.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn raw_fd_epoll_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
         let files = self.files.borrow();
         let epoll_fd = files
@@ -11496,6 +11499,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// WRITE, so the child is given an OS pipe's write handle and the parent pumps that OS pipe's
     /// read handle back into this in-memory pipe. The handle must be descriptor-independent
     /// because the guest typically closes its own copy right after forking.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn detached_pipe_end_for_raw_fd(
         &self,
         raw_fd: usize,

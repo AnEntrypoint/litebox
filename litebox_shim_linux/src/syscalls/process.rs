@@ -429,6 +429,7 @@ static NATIVE_FORK_CHILD_PID: core::sync::atomic::AtomicI32 = core::sync::atomic
 /// child by `reinit_as_native_fork_child`, consumed once by the syscall-return path.
 static NATIVE_CHILD_SP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn take_native_child_sp() -> Option<usize> {
     match NATIVE_CHILD_SP.swap(0, Ordering::Relaxed) {
         0 => None,
@@ -1145,19 +1146,24 @@ enum ThreadInitState {
     ),
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const TASK_STATE_SHIM_FD: i32 = i32::MAX;
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static SOURCE_BRIDGES: spin::Mutex<alloc::vec::Vec<(usize, u64)>> =
     spin::Mutex::new(alloc::vec::Vec::new());
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 static NEXT_SOURCE_BRIDGE_SEQUENCE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(1);
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct SourceBridgeRegistration {
     end_identity: usize,
     sequence: u64,
 }
 
 impl SourceBridgeRegistration {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn new(end_identity: usize) -> Self {
         let sequence = NEXT_SOURCE_BRIDGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         SOURCE_BRIDGES.lock().push((end_identity, sequence));
@@ -1167,6 +1173,7 @@ impl SourceBridgeRegistration {
         }
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn effective_owners(&self, raw_owners: usize) -> usize {
         let bridges = SOURCE_BRIDGES.lock();
         let siblings = bridges
@@ -1234,6 +1241,7 @@ fn parse_id_extents(buf: &[u8]) -> Option<alloc::vec::Vec<IdExtent>> {
 
 /// `None` (the initial namespace) encodes as `-`; a user namespace encodes as `;`-joined
 /// `inner.outer.count` extents, empty when nothing is mapped yet.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn encode_id_map(map: Option<&alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
     let Some(extents) = map else {
         return alloc::string::String::from("-");
@@ -1533,6 +1541,7 @@ impl Credentials {
         Ok(())
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn to_spec(&self) -> alloc::string::String {
         let groups: alloc::vec::Vec<alloc::string::String> =
             self.groups.iter().map(|g| alloc::format!("{g}")).collect();
@@ -7997,6 +8006,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.update_creds(|c| c.set_re_gid(rgid, egid))
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn task_state_spec(&self, new_user_namespace: bool) -> alloc::string::String {
         let identity = self
             .global
@@ -9664,7 +9674,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .global
                         .platform
                         .set_arch_specific_register(&ArchSpecificRegister::TpidrEl0, tls.as_usize())
-                        .map_err(Errno::from);
+                        .map_err(|_| Errno::EINVAL);
                     if let Err(e) = set_tls {
                         litebox_util_log::warn!(
                             tid:% = self.tid.get(), error:? = e;

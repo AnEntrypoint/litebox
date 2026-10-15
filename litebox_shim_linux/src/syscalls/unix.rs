@@ -6416,6 +6416,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     /// Moves the connection holder [`Self::fork_carry`] counted for a child off the carrying
     /// process's host pid and onto the child's real one, as soon as the child's host process
     /// exists. See the comment at that call site for the launcher-exits-first window this closes.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(super) fn fork_carry_move_to_child(
         global: &GlobalStateHandle<Platform, FS>,
         hold: &mut UnixCarryHold,
