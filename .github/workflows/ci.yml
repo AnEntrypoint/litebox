@@ -385,5 +385,6 @@ jobs:
             -not -path './litebox_presenter_protocol/Cargo.toml' \
             -not -path './advisor/probes/xproc_rust_probe/Cargo.toml' \
             -not -path './docs/wayland-drm-backend-probe/Cargo.toml' \
+            -not -path './dev_util/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'
