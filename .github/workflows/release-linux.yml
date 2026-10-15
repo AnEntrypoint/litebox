@@ -70,7 +70,13 @@ jobs:
         run: cargo build --locked --release -p litebox_packager
       - name: Package Alpine rootfs (BusyBox + nodejs + python)
         run: |
-          ./target/release/litebox_packager --oci-image ${{ needs.build_base_image.outputs.image }} -o alpine-rootfs.tar --verbose
+          # docker.io drops a webtop blob fetch now and then ("failed to pull layer 17"); retry the
+          # whole pull rather than failing the bundle on one transient request.
+          for attempt in 1 2 3; do
+            ./target/release/litebox_packager --oci-image ${{ needs.build_base_image.outputs.image }} -o alpine-rootfs.tar --verbose && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            echo "packager attempt $attempt failed; retrying in 30s"; sleep 30
+          done
       - name: Upload rootfs tar
         uses: actions/upload-artifact@v4
         with:
