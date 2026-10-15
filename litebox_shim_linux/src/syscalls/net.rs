@@ -335,6 +335,8 @@ impl SocketAddress {
     }
 }
 
+// Each flag is an independent setsockopt/getsockopt bit the guest sets on its own.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Clone)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
@@ -414,20 +416,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
 
+        // Unknown socket types fall back to raw, exactly as `SockType::Raw` does.
+        #[allow(clippy::match_same_arms)]
         let proxy = match sock_type {
             SockType::Stream => {
                 let proxy = litebox::net::socket_channel::StreamSocketChannel::new();
                 NetworkProxy::Stream(proxy)
             }
-            SockType::Datagram => {
+            SockType::Datagram | SockType::SeqPacket => {
                 let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
                 NetworkProxy::Datagram(proxy)
             }
             SockType::Raw => NetworkProxy::Raw,
-            SockType::SeqPacket => {
-                let proxy = litebox::net::socket_channel::DatagramSocketChannel::new();
-                NetworkProxy::Datagram(proxy)
-            }
             _ => NetworkProxy::Raw,
         };
         // Save the proxy in both the descriptor table and the network subsystem so that the shim layer
@@ -822,7 +822,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
     ) -> Result<usize, Errno> {
         // Read the options once: this fd may not be one this descriptor table holds at all (a fork
         // child's dropped fd), and that is EBADF for the whole call rather than a panic.
-        let options = self.with_socket_options(fd, |o| o.clone())?;
+        let options = self.with_socket_options(fd, SocketOptions::clone)?;
         match self.getsockopt_common(optname, optval, len, |sopt| match sopt {
             SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
             SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
@@ -910,6 +910,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalStateHandle<Platform, FS> {
                         else {
                             unreachable!()
                         };
+                        // `_` must stay a fallback for future variants, so Cubic keeps its own arm for clarity.
+                        #[allow(clippy::match_same_arms)]
                         let name = match congestion {
                             litebox::net::CongestionControl::Reno => "reno",
                             litebox::net::CongestionControl::Cubic => "cubic",
@@ -1806,6 +1808,19 @@ fn as_v6_view(addr: SocketAddress) -> SocketAddress {
     }
 }
 
+/// The duplicated SCM_RIGHTS fds of one message, each with an optional path label.
+type ScmRightsFds<Platform, FS> = (
+    AnyDupFds<Platform, FS>,
+    alloc::vec::Vec<Option<alloc::string::String>>,
+);
+
+/// What one `recvmsg` returns besides its byte count: the carried fds and the sender's credentials.
+type RecvMsgFds<Platform, FS> = (
+    usize,
+    AnyDupFds<Platform, FS>,
+    Option<litebox_common_linux::Ucred>,
+);
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Whether `sockfd` is an `AF_INET6` socket.
     fn socket_is_v6(&self, sockfd: u32) -> bool {
@@ -1814,11 +1829,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .with_socket(
                 &self.global,
                 sockfd,
-                |fd| {
-                    Ok(self
-                        .global
-                        .with_socket_options(fd, |options| options.is_v6)?)
-                },
+                |fd| self.global.with_socket_options(fd, |options| options.is_v6),
                 |_| Ok(false),
             )
             .unwrap_or(false)
@@ -2180,16 +2191,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// real Linux `SCM_RIGHTS` semantics. Any cmsg that isn't `SOL_SOCKET`/`SCM_RIGHTS` is
     /// ignored (Linux itself only interprets a handful of `SOL_SOCKET`-level cmsg types; none of
     /// the others litebox doesn't otherwise support are safety-relevant to reject outright).
-    fn resolve_scm_rights_fds(
-        &self,
-        control: &[u8],
-    ) -> Result<
-        (
-            AnyDupFds<Platform, FS>,
-            alloc::vec::Vec<Option<alloc::string::String>>,
-        ),
-        Errno,
-    > {
+    fn resolve_scm_rights_fds(&self, control: &[u8]) -> Result<ScmRightsFds<Platform, FS>, Errno> {
         let mut fds = alloc::vec::Vec::new();
         let mut specs = alloc::vec::Vec::new();
         let mut offset = 0usize;
@@ -2201,7 +2203,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             let payload = &control[offset + size_of::<CmsgHdr>()..offset + hdr.cmsg_len];
             if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_RIGHTS {
-                for raw_fd_bytes in payload.chunks_exact(size_of::<i32>()) {
+                for raw_fd_bytes in payload.as_chunks::<{ size_of::<i32>() }>().0 {
                     let raw_fd = i32::read_from_bytes(raw_fd_bytes).map_err(|_| Errno::EINVAL)?;
                     let raw_fd = usize::try_from(raw_fd).map_err(|_| Errno::EBADF)?;
                     let files = self.files.borrow();
@@ -2584,14 +2586,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
-    ) -> Result<
-        (
-            usize,
-            AnyDupFds<Platform, FS>,
-            Option<litebox_common_linux::Ucred>,
-        ),
-        Errno,
-    > {
+    ) -> Result<RecvMsgFds<Platform, FS>, Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
@@ -3092,6 +3087,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        const SOL_SOCKET: u32 = 1;
+        const SO_PASSCRED: u32 = 16;
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
@@ -3107,8 +3104,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Every other family has no credential passing to turn on, so it keeps accepting the
         // option while ignoring it: inet's own `setsockopt` answers `Ok(())` for it, and netlink
         // (which reaches neither arm) must keep doing the same rather than start failing.
-        const SOL_SOCKET: u32 = 1;
-        const SO_PASSCRED: u32 = 16;
         if level == SOL_SOCKET && optname == SO_PASSCRED {
             return match self.do_setsockopt(
                 sockfd,
@@ -3116,7 +3111,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 optval,
                 optlen,
             ) {
-                Err(Errno::EOPNOTSUPP) | Err(Errno::ENOPROTOOPT) => Ok(()),
+                Err(Errno::EOPNOTSUPP | Errno::ENOPROTOOPT) => Ok(()),
                 other => other,
             };
         }
@@ -4508,7 +4503,8 @@ mod unix_tests {
             client_fd,
             SocketOptionName::Socket(SocketOption::PEERCRED),
             optval_out,
-            core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+            u32::try_from(core::mem::size_of::<litebox_common_linux::Ucred>())
+                .expect("Ucred fits in u32"),
         )
         .expect("getsockopt(SO_PEERCRED) on connected client socket must succeed");
         assert_eq!(client_cred.pid, expected.pid);
@@ -4525,7 +4521,8 @@ mod unix_tests {
             server_conn,
             SocketOptionName::Socket(SocketOption::PEERCRED),
             optval_out,
-            core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+            u32::try_from(core::mem::size_of::<litebox_common_linux::Ucred>())
+                .expect("Ucred fits in u32"),
         )
         .expect("getsockopt(SO_PEERCRED) on accepted server socket must succeed");
         assert_eq!(server_cred.pid, expected.pid);
@@ -4560,7 +4557,8 @@ mod unix_tests {
                 fd,
                 SocketOptionName::Socket(SocketOption::PEERCRED),
                 optval_out,
-                core::mem::size_of::<litebox_common_linux::Ucred>() as u32,
+                u32::try_from(core::mem::size_of::<litebox_common_linux::Ucred>())
+                    .expect("Ucred fits in u32"),
             )
             .expect("getsockopt(SO_PEERCRED) on socketpair fd must succeed");
             assert_eq!(cred.pid, expected.pid);

@@ -116,10 +116,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // but the `ET_EXEC` collision class needs a different fix (in `allocate_pages`'s own
             // foreign-claim/collision handling, not here) -- see `AGENTS.md` for the precise,
             // still-open next step for that.
-            #[allow(
-                clippy::cast_sign_loss,
-                reason = "pid is always non-negative in practice"
-            )]
             // The stride must exceed a whole process image, or it spreads nothing.
             //
             // This was `PAGE_SIZE * 64` -- 256 KiB per pid. A real guest image plus its heap is
@@ -145,6 +141,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
             // comfortably inside `TASK_ADDR_MAX` (~140 TiB) with room for the OS-picked mappings
             // that live above it.
             const PID_SALT_STRIDE: usize = 4 * 1024 * 1024 * 1024;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "pid is always non-negative in practice"
+            )]
             let pid_salt = (self.task.pid.get() as usize % 1024).wrapping_mul(PID_SALT_STRIDE);
             super::DEFAULT_LOW_ADDR + pid_salt
         };

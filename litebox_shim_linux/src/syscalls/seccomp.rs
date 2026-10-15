@@ -209,6 +209,10 @@ fn alu(op: u16, a: u32, y: u32) -> Option<u32> {
 /// Anything Linux would reject at install time but that reaches here anyway (an unsupported mode,
 /// a division by zero, running off the end) yields `SECCOMP_RET_KILL_THREAD`, the same verdict
 /// Linux's own interpreter produces for a non-`RET` exit.
+#[allow(
+    clippy::many_single_char_names,
+    reason = "a, x, m, k and pc mirror the classic-BPF interpreter's register and operand names"
+)]
 fn run_filter(prog: &[SockFilter], data: &[u8; SECCOMP_DATA_LEN]) -> u32 {
     let mut a: u32 = 0;
     let mut x: u32 = 0;
@@ -334,7 +338,7 @@ fn validate(prog: &[SockFilter]) -> Result<(), Errno> {
                     let start = usize::try_from(insn.k).unwrap_or(usize::MAX);
                     if start
                         .checked_add(width)
-                        .map_or(true, |end| end > SECCOMP_DATA_LEN)
+                        .is_none_or(|end| end > SECCOMP_DATA_LEN)
                     {
                         return Err(Errno::EINVAL);
                     }
@@ -369,7 +373,7 @@ fn validate(prog: &[SockFilter]) -> Result<(), Errno> {
                 let limit = prog.len() - 1 - pc;
                 let op = code & BPF_OP;
                 let in_range = if op == BPF_JA {
-                    usize::try_from(insn.k).map_or(false, |o| o <= limit)
+                    usize::try_from(insn.k).is_ok_and(|o| o <= limit)
                 } else {
                     matches!(op, BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET)
                         && usize::from(insn.jt) <= limit
@@ -462,19 +466,21 @@ impl<Platform: ShimPlatform> SeccompState<Platform> {
     /// into every renderer's life. `Arc` cannot cross the OS process boundary, but a filter
     /// program is plain bytes, so it can.
     pub(crate) fn to_spec(&self) -> alloc::string::String {
+        use core::fmt::Write as _;
         let mut out = alloc::format!("{:02x}{:02x}", self.mode(), u8::from(self.no_new_privs()));
         let filters = self.filters.lock();
-        out.push_str(&alloc::format!("{:04x}", filters.len()));
+        let _ = core::write!(out, "{:04x}", filters.len());
         for prog in filters.iter() {
-            out.push_str(&alloc::format!("{:08x}", prog.len()));
-            for insn in prog.iter() {
-                out.push_str(&alloc::format!(
+            let _ = core::write!(out, "{:08x}", prog.len());
+            for insn in prog {
+                let _ = core::write!(
+                    out,
                     "{:04x}{:02x}{:02x}{:08x}",
                     insn.code,
                     insn.jt,
                     insn.jf,
                     insn.k
-                ));
+                );
             }
         }
         out
@@ -538,7 +544,7 @@ impl<Platform: ShimPlatform> SeccompState<Platform> {
         let mut worst: Option<Verdict> = None;
         for prog in self.filters.lock().iter() {
             let verdict = Verdict::from_ret(run_filter(prog, &data));
-            if worst.map_or(true, |w| verdict.severity() > w.severity()) {
+            if worst.is_none_or(|w| verdict.severity() > w.severity()) {
                 worst = Some(verdict);
             }
         }
@@ -579,16 +585,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let name = crate::diag::syscall_name_pub(usize::try_from(nr).unwrap_or(usize::MAX));
         match verdict {
             Verdict::Trap(data) => {
-                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip, trap_id:? = data; "seccomp: SECCOMP_RET_TRAP, delivering SIGSYS")
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip, trap_id:? = data; "seccomp: SECCOMP_RET_TRAP, delivering SIGSYS");
             }
             Verdict::Trace => {
-                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_TRACE with no tracer, delivering SIGSYS")
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_TRACE with no tracer, delivering SIGSYS");
             }
             Verdict::KillThread => {
-                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_THREAD, delivering SIGSYS")
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_THREAD, delivering SIGSYS");
             }
             Verdict::KillProcess => {
-                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_PROCESS, delivering SIGSYS")
+                litebox_util_log::warn!(pid:% = self.pid.get(), nr:? = nr, syscall:? = name, ip:? = ip; "seccomp: SECCOMP_RET_KILL_PROCESS, delivering SIGSYS");
             }
             Verdict::Allow | Verdict::Log | Verdict::Errno(_) => {}
         }

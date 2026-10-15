@@ -125,8 +125,8 @@ impl ProcIdentitySlot {
     fn load_bytes(field: &[AtomicU8], len: &AtomicUsize) -> alloc::vec::Vec<u8> {
         let n = len.load(Ordering::Acquire).min(field.len());
         let mut out = alloc::vec::Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(field[i].load(Ordering::Relaxed));
+        for cell in &field[..n] {
+            out.push(cell.load(Ordering::Relaxed));
         }
         out
     }
@@ -160,17 +160,17 @@ impl SharedProcessTable {
     pub(crate) fn new(platform: &impl litebox::platform::SharedKernelStateProvider) -> Self {
         let layout = core::alloc::Layout::array::<ProcIdentitySlot>(SHARED_PROCESS_CAPACITY)
             .expect("SHARED_PROCESS_CAPACITY identity-slot-array layout cannot overflow");
-        let (ptr, identity_shared) = match platform.shared_kernel_arena_alloc_bytes(layout) {
-            Some(p) => (p.cast::<ProcIdentitySlot>(), true),
-            None => {
+        let (ptr, identity_shared) =
+            if let Some(p) = platform.shared_kernel_arena_alloc_bytes(layout) {
+                (p.cast::<ProcIdentitySlot>(), true)
+            } else {
                 litebox_util_log::error!(
                     bytes:% = layout.size();
                     "shared process table: shared kernel arena exhausted; /proc/<pid> identity is \
                      not visible across host processes"
                 );
                 (core::ptr::NonNull::<ProcIdentitySlot>::dangling(), false)
-            }
-        };
+            };
         let count = if identity_shared {
             SHARED_PROCESS_CAPACITY
         } else {
@@ -262,6 +262,10 @@ impl SharedProcessTable {
         (pid > 0 && slot.pid.load(Ordering::Acquire) == pid).then_some(slot)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "slot indexes are below SHARED_PROCESS_CAPACITY, a small constant"
+    )]
     pub(crate) fn find(&self, pid: i32) -> Option<u32> {
         if pid <= 0 {
             return None;
@@ -288,6 +292,10 @@ impl SharedProcessTable {
         self.find(pid).and_then(|i| self.view(i))
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "SHARED_PROCESS_CAPACITY is a small constant that fits u32"
+    )]
     pub(crate) fn members(&self) -> impl Iterator<Item = SlotView> + '_ {
         (0..SHARED_PROCESS_CAPACITY as u32).filter_map(|i| self.view(i))
     }
@@ -296,6 +304,11 @@ impl SharedProcessTable {
     /// `pgid` and pending signals (a parent may already have moved the child into another group
     /// or signalled it before the child registered itself) and only has its host updated. When
     /// every slot is taken, slots whose host process has died are reclaimed.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::similar_names,
+        reason = "slot indexes are below SHARED_PROCESS_CAPACITY; pid/pgid are the POSIX names"
+    )]
     pub(crate) fn register(
         &self,
         pid: i32,
@@ -369,6 +382,10 @@ impl SharedProcessTable {
     }
 
     /// Frees every row `is_ghost` says no live process still needs, and returns how many.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "slot indexes are below SHARED_PROCESS_CAPACITY, a small constant"
+    )]
     pub(crate) fn reclaim_where(&self, is_ghost: impl Fn(u32, i32) -> bool) -> usize {
         let mut reclaimed = 0;
         for (i, slot) in self.slots.iter().enumerate() {
@@ -410,6 +427,7 @@ impl SharedProcessTable {
             .map(|s| s.pgid.load(Ordering::Acquire))
     }
 
+    #[allow(clippy::similar_names, reason = "pid/pgid are the POSIX names")]
     pub(crate) fn set_pgid(&self, index: u32, pid: i32, pgid: i32) {
         if let Some(slot) = self.slot(index, pid) {
             slot.pgid.store(pgid, Ordering::Release);
@@ -464,10 +482,7 @@ static PUBLISHED_PROCESS_TABLE: AtomicUsize = AtomicUsize::new(0);
 /// host process of the fork family -- including each cross-process fork child -- publishes its own
 /// view of the one shared table.
 pub(crate) fn publish_process_table(table: &SharedProcessTable) {
-    PUBLISHED_PROCESS_TABLE.store(
-        table as *const SharedProcessTable as usize,
-        Ordering::Release,
-    );
+    PUBLISHED_PROCESS_TABLE.store(core::ptr::from_ref(table) as usize, Ordering::Release);
 }
 
 /// Whether some host process in this fork family is running guest `pid`. False before
@@ -506,6 +521,7 @@ pub(crate) fn live_pids() -> alloc::vec::Vec<i32> {
 /// `pid`'s published identity, for `/proc/<pid>/{comm,cmdline,stat}` when the process runs in
 /// another host process. `None` when it is not registered or has published nothing, which leaves
 /// those files empty rather than `ENOENT` -- see `litebox::fs::procfs::PidIdentity`.
+#[allow(clippy::similar_names, reason = "pid/ppid are the POSIX names")]
 pub(crate) fn pid_identity(pid: i32) -> Option<litebox::fs::procfs::PidIdentity> {
     let raw = PUBLISHED_PROCESS_TABLE.load(Ordering::Acquire);
     if raw == 0 {
@@ -713,6 +729,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// A no-op when this pid has no row yet or no registry slot: a name in `/proc` is worth
     /// having, never worth failing an `execve` over.
+    #[allow(clippy::similar_names, reason = "pid/ppid are the POSIX names")]
     pub(crate) fn xproc_publish_identity(&self, pid: i32, ppid: i32) {
         let Some(info) = self.global.proc_self_info.read().portable_snapshot(pid) else {
             return;
@@ -783,6 +800,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Records `pgid` for `pid` in the registry and, when that process runs here, in its local
     /// `Process` too. Returns whether `pid` is registered.
+    #[allow(clippy::similar_names, reason = "pid/pgid are the POSIX names")]
     pub(crate) fn xproc_set_pgid(&self, pid: i32, pgid: i32) -> bool {
         if self.xproc_host().is_none() {
             return false;

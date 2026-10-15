@@ -163,17 +163,15 @@ impl SocketBuffers {
         let mut claim = Claim::new();
         let rx = self.data_slot(&mut claim);
         let tx = self.data_slot(&mut claim);
-        match (rx, tx) {
-            (Some(rx), Some(tx)) => Some((RingBuffer::new(rx), RingBuffer::new(tx), claim)),
-            _ => {
-                self.abandon(claim);
-                None
-            }
+        if let (Some(rx), Some(tx)) = (rx, tx) {
+            Some((RingBuffer::new(rx), RingBuffer::new(tx), claim))
+        } else {
+            self.abandon(claim);
+            None
         }
     }
 
     /// RX and TX packet buffers for a UDP socket, or `None` when a pool is exhausted.
-    #[expect(clippy::type_complexity, reason = "smoltcp's own buffer types")]
     pub(crate) fn udp(
         &mut self,
     ) -> Option<(
@@ -186,14 +184,11 @@ impl SocketBuffers {
         let rx_data = self.data_slot(&mut claim);
         let tx_meta = self.meta_slice(&mut claim);
         let tx_data = self.data_slot(&mut claim);
-        match (rx_meta, rx_data, tx_meta, tx_data) {
-            (Some(rm), Some(rd), Some(tm), Some(td)) => {
-                Some((PacketBuffer::new(rm, rd), PacketBuffer::new(tm, td), claim))
-            }
-            _ => {
-                self.abandon(claim);
-                None
-            }
+        if let (Some(rm), Some(rd), Some(tm), Some(td)) = (rx_meta, rx_data, tx_meta, tx_data) {
+            Some((PacketBuffer::new(rm, rd), PacketBuffer::new(tm, td), claim))
+        } else {
+            self.abandon(claim);
+            None
         }
     }
 

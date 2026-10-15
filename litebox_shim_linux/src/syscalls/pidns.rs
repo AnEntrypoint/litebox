@@ -89,6 +89,10 @@ pub(crate) struct PidNamespaceTable {
 }
 
 impl PidNamespaceTable {
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "const-initialized into a static table, never a stack frame"
+    )]
     pub(crate) const fn new() -> Self {
         Self {
             namespaces: [const { NamespaceSlot::new() }; MAX_NAMESPACES],
@@ -193,15 +197,15 @@ impl PidNamespaceTable {
     /// one-row namespaces whose only member should have been released" (a leak).
     fn rows_per_namespace(&self) -> [usize; 4] {
         let mut counts = [0usize; MAX_NAMESPACES];
-        for row in self.members.iter() {
+        for row in &self.members {
             if row.ns_pid.load(Ordering::Acquire) == FREE_PID {
                 continue;
             }
             let ns = row.ns.load(Ordering::Acquire);
-            if let Some(slot) = usize::checked_sub(ns as usize, 1) {
-                if let Some(c) = counts.get_mut(slot) {
-                    *c += 1;
-                }
+            if let Some(slot) = usize::checked_sub(ns as usize, 1)
+                && let Some(c) = counts.get_mut(slot)
+            {
+                *c += 1;
             }
         }
         let mut buckets = [0usize; 4];
@@ -226,17 +230,17 @@ impl PidNamespaceTable {
         let mut min_ipid = i32::MAX;
         let mut max_ipid = i32::MIN;
         let mut referenced = [false; MAX_NAMESPACES];
-        for row in self.members.iter() {
+        for row in &self.members {
             let ns_pid = row.ns_pid.load(Ordering::Acquire);
             if ns_pid == FREE_PID {
                 continue;
             }
             let ns = row.ns.load(Ordering::Acquire);
             let ipid = row.internal_pid.load(Ordering::Acquire);
-            if let Some(slot) = usize::checked_sub(ns as usize, 1) {
-                if let Some(flag) = referenced.get_mut(slot) {
-                    *flag = true;
-                }
+            if let Some(slot) = usize::checked_sub(ns as usize, 1)
+                && let Some(flag) = referenced.get_mut(slot)
+            {
+                *flag = true;
             }
             if sample.len() < 24 {
                 sample.push((ns, ns_pid, ipid));
@@ -257,6 +261,10 @@ impl PidNamespaceTable {
     }
 
     /// Claims the first free slot for a namespace nested inside `parent`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the slot index is below MAX_NAMESPACES, far under u32::MAX"
+    )]
     fn claim(&self, parent: u32, skip_referenced: bool) -> Option<u32> {
         for (index, slot) in self.namespaces.iter().enumerate() {
             if slot.in_use.load(Ordering::Acquire) {
@@ -291,6 +299,10 @@ impl PidNamespaceTable {
     ///
     /// An UNsealed slot is never touched: that is a `clone()` between `create` and `allocate`,
     /// legitimately rowless, and recycling it would hand its id to a second, concurrent clone.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the slot index is below MAX_NAMESPACES, far under u32::MAX"
+    )]
     fn reclaim_dead(&self, alive: &dyn Fn(i32) -> bool) -> usize {
         let mut freed = 0;
         for (index, slot) in self.namespaces.iter().enumerate() {
@@ -299,7 +311,7 @@ impl PidNamespaceTable {
             }
             let id = index as u32 + 1;
             let mut any_live = false;
-            for row in self.members.iter() {
+            for row in &self.members {
                 if row.ns_pid.load(Ordering::Acquire) == FREE_PID
                     || row.ns.load(Ordering::Acquire) != id
                 {
@@ -319,7 +331,7 @@ impl PidNamespaceTable {
             // twice -- `translate`/`pid_in` would then answer for the wrong process. A parent
             // still waiting on one of them is answered from its OWN namespace's row, not from
             // this one, so nothing a live process can ask for is lost by freeing these.
-            for row in self.members.iter() {
+            for row in &self.members {
                 if row.ns_pid.load(Ordering::Acquire) != FREE_PID
                     && row.ns.load(Ordering::Acquire) == id
                 {
@@ -350,7 +362,7 @@ impl PidNamespaceTable {
     pub(crate) fn occupancy(&self) -> (usize, usize, usize) {
         let mut in_use = 0;
         let mut sealed = 0;
-        for slot in self.namespaces.iter() {
+        for slot in &self.namespaces {
             if slot.in_use.load(Ordering::Acquire) {
                 in_use += 1;
             }
@@ -375,7 +387,7 @@ impl PidNamespaceTable {
     /// be able to `wait4`/read `si_pid` by the pid it knew. `release` (called from `sys_wait4`)
     /// clears those later, and `reclaim_dead` then frees the slot if that was the last one.
     pub(crate) fn init_exited(&self, ns: u32) {
-        for row in self.members.iter() {
+        for row in &self.members {
             if row.ns.load(Ordering::Acquire) == ns
                 && row.ns_pid.load(Ordering::Acquire) != FREE_PID
             {
@@ -398,7 +410,7 @@ impl PidNamespaceTable {
                 .destroyed
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
                 + 1;
-            if n <= 2 || n % 64 == 0 {
+            if n <= 2 || n.is_multiple_of(64) {
                 litebox_util_log::warn!(ns:% = ns, destroyed:% = n; "pidns: namespace destroyed with its init");
             }
         }
@@ -475,7 +487,7 @@ impl PidNamespaceTable {
     }
 
     fn register(&self, ns_pid: i32, ns: u32, internal_pid: i32) -> bool {
-        for row in self.members.iter() {
+        for row in &self.members {
             if row
                 .ns_pid
                 .compare_exchange(FREE_PID, ns_pid, Ordering::AcqRel, Ordering::Acquire)
@@ -493,7 +505,7 @@ impl PidNamespaceTable {
     /// Forgets every row naming `internal_pid` -- a process's own pid when it exits, a thread's own
     /// tid when that thread does.
     pub(crate) fn release(&self, internal_pid: i32) {
-        for row in self.members.iter() {
+        for row in &self.members {
             if row.internal_pid.load(Ordering::Acquire) == internal_pid
                 && row.ns_pid.load(Ordering::Acquire) != FREE_PID
             {

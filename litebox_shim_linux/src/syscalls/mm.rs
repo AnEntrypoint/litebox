@@ -157,6 +157,10 @@ pub(crate) struct SysvShmTable {
 }
 
 impl SysvShmTable {
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the SysV segment table is a fixed inline array of MAX_SYSV_SHM_SEGMENTS slots by design"
+    )]
     pub(crate) fn new() -> Self {
         Self {
             slots: [None; MAX_SYSV_SHM_SEGMENTS],
@@ -217,7 +221,7 @@ impl SysvShmTable {
         let free = self
             .slots
             .iter()
-            .position(|slot| slot.is_none())
+            .position(Option::is_none)
             .ok_or(Errno::ENOSPC)?;
         self.slots[free] = Some(ShmSlot { shmid, segment });
         Ok(())
@@ -434,16 +438,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(handle) => handle,
             Err(SharedMemoryError::UnsupportedByPlatform) => {
                 let section = alloc::format!("Local\\{name}");
-                match self
+                if let Ok(handle) = self
                     .global
                     .platform
                     .create_named_shared_memory(&section, size)
                 {
-                    Ok(handle) => handle,
-                    Err(_) => {
-                        rollback_attach();
-                        return Err(Errno::ENOMEM);
-                    }
+                    handle
+                } else {
+                    rollback_attach();
+                    return Err(Errno::ENOMEM);
                 }
             }
             Err(_) => {
@@ -466,19 +469,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `shared_view_base` handles the second). Mapping it at a platform-chosen (non-fixed)
         // address is sound -- no guest code has observed this address range before this call
         // returns it.
-        let ptr = match unsafe {
+        let Ok(ptr) = (unsafe {
             self.process().pm().map_existing_shared_pages(
                 None,
                 len,
                 litebox::mm::linux::CreatePagesFlags::empty(),
                 handle,
             )
-        } {
-            Ok(p) => p,
-            Err(_) => {
-                rollback_attach();
-                return Err(Errno::ENOMEM);
-            }
+        }) else {
+            rollback_attach();
+            return Err(Errno::ENOMEM);
         };
         let addr = ptr.as_usize();
         self.files.borrow().record_shm_attachment(addr, shmid);
@@ -636,7 +636,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 // `struct ipc64_perm`: key, uid, gid, cuid, cgid (i32/u32 each), then mode.
                 for (off, v) in [
-                    (0isize, key as u32),
+                    (0isize, key.cast_unsigned()),
                     (4, uid),
                     (8, gid),
                     (12, uid),
@@ -644,7 +644,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     (20, mode),
                 ] {
                     for (i, b) in v.to_le_bytes().iter().enumerate() {
-                        let _ = buf.write_at_offset::<Platform>(off + i as isize, *b);
+                        let _ =
+                            buf.write_at_offset::<Platform>(off + isize::try_from(i).unwrap(), *b);
                     }
                 }
                 for (i, b) in size.to_le_bytes().iter().enumerate() {
@@ -850,7 +851,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!(
                 fd:% = fd, len:% = len, offset:% = offset,
                 memcpy_ok:% = memcpy_result.is_ok(),
-                memcpy_addr:% = memcpy_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                memcpy_addr:% = memcpy_result.as_ref().map_or(0, UserPtrMut::<u8>::as_usize);
                 "DIAG do_mmap_file: memcpy fallback result"
             );
             memcpy_result?
@@ -863,6 +864,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // correlation, reusing the same `lookup_fd_path` mechanism `readlink("/proc/self/fd/N")`
         // already relies on).
         if is_exec {
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "a guest fd is only a lookup key here, so a negative fd keeps its sign-extended value unchanged"
+            )]
             let path = self.files.borrow().lookup_fd_path(fd as usize);
             litebox_util_log::debug!(
                 path:? = path, start:% = result.as_usize(), len:% = len, offset:% = offset;
@@ -916,6 +921,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         fd: i32,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        const MAX_COW_VERIFIED_PADDING: usize = 0x1_0000 - PAGE_SIZE;
         if !len.is_multiple_of(PAGE_SIZE) {
             return None;
         }
@@ -1009,7 +1015,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // `verified_safe_padding` clamp down to exactly how much (if any) genuinely qualifies --
         // `try_allocate_cow_pages` NEVER receives a padding budget this call has not itself,
         // just now, confirmed live.
-        const MAX_COW_VERIFIED_PADDING: usize = 0x1_0000 - PAGE_SIZE;
         let verified_safe_padding = suggested_addr
             .filter(|&addr| addr >= MAX_COW_VERIFIED_PADDING)
             .and_then(|addr| {
@@ -1368,6 +1373,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// mappers. That is exactly how SQLite (Chromium's every database) works: it maps the file
     /// read-only and writes it with `pwrite`, so it read back stale zeros, decided the database
     /// was corrupt, and the browser aborted on a `CHECK`. A no-op unless the file has a mapping.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "offset is an index into a mapping of size bytes, far below isize::MAX"
+    )]
     pub(crate) fn propagate_write_to_shared_mapping(
         &self,
         raw_fd: usize,
@@ -1499,6 +1508,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         !self.global.shared_files.lock().is_empty()
     }
 
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "start is an index into a mapping of length bytes, far below isize::MAX"
+    )]
     pub(crate) fn shared_file_write_through(&self, raw_fd: usize, start: usize, bytes: &[u8]) {
         let key = {
             let files = self.files.borrow();
@@ -1713,6 +1726,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// are excluded and keep their private, patchable copies.
     ///
     /// Returns `None` whenever the mapping does not qualify, leaving the ordinary path untouched.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "file offsets written into a mapping are far below isize::MAX"
+    )]
     fn try_shared_private_file_mmap(
         &self,
         addr: usize,
@@ -2045,8 +2062,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         litebox_util_log::debug!(
             tid:% = self.tid.get(), addr:% = addr, len:% = len,
             ok:% = result.is_ok(),
-            returned_start:% = result.as_ref().map(|p| p.as_usize()).unwrap_or(0),
-            returned_end:% = result.as_ref().map(|p| p.as_usize() + len).unwrap_or(0);
+            returned_start:% = result.as_ref().map_or(0, UserPtrMut::<u8>::as_usize),
+            returned_end:% = result.as_ref().map_or(0, |p| p.as_usize() + len);
             "DIAG sys_mmap: result"
         );
         result
@@ -2302,7 +2319,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         vec: UserPtrMut<u8>,
     ) -> Result<(), Errno> {
         let page = litebox::mm::linux::PAGE_SIZE;
-        if addr.as_usize() % page != 0 {
+        if !addr.as_usize().is_multiple_of(page) {
             return Err(Errno::EINVAL);
         }
         let pages = length.div_ceil(page);
@@ -2322,7 +2339,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         const MS_ASYNC: u32 = 1;
         const MS_INVALIDATE: u32 = 2;
         const MS_SYNC: u32 = 4;
-        if addr.as_usize() % litebox::mm::linux::PAGE_SIZE != 0
+        if !addr
+            .as_usize()
+            .is_multiple_of(litebox::mm::linux::PAGE_SIZE)
             || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
             || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
         {
@@ -2455,6 +2474,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // the actual weston crash addresses entirely -- this is the OTHER route a mapping
             // gains PROT_EXEC (an mmap(PROT_READ) followed later by mprotect(PROT_EXEC), the
             // classic dynamic-linker lazy-mapping idiom), so track it here too.
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "a guest fd is only a lookup key here, so a negative fd keeps its sign-extended value unchanged"
+            )]
             let path = self.files.borrow().lookup_fd_path(fd as usize);
             litebox_util_log::debug!(
                 path:? = path, start:% = patch_start, len:% = patch_len;
@@ -2855,6 +2878,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// pre-patched binary's trampoline could not be set up — the caller must
     /// fail the mapping because the code already contains JMPs to the
     /// trampoline address.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "span offsets are relative to an ELF file mapping that fits usize"
+    )]
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
@@ -2863,6 +2890,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         syscall_entry: usize,
         file_offset: Option<usize>,
     ) -> bool {
+        // Per-syscall stub upper bound: the fixed lea+jmp+jmp-back sequence
+        // (`hook_syscalls_in_section`) is 18 bytes, plus up to `SYSCALL_CONTEXT_INSTRUCTIONS`
+        // (8) re-encoded instructions of at most 15 bytes (x86-64's own max instruction
+        // length) each on the richer pre/post-syscall paths -- 128 comfortably covers that
+        // with headroom, and only pads address space (never committed memory) if it
+        // overshoots.
+        const MAX_STUB_BYTES_PER_SYSCALL: usize = 128;
+        const TRAMPOLINE_ENTRY_BYTES: usize = 8;
+        // Capped: `syscall_upper_bound` counts raw `0F 05` byte pairs anywhere in the
+        // mapping, including non-code data (rodata sharing the segment, or an unrelated
+        // byte pair inside another instruction's encoding) -- real code never approaches
+        // this density, so a huge count here means the segment is huge and mostly NOT
+        // syscalls, not that it genuinely needs gigabytes of trampoline. 4 MiB covers over
+        // 32,000 real syscall sites (every real-world binary seen so far needs under 1,000)
+        // while bounding the one-time address-space/commit cost for a large, data-heavy
+        // mapping. A segment that legitimately needs more than this still has the existing
+        // `trampoline_mapped_len`-extension path as a backstop, unchanged.
+        const MAX_INITIAL_TRAMPOLINE_SIZE: usize = 4 * 1024 * 1024;
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
@@ -2979,40 +3024,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // on: a real `syscall` is always exactly `0F 05` with no prefix that changes those
             // bytes, so this can only OVER-count (data or another instruction's encoding
             // containing that pair), never under-count, and sizing off an over-count is safe.
-            let syscall_upper_bound = mapped_addr
-                .to_owned_slice::<Platform>(len)
-                .map(|owned| {
-                    let buf = owned.into_vec();
-                    buf.windows(2)
-                        .filter(|w| w[0] == 0x0F && w[1] == 0x05)
-                        .count()
-                })
-                .unwrap_or(0);
-            // Per-syscall stub upper bound: the fixed lea+jmp+jmp-back sequence
-            // (`hook_syscalls_in_section`) is 18 bytes, plus up to `SYSCALL_CONTEXT_INSTRUCTIONS`
-            // (8) re-encoded instructions of at most 15 bytes (x86-64's own max instruction
-            // length) each on the richer pre/post-syscall paths -- 128 comfortably covers that
-            // with headroom, and only pads address space (never committed memory) if it
-            // overshoots.
-            const MAX_STUB_BYTES_PER_SYSCALL: usize = 128;
-            const TRAMPOLINE_ENTRY_BYTES: usize = 8;
-            // Capped: `syscall_upper_bound` counts raw `0F 05` byte pairs anywhere in the
-            // mapping, including non-code data (rodata sharing the segment, or an unrelated
-            // byte pair inside another instruction's encoding) -- real code never approaches
-            // this density, so a huge count here means the segment is huge and mostly NOT
-            // syscalls, not that it genuinely needs gigabytes of trampoline. 4 MiB covers over
-            // 32,000 real syscall sites (every real-world binary seen so far needs under 1,000)
-            // while bounding the one-time address-space/commit cost for a large, data-heavy
-            // mapping. A segment that legitimately needs more than this still has the existing
-            // `trampoline_mapped_len`-extension path as a backstop, unchanged.
-            const MAX_INITIAL_TRAMPOLINE_SIZE: usize = 4 * 1024 * 1024;
+            let syscall_upper_bound =
+                mapped_addr
+                    .to_owned_slice::<Platform>(len)
+                    .map_or(0, |owned| {
+                        let buf = owned.into_vec();
+                        buf.windows(2)
+                            .filter(|w| w[0] == 0x0F && w[1] == 0x05)
+                            .count()
+                    });
             let initial_tramp_size = align_up(
                 TRAMPOLINE_ENTRY_BYTES
                     + syscall_upper_bound.saturating_mul(MAX_STUB_BYTES_PER_SYSCALL),
                 PAGE_SIZE,
             )
-            .max(PAGE_SIZE)
-            .min(MAX_INITIAL_TRAMPOLINE_SIZE);
+            .clamp(PAGE_SIZE, MAX_INITIAL_TRAMPOLINE_SIZE);
 
             // Try MAP_FIXED_NOREPLACE first — works when the preferred
             // trampoline address is available. If that fails, probe nearby
@@ -3255,17 +3281,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
-        let patch_result = match patch_err {
-            Some(e) => Err(e),
-            None => {
-                if !all_skipped.is_empty() {
-                    litebox_util_log::warn!(
-                        count:? = all_skipped.len(), addrs:? = all_skipped;
-                        "syscall instruction(s) could not be patched"
-                    );
-                }
-                Ok(all_stubs)
+        let patch_result = if let Some(e) = patch_err {
+            Err(e)
+        } else {
+            if !all_skipped.is_empty() {
+                litebox_util_log::warn!(
+                    count:? = all_skipped.len(), addrs:? = all_skipped;
+                    "syscall instruction(s) could not be patched"
+                );
             }
+            Ok(all_stubs)
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
@@ -3297,7 +3322,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                     litebox_util_log::debug!(
                         ok:% = extend_result.is_ok(),
-                        result_addr:% = extend_result.as_ref().map(|p| p.as_usize()).unwrap_or(0);
+                        result_addr:% = extend_result.as_ref().map_or(0, UserPtrMut::<u8>::as_usize);
                         "diag-tramp-extend: do_mmap_anonymous result"
                     );
                     if extend_result.is_err() {

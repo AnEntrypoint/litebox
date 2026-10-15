@@ -304,7 +304,7 @@ mod tests {
         if !host_program_available("diod") {
             std::eprintln!("SKIPPED: `diod` is not installed on this host");
             return;
-        };
+        }
 
         let server = DiodServer::start();
         let fs = connect_9p(&task, &server);
@@ -346,7 +346,7 @@ mod tests {
         if !host_program_available("diod") {
             std::eprintln!("SKIPPED: `diod` is not installed on this host");
             return;
-        };
+        }
 
         let server = DiodServer::start();
 

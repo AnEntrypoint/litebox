@@ -1166,6 +1166,7 @@ impl ControlTransferTargets<'_> {
     /// Takes `&u64` so call sites read identically to the `BTreeSet::contains` this replaced.
     /// `addr` is absolute; the stored offsets are not, which is what lets one scan of a file serve
     /// every address that file is ever mapped at (see [`SegmentScanTemplate`]).
+    #[allow(clippy::trivially_copy_pass_by_ref)] // Mirrors `BTreeSet::contains`, which takes `&u64`.
     fn contains(&self, addr: &u64) -> bool {
         match addr.checked_sub(self.base) {
             Some(offset) => self.offsets.binary_search(&offset).is_ok(),

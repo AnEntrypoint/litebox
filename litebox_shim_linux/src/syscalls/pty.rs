@@ -784,8 +784,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
 
     pub(crate) fn get_fg_pgid(&self, id: u32) -> i32 {
         self.find(id)
-            .map(|s| s.fg_pgid.load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |s| s.fg_pgid.load(Ordering::Relaxed))
     }
 
     pub(crate) fn set_fg_pgid(&self, id: u32, v: i32) {
@@ -796,8 +795,7 @@ impl<Platform: ShimPlatform> SharedPtyTable<Platform> {
 
     pub(crate) fn is_locked(&self, id: u32) -> bool {
         self.find(id)
-            .map(|s| s.locked.load(Ordering::Acquire))
-            .unwrap_or(false)
+            .is_some_and(|s| s.locked.load(Ordering::Acquire))
     }
 
     pub(crate) fn set_locked(&self, id: u32, v: bool) {
@@ -982,7 +980,7 @@ pub(crate) enum PtyStateRef<'a, Platform: ShimPlatform> {
     Shared(u32, &'a SharedPtyTable<Platform>),
 }
 
-impl<'a, Platform: ShimPlatform> PtyStateRef<'a, Platform> {
+impl<Platform: ShimPlatform> PtyStateRef<'_, Platform> {
     pub(crate) fn id(&self) -> u32 {
         match self {
             Self::Local(p) => p.id,

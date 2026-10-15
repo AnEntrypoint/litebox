@@ -143,6 +143,10 @@ const VIRTUAL_EDID_BLOB: [u8; 128] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56,
 ];
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the virtual mode dimensions are small compile-time constants that fit u16/u32"
+)]
 fn virtual_mode() -> DrmModeModeinfo {
     let mut name = [0u8; 32];
     let label = b"virtual-1920x1080\0";
@@ -518,24 +522,23 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedDrmRegion<Platform>>();
         let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let (ptr, shared) = match arena {
-            Some(ptr) => (ptr.cast::<SharedDrmRegion<Platform>>(), true),
-            None => {
-                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Leak a process-private allocation so every
-                // later access stays memory-safe, and let `shared` say so.
-                litebox_util_log::error!(
-                    bytes:% = layout.size();
-                    "shared drm table: shared kernel arena exhausted; /dev/dri/card0 objects are \
-                     visible to this host process only"
-                );
-                (
-                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .expect("shared drm table: fallback allocation failed")
-                        .cast::<SharedDrmRegion<Platform>>(),
-                    false,
-                )
-            }
+        let (ptr, shared) = if let Some(ptr) = arena {
+            (ptr.cast::<SharedDrmRegion<Platform>>(), true)
+        } else {
+            // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+            // process IS the whole guest session). Leak a process-private allocation so every
+            // later access stays memory-safe, and let `shared` say so.
+            litebox_util_log::error!(
+                bytes:% = layout.size();
+                "shared drm table: shared kernel arena exhausted; /dev/dri/card0 objects are \
+                 visible to this host process only"
+            );
+            (
+                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                    .expect("shared drm table: fallback allocation failed")
+                    .cast::<SharedDrmRegion<Platform>>(),
+                false,
+            )
         };
         Self::new_in(ptr, shared)
     }
@@ -708,6 +711,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// Appends one flip-completion event to the shared ring, dropping the OLDEST if it is already
     /// full (a real kernel's own event ring behaves the same way -- a client that never reads must
     /// not be able to fail the presenting process's `PAGE_FLIP`). Callers hold `guard`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "head and count are kept below SHARED_DRM_FLIP_EVENTS, a small constant"
+    )]
     fn flip_push(&self, event: &DrmEventVblank) {
         let count = self.region.flip_count.load(Ordering::Acquire) as usize;
         let head = self.region.flip_head.load(Ordering::Acquire) as usize;
@@ -733,6 +740,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     }
 
     /// Pops the oldest flip-completion event's exact byte image. Callers hold `guard`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "head and count are kept below SHARED_DRM_FLIP_EVENTS, a small constant"
+    )]
     fn flip_pop(&self) -> Option<[u8; FLIP_EVENT_BYTES]> {
         let count = self.region.flip_count.load(Ordering::Acquire) as usize;
         if count == 0 {
@@ -817,6 +828,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         self.region.flip_count.load(Ordering::Acquire) != 0
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn get_resources(&self, ptr: UserPtrMut<DrmModeCardRes>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
 
@@ -841,12 +856,12 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             out.write_at_offset::<Platform>(0, VIRTUAL_CRTC_ID)
                 .ok_or(Errno::EFAULT)?;
         }
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         let fb_count = u32::try_from(self.fb_count()).unwrap_or(u32::MAX);
         if req.count_fbs > 0 && req.fb_id_ptr != 0 {
             let out = UserPtrMut::<u32>::from_usize(req.fb_id_ptr as usize);
             let mut i: u32 = 0;
-            for slot in self.region.framebuffers.iter() {
+            for slot in &self.region.framebuffers {
                 if i >= req.count_fbs {
                     break;
                 }
@@ -861,7 +876,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
                 i += 1;
             }
         }
-        drop(_guard);
+        drop(guard);
 
         req.count_connectors = 1;
         req.count_encoders = 1;
@@ -876,6 +891,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         Ok(0)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn get_connector(&self, ptr: UserPtrMut<DrmModeGetConnector>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.connector_id != 0 && req.connector_id != VIRTUAL_CONNECTOR_ID {
@@ -1110,91 +1129,92 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         }) else {
             return;
         };
-        match platform.map_shared_memory(
+        // A host-side presentation window failing to see one frame is not a reason to fail
+        // the guest's own ioctl -- see `page_flip`'s identical reasoning at its own
+        // corresponding `Err` arm. On `Err` nothing else happens.
+        if let Ok(mapped_ptr) = platform.map_shared_memory(
             handle,
             0..size,
             litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
             litebox::platform::page_mgmt::FixedAddressBehavior::Hint,
         ) {
-            Ok(mapped_ptr) => {
-                let addr = mapped_ptr.as_usize();
-                // SAFETY: `map_shared_memory` just returned this exact `addr`/`size` as a freshly
-                // established, readable mapping of `handle`'s real backing storage; nothing else in
-                // this function (or reachable from the callback, which only receives a `&[u8]`
-                // slice, not the address) can invalidate it before the `unmap_shared_memory` call
-                // immediately below.
-                let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
-                // Log the address this fb is mapped at, so a range destroyed by
-                // allocate_pages (see diag-reclaim) can be matched against it.
-                if drm_trace_enabled() {
-                    litebox_util_log::debug!(
-                        fb_id:% = fb_id, addr:% = addr, size:% = size;
-                        "diag-drm-fb-addr"
-                    );
-                }
-                // Sample the SHARED BACKING STORE directly (this mapping was just
-                // established fresh from `handle`, so it is not a stale view). A black
-                // captured frame with non-zero bytes here would mean the capture path is
-                // at fault; zero bytes here means the backing store itself really was
-                // wiped, and the search moves to whatever wiped it.
-                if drm_trace_enabled() {
-                    let n = bytes.len();
-                    let nz = bytes.iter().filter(|b| **b != 0).count();
-                    // A cheap content fingerprint. If this never changes flip after
-                    // flip, the guest is not drawing into the buffer at all -- which
-                    // would mean the blackout is a compositing problem (no visible
-                    // surface, so a legitimately black frame) rather than memory being
-                    // destroyed. That distinction decides whether this is a litebox bug
-                    // at all, so it is worth measuring before any more memory work.
-                    let mut sum: u64 = 0;
-                    for (i, b) in bytes.iter().enumerate().step_by(4096) {
-                        sum = sum.wrapping_mul(31).wrapping_add((*b as u64) ^ (i as u64));
-                    }
-                    litebox_util_log::debug!(fb_id:% = fb_id, digest:% = sum; "diag-drm-digest");
-                    litebox_util_log::debug!(
-                        fb_id:% = fb_id,
-                        bytes_len:% = n,
-                        nonzero_bytes:% = nz,
-                        first8:? = &bytes[..core::cmp::min(8, n)],
-                        mid8:? = &bytes[n / 2..core::cmp::min(n / 2 + 8, n)];
-                        "diag-drm-scanout-bytes"
-                    );
-                }
-                if drm_trace_enabled() {
-                    // Sample the SOURCE bytes right at this fresh mapping, before the callback
-                    // sees them -- distinguishes "the shared buffer itself is zero" (a real
-                    // wipe/coherency bug upstream of this function) from "the buffer holds real
-                    // content but something downstream of this function drops it" (a capture/
-                    // presentation-path bug instead). Counting only a bounded prefix keeps this
-                    // cheap enough to run on every flip while `LITEBOX_DRM_TRACE=1` is set.
-                    let sample_len = bytes.len().min(4096);
-                    let non_zero_in_sample =
-                        bytes[..sample_len].iter().filter(|b| **b != 0).count();
-                    litebox_util_log::debug!(
-                        fb_id:% = fb_id, handle:? = handle, addr:% = addr, size:% = size,
-                        sample_len:% = sample_len, non_zero_in_sample:% = non_zero_in_sample;
-                        "diag-drm-flip-source-bytes"
-                    );
-                }
-                // Every observer sees the same frame. The SAFETY note below depends on all of
-                // them having returned before the mapping is torn down, which this loop
-                // guarantees exactly as the previous single call did.
-                for callback in local.callbacks.lock().iter() {
-                    callback(bytes, width, height, pitch, pixel_format);
-                }
-                // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
-                // callback (the only other holder of a reference into it) has already returned by
-                // this point -- no other code can still be reading through it.
-                let _ = unsafe { platform.unmap_shared_memory(addr..addr + size) };
+            let addr = mapped_ptr.as_usize();
+            // SAFETY: `map_shared_memory` just returned this exact `addr`/`size` as a freshly
+            // established, readable mapping of `handle`'s real backing storage; nothing else in
+            // this function (or reachable from the callback, which only receives a `&[u8]`
+            // slice, not the address) can invalidate it before the `unmap_shared_memory` call
+            // immediately below.
+            let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+            // Log the address this fb is mapped at, so a range destroyed by
+            // allocate_pages (see diag-reclaim) can be matched against it.
+            if drm_trace_enabled() {
+                litebox_util_log::debug!(
+                    fb_id:% = fb_id, addr:% = addr, size:% = size;
+                    "diag-drm-fb-addr"
+                );
             }
-            Err(_) => {
-                // A host-side presentation window failing to see one frame is not a reason to fail
-                // the guest's own ioctl -- see `page_flip`'s identical reasoning at its own
-                // corresponding `Err` arm.
+            // Sample the SHARED BACKING STORE directly (this mapping was just
+            // established fresh from `handle`, so it is not a stale view). A black
+            // captured frame with non-zero bytes here would mean the capture path is
+            // at fault; zero bytes here means the backing store itself really was
+            // wiped, and the search moves to whatever wiped it.
+            if drm_trace_enabled() {
+                let n = bytes.len();
+                let nz = bytes.iter().filter(|b| **b != 0).count();
+                // A cheap content fingerprint. If this never changes flip after
+                // flip, the guest is not drawing into the buffer at all -- which
+                // would mean the blackout is a compositing problem (no visible
+                // surface, so a legitimately black frame) rather than memory being
+                // destroyed. That distinction decides whether this is a litebox bug
+                // at all, so it is worth measuring before any more memory work.
+                let mut sum: u64 = 0;
+                for (i, b) in bytes.iter().enumerate().step_by(4096) {
+                    sum = sum
+                        .wrapping_mul(31)
+                        .wrapping_add(u64::from(*b) ^ (i as u64));
+                }
+                litebox_util_log::debug!(fb_id:% = fb_id, digest:% = sum; "diag-drm-digest");
+                litebox_util_log::debug!(
+                    fb_id:% = fb_id,
+                    bytes_len:% = n,
+                    nonzero_bytes:% = nz,
+                    first8:? = &bytes[..core::cmp::min(8, n)],
+                    mid8:? = &bytes[n / 2..core::cmp::min(n / 2 + 8, n)];
+                    "diag-drm-scanout-bytes"
+                );
             }
+            if drm_trace_enabled() {
+                // Sample the SOURCE bytes right at this fresh mapping, before the callback
+                // sees them -- distinguishes "the shared buffer itself is zero" (a real
+                // wipe/coherency bug upstream of this function) from "the buffer holds real
+                // content but something downstream of this function drops it" (a capture/
+                // presentation-path bug instead). Counting only a bounded prefix keeps this
+                // cheap enough to run on every flip while `LITEBOX_DRM_TRACE=1` is set.
+                let sample_len = bytes.len().min(4096);
+                let non_zero_in_sample = bytes[..sample_len].iter().filter(|b| **b != 0).count();
+                litebox_util_log::debug!(
+                    fb_id:% = fb_id, handle:? = handle, addr:% = addr, size:% = size,
+                    sample_len:% = sample_len, non_zero_in_sample:% = non_zero_in_sample;
+                    "diag-drm-flip-source-bytes"
+                );
+            }
+            // Every observer sees the same frame. The SAFETY note below depends on all of
+            // them having returned before the mapping is torn down, which this loop
+            // guarantees exactly as the previous single call did.
+            for callback in local.callbacks.lock().iter() {
+                callback(bytes, width, height, pitch, pixel_format);
+            }
+            // SAFETY: `addr..addr+size` is exactly the range just mapped above, and the
+            // callback (the only other holder of a reference into it) has already returned by
+            // this point -- no other code can still be reading through it.
+            let _ = unsafe { platform.unmap_shared_memory(addr..addr + size) };
         }
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn get_plane_resources(
         &self,
         ptr: UserPtrMut<DrmModeGetPlaneRes>,
@@ -1213,6 +1233,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         Ok(0)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn get_plane(&self, ptr: UserPtrMut<DrmModeGetPlane>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.plane_id != 0 && req.plane_id != VIRTUAL_PLANE_ID {
@@ -1270,12 +1294,14 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// real buffer gets it filled, truncated to whichever is smaller (matching the real kernel's
     /// own `drm_copy_field` behavior -- a short caller buffer is not an error).
     pub(crate) fn version(&self, ptr: UserPtrMut<DrmVersion>) -> Result<u32, Errno> {
-        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-
         const NAME: &[u8] = b"litebox";
         const DATE: &[u8] = b"20260101";
         const DESC: &[u8] = b"litebox virtual DRM/KMS device";
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "guest pointers and lengths are u64 but every host target is 64-bit (x64/arm64)"
+        )]
         fn fill_field<Platform: ShimPlatform>(
             user_ptr: u64,
             user_len: u64,
@@ -1290,6 +1316,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             Ok(value.len() as u64)
         }
 
+        let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         req.version_major = 1;
         req.version_minor = 0;
         req.version_patchlevel = 0;
@@ -1433,6 +1460,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// resolved to `WDRM_PLANE_TYPE_PRIMARY`, so a plane reporting zero properties (this
     /// device's prior behavior) was silently invisible to that discovery path even though
     /// `GETPLANE`/`GETPLANERESOURCES` correctly enumerated it.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn obj_get_properties(
         &self,
         ptr: UserPtrMut<DrmModeObjGetProperties>,
@@ -1577,6 +1608,10 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// which is what real clients actually use to pick a mode -- the EDID's only job here is to
     /// exist and parse successfully, not to redundantly describe a mode a client would prefer
     /// over the one already offered.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64); the EDID blob is a small constant"
+    )]
     pub(crate) fn get_prop_blob(&self, ptr: UserPtrMut<DrmModeGetBlob>) -> Result<u32, Errno> {
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.blob_id != VIRTUAL_CONNECTOR_EDID_BLOB_ID {
@@ -1586,7 +1621,8 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             let len = core::cmp::min(req.length as usize, VIRTUAL_EDID_BLOB.len());
             let dest = UserPtrMut::<u8>::from_usize(req.data as usize);
             for (i, byte) in VIRTUAL_EDID_BLOB[..len].iter().enumerate() {
-                dest.write_at_offset::<Platform>(i as isize, *byte)
+                let index = isize::try_from(i).map_err(|_| Errno::EINVAL)?;
+                dest.write_at_offset::<Platform>(index, *byte)
                     .ok_or(Errno::EFAULT)?;
             }
         }
@@ -1611,7 +1647,12 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
     /// advertises, not just the ones a caller happens to exercise directly). Every other
     /// property ID this device could ever be asked about (there are none) gets a real `ENOENT`
     /// (unknown property) rather than an `ENOTTY` that would look like a missing driver.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guest pointers are u64 but every host target is 64-bit (x64/arm64), so usize holds them"
+    )]
     pub(crate) fn get_property(&self, ptr: UserPtrMut<DrmModeGetProperty>) -> Result<u32, Errno> {
+        const NAME: &[u8] = b"type";
         let mut req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         if req.prop_id == VIRTUAL_CONNECTOR_DPMS_PROP_ID {
             const NAME: &[u8] = b"DPMS";
@@ -1670,7 +1711,6 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         if req.prop_id != VIRTUAL_PLANE_TYPE_PROP_ID {
             return Err(Errno::ENOENT);
         }
-        const NAME: &[u8] = b"type";
         req.name = [0u8; 32];
         req.name[..NAME.len()].copy_from_slice(NAME);
         req.flags = DRM_MODE_PROP_ENUM;
@@ -1734,7 +1774,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         let shared_handle = platform
             .create_shared_memory(page_aligned_size)
             .map_err(|_| Errno::ENOMEM)?;
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         let handle = self
             .region
             .next_buffer_handle
@@ -1743,7 +1783,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         // Table full (after dead-owner reclaim): real DRM answers a GEM object it cannot allocate
         // with ENOMEM, and so does this. Never a panic.
         let Some(i) = self.claim_buffer(platform) else {
-            drop(_guard);
+            drop(guard);
             let _ = platform.close_shared_memory(shared_handle);
             litebox_util_log::error!(
                 capacity:% = SHARED_DRM_BUFFERS, cross_process:% = self.is_shared();
@@ -1762,7 +1802,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         slot.map_offset.store(0, Ordering::Release);
         slot.owner_host.store(owner, Ordering::Release);
         slot.state.store(DRM_SLOT_USED, Ordering::Release);
-        drop(_guard);
+        drop(guard);
         req.handle = handle;
         req.pitch = pitch;
         req.size = size;
@@ -1799,7 +1839,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         ptr: UserPtr<DrmModeDestroyDumb>,
     ) -> Result<u32, Errno> {
         let req = ptr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         let Some(i) = self.buffer_slot(req.handle) else {
             return Err(Errno::ENOENT);
         };
@@ -1809,7 +1849,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         slot.set_handle(None);
         slot.map_offset.store(0, Ordering::Release);
         slot.owner_host.store(0, Ordering::Release);
-        drop(_guard);
+        drop(guard);
         let Some(buffer) = taken else {
             return Err(Errno::ENOENT);
         };
@@ -1863,7 +1903,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             bpp:? = req.bpp, depth:? = req.depth, handle:? = handle;
             "drm-ioctl: ADDFB (v1) request"
         );
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         let fb_id = self.region.next_fb_id.fetch_add(1, Ordering::Relaxed);
         let owner = platform.current_host_pid();
         let Some(i) = self.claim_fb(platform) else {
@@ -1882,7 +1922,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         slot.handle.store(handle, Ordering::Release);
         slot.owner_host.store(owner, Ordering::Release);
         slot.state.store(DRM_SLOT_USED, Ordering::Release);
-        drop(_guard);
+        drop(guard);
         req.fb_id = fb_id;
         ptr.write_at_offset::<Platform>(0, req)
             .ok_or(Errno::EFAULT)?;
@@ -1912,7 +1952,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
             handle:? = handle;
             "drm-ioctl: ADDFB2 request"
         );
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         let fb_id = self.region.next_fb_id.fetch_add(1, Ordering::Relaxed);
         let owner = platform.current_host_pid();
         let Some(i) = self.claim_fb(platform) else {
@@ -1930,7 +1970,7 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         slot.handle.store(handle, Ordering::Release);
         slot.owner_host.store(owner, Ordering::Release);
         slot.state.store(DRM_SLOT_USED, Ordering::Release);
-        drop(_guard);
+        drop(guard);
         req.fb_id = fb_id;
         ptr.write_at_offset::<Platform>(0, req)
             .ok_or(Errno::EFAULT)?;
@@ -1993,6 +2033,11 @@ impl<Platform: ShimPlatform> SharedDrmTable<Platform> {
         Ok(0)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::similar_names,
+        reason = "size_of a fixed-size event struct fits u32; tv_sec/tv_usec mirror the kernel's timeval field names"
+    )]
     pub(crate) fn page_flip(
         &self,
         platform: &Platform,

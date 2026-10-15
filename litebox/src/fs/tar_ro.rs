@@ -613,6 +613,9 @@ impl TarIndex {
         }
     }
 
+    // The on-disk mtime is the i64 bit pattern of a u64 field, and the data range is a u64 field
+    // read back as usize on the 64-bit hosts this runs on.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn file(&self, idx: usize) -> FileRecord {
         let at = self.files_off + idx * FILE_RECORD_LEN;
         FileRecord {
@@ -628,6 +631,8 @@ impl TarIndex {
         }
     }
 
+    // The on-disk mtime is the i64 bit pattern of a u64 field.
+    #[allow(clippy::cast_possible_wrap)]
     fn dir(&self, idx: usize) -> DirRecord {
         let at = self.dirs_off + idx * DIR_RECORD_LEN;
         let flags = self.u32_at(at + 4);
@@ -695,6 +700,9 @@ impl TarIndex {
 }
 
 impl TreeIndex {
+    // The flat format stores every count, offset and length as a u32 field; a layer index whose
+    // entry, child or byte counts overflow those fields is outside what this encoder is built for.
+    #[allow(clippy::cast_possible_truncation)]
     fn flatten(self, inode_allocator: &InodeAllocator) -> TarIndex {
         let Self {
             layers,

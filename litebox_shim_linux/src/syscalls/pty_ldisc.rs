@@ -238,7 +238,7 @@ impl LineDiscipline {
             if b == cc[VKILL] && b != 0 {
                 let mut e = Vec::new();
                 if lflag & ECHOKE != 0 {
-                    for gone in self.line.iter() {
+                    for gone in &self.line {
                         for _ in 0..echo_width(*gone, t) {
                             e.extend_from_slice(b"\x08 \x08");
                         }
@@ -262,8 +262,7 @@ impl LineDiscipline {
             }
         }
 
-        let is_eol =
-            b == b'\n' || (!literal && ((b == cc[VEOL] && b != 0) || (b == cc[VEOL2] && b != 0)));
+        let is_eol = b == b'\n' || (!literal && b != 0 && (b == cc[VEOL] || b == cc[VEOL2]));
         if self.line.len() >= MAX_LINE && !is_eol {
             return;
         }

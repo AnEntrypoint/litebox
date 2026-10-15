@@ -1235,6 +1235,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /// child. A mapping whose object has no name on this platform is simply absent here: it
     /// cannot be reconstructed elsewhere, and the child reports it as unrestorable rather than
     /// quietly substituting a private copy (see [`Self::adopt`]).
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the masked access bits (VM_ACCESS_FLAGS) are the low byte of VmFlags"
+    )]
     pub(super) fn shared_region_carry(&self) -> Vec<SharedRegionCarry> {
         let mut out = Vec::new();
         for (range, vma) in self.vmas.iter() {
@@ -2328,15 +2332,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         } else {
             FixedAddressBehavior::Hint
         };
-        let result = unsafe {
+        unsafe {
             self.insert_mapping(
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
                 behavior,
             )
-        };
-        result
+        }
     }
 
     /// Resize a range in the virtual address space.
@@ -2542,6 +2545,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         new_size: NonZeroPageSize<ALIGN>,
     ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
+        const MAX_PLACEMENT_RETRIES: u32 = 8;
         assert!(new_size.as_usize() >= old_range.len());
 
         self.coalesce_private_span(&old_range);
@@ -2593,6 +2597,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // private memory -- no byte-copy is needed since the content lives in the shared object,
         // not in either view.
         if let Some(shared_handle) = vma.shared_handle {
+            const MAX_SHARED_MOVE_RETRIES: u32 = 8;
             // A GROWN shared mapping needs a bigger object, not just a bigger view: the object
             // was created at the OLD length (see `grow_shared_object`), and asking the platform
             // for a longer view than the object holds is what produced the live
@@ -2617,7 +2622,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // `map_shared_memory`'s own alignment/placement quirks (e.g. the
             // `ERROR_MAPPED_ALIGNMENT` case fixed in `map_shared_memory` above) can still cause
             // a first-pick collision.
-            const MAX_SHARED_MOVE_RETRIES: u32 = 8;
             let mut next_hint = suggested_new_address;
             let mut attempt = 0u32;
             let new_ptr = loop {
@@ -2680,7 +2684,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // surfacing a permanent failure for what is really just a resolvable placement collision.
         // Bounded (not unbounded) so a genuine, persistent AlreadyAllocated (e.g. every retry
         // landing in the same crowded region) still terminates instead of looping forever.
-        const MAX_PLACEMENT_RETRIES: u32 = 8;
         let mut next_hint = suggested_new_address;
         let mut attempt = 0u32;
         // Candidates the platform has already rejected, parked in `self.vmas` as placeholder VMAs

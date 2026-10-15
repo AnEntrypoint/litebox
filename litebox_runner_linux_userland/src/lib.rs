@@ -310,19 +310,20 @@ fn initialize_root_in_mem_layer<Platform: litebox::sync::RawSyncPrimitivesProvid
 fn install_frame_pointer_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(std::boxed::Box::new(move |info| {
+        use std::fmt::Write as _;
         previous(info);
         let mut rbp: usize;
         // SAFETY: reads the frame-pointer register only.
         unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
         let mut out = std::string::String::from("litebox-panic-frames:");
         for _ in 0..48 {
-            if rbp < 0x1000 || rbp % 8 != 0 {
+            if rbp < 0x1000 || !rbp.is_multiple_of(8) {
                 break;
             }
             // SAFETY: best-effort walk; the chain is validated only by alignment, which is
             // acceptable for a crash diagnostic that already runs on a panicking thread.
             let (next, ret) = unsafe { (*(rbp as *const usize), *((rbp + 8) as *const usize)) };
-            out.push_str(&std::format!(" {ret:#x}"));
+            let _ = write!(out, " {ret:#x}");
             if next <= rbp {
                 break;
             }
@@ -351,6 +352,12 @@ fn install_terminate_on_panic_hook() {
     }));
 }
 
+/// Runs the guest program described by `cli_args`.
+///
+/// # Panics
+///
+/// Panics if `insert_files` is non-empty (not implemented yet), if `program_and_arguments` is
+/// empty, or if the program path cannot be made absolute on the host.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     if std::env::var_os("LITEBOX_PRINT_EXE_BASE").is_some() {
         install_frame_pointer_panic_hook();

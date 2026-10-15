@@ -41,6 +41,9 @@ bitflags::bitflags! {
     }
 }
 
+/// The result of [`PageManagementProvider::try_allocate_cow_pages`].
+type CowPagesResult<P> = Result<(P, Option<(usize, usize)>), CowAllocationError>;
+
 /// A provider for managing memory pages
 ///
 /// NOTE: Due to insufficient support for associated constants in current Stable Rust, we have
@@ -84,11 +87,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
-    /// De-allocated all pages in the given `range`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that these pages are not in active use.
     /// Notification that the guest's mapping over `range` has been removed, whether or not that
     /// removal also required a real platform-level deallocation.
     ///
@@ -123,6 +121,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         false
     }
 
+    /// De-allocated all pages in the given `range`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that these pages are not in active use.
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.
@@ -278,7 +281,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
         verified_safe_padding: usize,
-    ) -> Result<(Self::RawMutPointer<u8>, Option<(usize, usize)>), CowAllocationError> {
+    ) -> CowPagesResult<Self::RawMutPointer<u8>> {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 

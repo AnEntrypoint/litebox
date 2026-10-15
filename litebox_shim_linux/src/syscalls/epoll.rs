@@ -63,6 +63,10 @@ const POLL_DIAG_SLICE: core::time::Duration = core::time::Duration::from_secs(2)
 /// each word gets a share of the budget and the whole set is re-checked between shares: a bump on
 /// ANY word is then noticed within one share. The snapshot is taken by the CALLER before it scans,
 /// so a bump racing that scan reads as "already changed" here rather than being lost.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "words is one poll set's wake-word list, far below u32::MAX"
+)]
 fn park_on_unix_wake_words<Platform: ShimPlatform, FS: ShimFS>(
     words: &[SharedWakeHandle<Platform, FS>],
     seen: &[u32],
@@ -467,7 +471,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 .filter_map(|entry| entry.desc.upgrade())
                 .collect();
             let wake_words = unix_wake_words(global, descs);
-            let seen: alloc::vec::Vec<u32> = wake_words.iter().map(|w| w.wake_seq()).collect();
+            let seen: alloc::vec::Vec<u32> =
+                wake_words.iter().map(SharedWakeHandle::wake_seq).collect();
             // `trace!`, not `debug!`: this fires every ~15ms per actively-waiting epoll_wait
             // caller for the whole boot (Xvfb, dbus-daemon, selkies, ...) -- an unthrottled
             // `debug!` here hit 78MB of log output in under 8 minutes (2026-09-18, twenty-fifth
@@ -563,12 +568,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                         .with_metadata(&file, |stream: &litebox::platform::StdioStream| *stream),
                     Ok(litebox::platform::StdioStream::Stdin)
                 ),
-                Some(EpollDescriptor::Timerfd(_)) => true,
-                Some(EpollDescriptor::Unix(_)) => true,
                 // TCP readiness changes made by another process's network poll (the host publish
                 // proxy runs in the root process) notify only observers local to that process, so
                 // a listener or connection owned by a fork child needs the bounded re-check too.
-                Some(EpollDescriptor::Socket(_)) => true,
+                Some(
+                    EpollDescriptor::Timerfd(_)
+                    | EpollDescriptor::Unix(_)
+                    | EpollDescriptor::Socket(_),
+                ) => true,
                 Some(EpollDescriptor::Pty(pty)) => pty_needs_repoll(global, &pty),
                 _ => false,
             }
@@ -585,6 +592,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         diag_tid: i32,
         diag_epfd: u32,
     ) {
+        static REPOLL_UNIX_DIAG_COUNTER: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
         // Keep the fd alongside each entry (lost by a plain `.values()` iteration) so the
         // targeted per-Unix-entry trace below can name which fd it's reporting on -- see that
         // trace's own comment for why this is the throttled replacement for the old unthrottled
@@ -601,11 +610,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
                 !entry.is_ready.load(core::sync::atomic::Ordering::Relaxed)
                     && matches!(
                         entry.desc.upgrade(),
-                        Some(EpollDescriptor::File(_))
-                            | Some(EpollDescriptor::Timerfd(_))
-                            | Some(EpollDescriptor::Unix(_))
-                            | Some(EpollDescriptor::Socket(_))
-                            | Some(EpollDescriptor::Pty(_))
+                        Some(
+                            EpollDescriptor::File(_)
+                                | EpollDescriptor::Timerfd(_)
+                                | EpollDescriptor::Unix(_)
+                                | EpollDescriptor::Socket(_)
+                                | EpollDescriptor::Pty(_)
+                        )
                     )
             })
             .map(|(key, entry)| (key.0, key.1, entry.clone()))
@@ -632,8 +643,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         // rare, high-value evidence AGENTS.md's twenty-fifth-pass pickup list asked for next --
         // whether Xvfb's real accepted-client fd is ever seen ready by this repoll at all, and with
         // what mask.
-        static REPOLL_UNIX_DIAG_COUNTER: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
         let call_idx = REPOLL_UNIX_DIAG_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         for (fd, entry_ptr, entry) in entries {
             let is_unix = matches!(entry.desc.upgrade(), Some(EpollDescriptor::Unix(_)));
@@ -659,7 +668,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
             // mechanism behind the "Xvfb never reads `xset q`'s bytes" gap this whole investigation
             // has been chasing since the twenty-fifth pass.
             let has_event = result.as_ref().is_some_and(|(ev, _)| ev.is_some());
-            if is_unix && (has_event || call_idx % 400 == 0) {
+            if is_unix && (has_event || call_idx.is_multiple_of(400)) {
                 litebox_util_log::debug!(
                     tid:% = diag_tid,
                     epfd:% = diag_epfd,
@@ -675,7 +684,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> EpollFile<Platform, FS> {
         }
         if !unpolllable.is_empty() {
             let mut interests = self.interests.lock();
-            for key in unpolllable.iter() {
+            for key in &unpolllable {
                 interests.remove(key);
             }
             litebox_util_log::debug!(
@@ -1131,7 +1140,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> ReadySet<Platform, FS> {
             litebox_util_log::debug!(
                 entry_id:% = alloc::sync::Arc::as_ptr(&entry) as usize,
                 data:% = entry.data(),
-                events_bits:% = event.as_ref().map(|e| e.events).unwrap_or(0),
+                events_bits:% = event.as_ref().map_or(0, |e| e.events),
                 is_still_ready:% = is_still_ready;
                 "diag-epoll-pop: entry polled"
             );
@@ -1392,7 +1401,8 @@ impl<Platform: ShimPlatform> PollSet<Platform> {
             // Snapshot the wake words BEFORE the scan below: a peer's bump racing that scan then
             // reads as "already changed" to the park at the bottom of this iteration, so no wake
             // can be lost between looking and sleeping.
-            let seen: alloc::vec::Vec<u32> = wake_words.iter().map(|w| w.wake_seq()).collect();
+            let seen: alloc::vec::Vec<u32> =
+                wake_words.iter().map(SharedWakeHandle::wake_seq).collect();
             // At least one entry is a stdin or evdev fd, neither of which ever registers a real
             // wakeup observer inside `scan_once` (see its doc comment): there is no OS-level async
             // notification this codebase's `Waker`/`Observer` machinery can hook into for "new
@@ -1906,6 +1916,7 @@ mod test {
     /// join()-before-next-wait test can never hit.
     #[test]
     fn test_nested_epoll_readiness_rechecked_under_concurrent_dispatch() {
+        const N: usize = 30;
         let (task, outer) = setup_epoll();
         let outer = Arc::new(outer);
         let inner = EpollFile::<TestPlatform, crate::DefaultFS<TestPlatform>>::new();
@@ -1992,7 +2003,6 @@ mod test {
             )
             .unwrap();
 
-        const N: usize = 30;
         let received = Arc::new(core::sync::atomic::AtomicUsize::new(0));
 
         // Dispatcher thread: mimics `calloop::EventLoop::dispatch(Duration::from_millis(100), ..)`

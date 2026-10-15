@@ -86,6 +86,13 @@ impl TestLauncher {
     }
 
     fn test_load_exec_common(self, executable_path: &str) {
+        // `build` constructs `GlobalState` **by value on the stack** -- a little over 1.5 MiB of
+        // live stack in an unoptimized build (see `litebox_shim_linux::syscalls::tests`'s
+        // `BUILD_STACK_SIZE`), which does not fit libtest's default 2 MiB test-thread stack:
+        // live-caught as `test_load_exec_dynamic` aborting the whole `loader` binary with
+        // `fatal runtime error: stack overflow`, discarding every other test's result with it.
+        // A real runner's main thread gets 8 MiB, so do the construction on a thread that does.
+        const BUILD_STACK_SIZE: usize = 8 << 20;
         let argv = vec![
             CString::new(executable_path).unwrap(),
             CString::new("hello").unwrap(),
@@ -95,13 +102,6 @@ impl TestLauncher {
             CString::new("HOME=/").unwrap(),
         ];
         let fs = std::sync::Arc::new(self.fs);
-        // `build` constructs `GlobalState` **by value on the stack** -- a little over 1.5 MiB of
-        // live stack in an unoptimized build (see `litebox_shim_linux::syscalls::tests`'s
-        // `BUILD_STACK_SIZE`), which does not fit libtest's default 2 MiB test-thread stack:
-        // live-caught as `test_load_exec_dynamic` aborting the whole `loader` binary with
-        // `fatal runtime error: stack overflow`, discarding every other test's result with it.
-        // A real runner's main thread gets 8 MiB, so do the construction on a thread that does.
-        const BUILD_STACK_SIZE: usize = 8 << 20;
         let shim_builder = self.shim_builder;
         let shim = std::thread::Builder::new()
             .stack_size(BUILD_STACK_SIZE)

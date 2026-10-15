@@ -79,6 +79,7 @@ impl Slot {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    #[allow(clippy::cast_possible_truncation)] // Callers bound `path` by PATH_CAPACITY before assigning.
     fn assign(&self, path: &str) {
         for (index, byte) in path.bytes().enumerate() {
             self.path[index].store(byte, Ordering::Relaxed);
@@ -208,7 +209,7 @@ impl SharedFileSpill {
                 Err(owner) => {
                     let recoverable = me != LOCK_TOKEN_NO_HOST_PID
                         && owner != LOCK_TOKEN_NO_HOST_PID
-                        && spins % DEAD_HOLDER_CHECK_EVERY == 0
+                        && spins.is_multiple_of(DEAD_HOLDER_CHECK_EVERY)
                         && !is_alive(owner);
                     if recoverable
                         && self
@@ -219,16 +220,16 @@ impl SharedFileSpill {
                         return Acquired::Recovered { dead_owner: owner };
                     }
                     spins = spins.wrapping_add(1);
-                    if spins % LOCK_SPIN_LIMIT == 0 {
+                    if spins.is_multiple_of(LOCK_SPIN_LIMIT) {
                         litebox_util_log::warn!(
                             owner:% = owner, me:% = me;
                             "spill-lock: a host process has held the shared file-spill lock across a very long wait"
                         );
                     }
-                    if let LockPolicy::BargeAfter(limit) = policy {
-                        if spins >= limit {
-                            return Acquired::Contended { owner };
-                        }
+                    if let LockPolicy::BargeAfter(limit) = policy
+                        && spins >= limit
+                    {
+                        return Acquired::Contended { owner };
                     }
                     core::hint::spin_loop();
                 }
@@ -318,13 +319,13 @@ impl SharedFileSpill {
             let index = self.find(from)?;
             // Renaming onto a live path replaces it, as Linux does: the destination's own row has to
             // go, or two rows would claim the same path and `find` would answer either.
-            if let Some(victim) = self.find(to) {
-                if victim != index {
-                    let slot = &self.slots[victim];
-                    slot.path_len.store(0, Ordering::Relaxed);
-                    slot.length.store(0, Ordering::Relaxed);
-                    slot.state.store(SLOT_DELETED, Ordering::Release);
-                }
+            if let Some(victim) = self.find(to)
+                && victim != index
+            {
+                let slot = &self.slots[victim];
+                slot.path_len.store(0, Ordering::Relaxed);
+                slot.length.store(0, Ordering::Relaxed);
+                slot.state.store(SLOT_DELETED, Ordering::Release);
             }
             let slot = &self.slots[index];
             slot.assign(to);
@@ -379,6 +380,9 @@ impl SharedFileSpill {
         })
     }
 
+    // Slot indices are below the fixed slot-table length, and spill offsets and lengths are bounded
+    // by the store's file sizes, which fit `usize` on every supported 64-bit host.
+    #[allow(clippy::cast_possible_truncation)]
     fn apply<Platform: ShimPlatform>(
         &self,
         platform: &Platform,
@@ -543,6 +547,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    // Spill slot indices and file offsets are bounded well below `u32`/`usize` on supported hosts.
+    #[allow(clippy::cast_possible_truncation)]
     fn install_spilled_content(&self, path: &str, view: &SpillView) {
         self.create_missing_parents(path);
         let mut chunk = vec![0u8; TRANSFER_CHUNK];
@@ -596,6 +602,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    // Spill file offsets are bounded well below `usize::MAX` on supported 64-bit hosts.
+    #[allow(clippy::cast_possible_truncation)]
     fn copier_of_local_file<'a>(&'a self, path: &'a str) -> impl FnOnce(u32) -> Option<u64> + 'a {
         move |slot| {
             litebox::fs::with_root_identity(|| {

@@ -121,21 +121,20 @@ impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedEvdevRegion<Platform>>();
         let arena = platform.shared_kernel_arena_alloc_bytes(layout);
-        let (ptr, shared) = match arena {
-            Some(ptr) => (ptr.cast::<SharedEvdevRegion<Platform>>(), true),
-            None => {
-                litebox_util_log::error!(
-                    bytes:% = layout.size();
-                    "shared evdev table: shared kernel arena exhausted; /dev/input/event0 queue is \
-                     this host process's own"
-                );
-                (
-                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .expect("shared evdev table: fallback allocation failed")
-                        .cast::<SharedEvdevRegion<Platform>>(),
-                    false,
-                )
-            }
+        let (ptr, shared) = if let Some(ptr) = arena {
+            (ptr.cast::<SharedEvdevRegion<Platform>>(), true)
+        } else {
+            litebox_util_log::error!(
+                bytes:% = layout.size();
+                "shared evdev table: shared kernel arena exhausted; /dev/input/event0 queue is \
+                 this host process's own"
+            );
+            (
+                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                    .expect("shared evdev table: fallback allocation failed")
+                    .cast::<SharedEvdevRegion<Platform>>(),
+                false,
+            )
         };
         // SAFETY: `ptr` names one contiguous, uninitialized `SharedEvdevRegion` sized by `layout`;
         // initializing it one field at a time keeps the several-KiB value off the stack.
@@ -168,6 +167,10 @@ impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
 
     /// Appends one event, dropping the OLDEST if the ring is already full (a real evdev ring
     /// buffer's overflow behavior: newest events win, not silently refused). Callers hold `guard`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "head and count are kept below MAX_QUEUED_EVENTS, a small constant"
+    )]
     fn push_locked(&self, event: &InputEvent) {
         let count = self.region.count.load(Ordering::Acquire) as usize;
         let head = self.region.head.load(Ordering::Acquire) as usize;
@@ -217,7 +220,7 @@ impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
                 "evdev-input-trace: push_batch emitting one SYN_REPORT"
             );
         }
-        let _guard = self.region.guard.lock();
+        let guard = self.region.guard.lock();
         for event in batch {
             self.push_locked(event);
         }
@@ -228,7 +231,7 @@ impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
             code: SYN_REPORT,
             value: 0,
         });
-        drop(_guard);
+        drop(guard);
         pollee.notify_observers(Events::IN);
     }
 
@@ -299,6 +302,10 @@ impl<Platform: ShimPlatform> SharedEvdevTable<Platform> {
     /// never a partial one). `None` means no event is pending -- the caller (see
     /// `syscalls::file::do_read`'s input-fd branch) is responsible for real Linux's actual
     /// `read()`-with-nothing-pending behavior (blocks, or `EAGAIN` if the fd is non-blocking).
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "head is kept below MAX_QUEUED_EVENTS, a small constant"
+    )]
     pub(crate) fn pop_event_bytes(&self) -> Option<alloc::vec::Vec<u8>> {
         let _guard = self.region.guard.lock();
         let count = self.region.count.load(Ordering::Acquire);

@@ -248,7 +248,7 @@ fn import_file<FS: FileSystem>(
         }
         Err(e) => return Err(ImportError::Open(String::from(path), e)),
     };
-    let existing_len = fs.file_status(path).map(|status| status.size).unwrap_or(0);
+    let existing_len = fs.file_status(path).map_or(0, |status| status.size);
     let mut result = Ok(());
     if matches!(merge, MergeSpec::Whole) {
         let mut written = 0;

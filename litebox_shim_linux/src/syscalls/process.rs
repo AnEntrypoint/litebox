@@ -398,7 +398,7 @@ pub(crate) fn decode_cross_process_exit_status(raw_exit_code: u32) -> ExitStatus
             ExitStatus::Signal,
         )
     } else {
-        ExitStatus::Exit((low as u8).cast_signed())
+        ExitStatus::Exit(raw_exit_code.to_le_bytes()[0].cast_signed())
     }
 }
 
@@ -1234,7 +1234,7 @@ fn parse_id_extents(buf: &[u8]) -> Option<alloc::vec::Vec<IdExtent>> {
 
 /// `None` (the initial namespace) encodes as `-`; a user namespace encodes as `;`-joined
 /// `inner.outer.count` extents, empty when nothing is mapped yet.
-fn encode_id_map(map: &Option<alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
+fn encode_id_map(map: Option<&alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
     let Some(extents) = map else {
         return alloc::string::String::from("-");
     };
@@ -1245,6 +1245,8 @@ fn encode_id_map(map: &Option<alloc::vec::Vec<IdExtent>>) -> alloc::string::Stri
     encoded.join(";")
 }
 
+// `None` (malformed), `Some(None)` (initial namespace) and `Some(Some(..))` are distinct states.
+#[allow(clippy::option_option)]
 fn decode_id_map(field: &str) -> Option<Option<alloc::vec::Vec<IdExtent>>> {
     if field == "-" {
         return Some(None);
@@ -1318,6 +1320,8 @@ const CAP_FULL: u64 = (1 << 41) - 1;
 const CAP_SETUID_BIT: u64 = 1 << 7;
 
 impl Credentials {
+    // `uid`/`euid` and `gid`/`egid` mirror the kernel's real/effective naming on purpose.
+    #[allow(clippy::similar_names)]
     pub(crate) fn new(uid: u32, euid: u32, gid: u32, egid: u32) -> Self {
         litebox::fs::ident::set(euid, egid);
         Self {
@@ -1352,7 +1356,7 @@ impl Credentials {
     /// What a kernel id (`self.uid` and friends, ids as every namespace enclosing this one knows
     /// them) reads back as INSIDE this namespace: [`OVERFLOW_ID`] when there is no mapping for it,
     /// which is exactly why `unshare -Ur` reports `nobody` instead of root.
-    fn visible_id(map: &Option<alloc::vec::Vec<IdExtent>>, kernel: u32) -> u32 {
+    fn visible_id(map: Option<&alloc::vec::Vec<IdExtent>>, kernel: u32) -> u32 {
         let Some(extents) = map else {
             return kernel;
         };
@@ -1369,7 +1373,7 @@ impl Credentials {
 
     /// What `inner` (an id as the namespace itself names it) is outside it: `None` when nothing
     /// maps it, which is what makes an unmapped id unsettable and unownable.
-    fn kernel_id(map: &Option<alloc::vec::Vec<IdExtent>>, inner: u32) -> Option<u32> {
+    fn kernel_id(map: Option<&alloc::vec::Vec<IdExtent>>, inner: u32) -> Option<u32> {
         let Some(extents) = map else {
             return Some(inner);
         };
@@ -1382,27 +1386,27 @@ impl Credentials {
     }
 
     pub(crate) fn visible_uid(&self) -> u32 {
-        Self::visible_id(&self.uid_map, self.uid)
+        Self::visible_id(self.uid_map.as_ref(), self.uid)
     }
 
     pub(crate) fn visible_euid(&self) -> u32 {
-        Self::visible_id(&self.uid_map, self.euid)
+        Self::visible_id(self.uid_map.as_ref(), self.euid)
     }
 
     pub(crate) fn visible_suid(&self) -> u32 {
-        Self::visible_id(&self.uid_map, self.suid)
+        Self::visible_id(self.uid_map.as_ref(), self.suid)
     }
 
     pub(crate) fn visible_gid(&self) -> u32 {
-        Self::visible_id(&self.gid_map, self.gid)
+        Self::visible_id(self.gid_map.as_ref(), self.gid)
     }
 
     pub(crate) fn visible_egid(&self) -> u32 {
-        Self::visible_id(&self.gid_map, self.egid)
+        Self::visible_id(self.gid_map.as_ref(), self.egid)
     }
 
     pub(crate) fn visible_sgid(&self) -> u32 {
-        Self::visible_id(&self.gid_map, self.sgid)
+        Self::visible_id(self.gid_map.as_ref(), self.sgid)
     }
 
     /// These credentials as they look the instant the task creates a new user namespace: the same
@@ -1551,8 +1555,8 @@ impl Credentials {
             groups.join(":"),
             u8::from(self.setgroups_denied),
             u8::from(self.setuid_in_parent_ns),
-            encode_id_map(&self.uid_map),
-            encode_id_map(&self.gid_map),
+            encode_id_map(self.uid_map.as_ref()),
+            encode_id_map(self.gid_map.as_ref()),
         )
     }
 
@@ -1605,13 +1609,13 @@ impl Credentials {
     fn set_res_uid(&mut self, ruid: u32, euid: u32, suid: u32) -> Result<(), Errno> {
         let holds = |v: u32| v == self.uid || v == self.euid || v == self.suid;
         let allowed = |v: u32| v == u32::MAX || holds(v);
-        if !self.is_privileged() && !(allowed(ruid) && allowed(euid) && allowed(suid)) {
+        if !self.is_privileged() && (!allowed(ruid) || !allowed(euid) || !allowed(suid)) {
             return Err(Errno::EPERM);
         }
         // Inside a user namespace an id with no mapping into it does not exist at all, so naming
         // one is `EINVAL` rather than `EPERM`.
         for value in [ruid, euid, suid] {
-            if value != u32::MAX && Self::kernel_id(&self.uid_map, value).is_none() {
+            if value != u32::MAX && Self::kernel_id(self.uid_map.as_ref(), value).is_none() {
                 return Err(Errno::EINVAL);
             }
         }
@@ -1620,14 +1624,14 @@ impl Credentials {
         // sandbox makes right after mapping 0 to its own outer id -- leave `getuid()` reporting
         // `OVERFLOW_ID`: the stored 0 had no mapping from `outer`, so it read back as `nobody`.
         if ruid != u32::MAX {
-            self.uid = Self::kernel_id(&self.uid_map, ruid).unwrap_or(OVERFLOW_ID);
+            self.uid = Self::kernel_id(self.uid_map.as_ref(), ruid).unwrap_or(OVERFLOW_ID);
         }
         if euid != u32::MAX {
-            self.euid = Self::kernel_id(&self.uid_map, euid).unwrap_or(OVERFLOW_ID);
+            self.euid = Self::kernel_id(self.uid_map.as_ref(), euid).unwrap_or(OVERFLOW_ID);
             self.fsuid = self.euid;
         }
         if suid != u32::MAX {
-            self.suid = Self::kernel_id(&self.uid_map, suid).unwrap_or(OVERFLOW_ID);
+            self.suid = Self::kernel_id(self.uid_map.as_ref(), suid).unwrap_or(OVERFLOW_ID);
         }
         Ok(())
     }
@@ -1636,24 +1640,24 @@ impl Credentials {
     fn set_res_gid(&mut self, rgid: u32, egid: u32, sgid: u32) -> Result<(), Errno> {
         let holds = |v: u32| v == self.gid || v == self.egid || v == self.sgid;
         let allowed = |v: u32| v == u32::MAX || holds(v);
-        if !self.is_privileged() && !(allowed(rgid) && allowed(egid) && allowed(sgid)) {
+        if !self.is_privileged() && (!allowed(rgid) || !allowed(egid) || !allowed(sgid)) {
             return Err(Errno::EPERM);
         }
         for value in [rgid, egid, sgid] {
-            if value != u32::MAX && Self::kernel_id(&self.gid_map, value).is_none() {
+            if value != u32::MAX && Self::kernel_id(self.gid_map.as_ref(), value).is_none() {
                 return Err(Errno::EINVAL);
             }
         }
         // See `set_res_uid`: the stored id is the kernel one, not the inner one.
         if rgid != u32::MAX {
-            self.gid = Self::kernel_id(&self.gid_map, rgid).unwrap_or(OVERFLOW_ID);
+            self.gid = Self::kernel_id(self.gid_map.as_ref(), rgid).unwrap_or(OVERFLOW_ID);
         }
         if egid != u32::MAX {
-            self.egid = Self::kernel_id(&self.gid_map, egid).unwrap_or(OVERFLOW_ID);
+            self.egid = Self::kernel_id(self.gid_map.as_ref(), egid).unwrap_or(OVERFLOW_ID);
             self.fsgid = self.egid;
         }
         if sgid != u32::MAX {
-            self.sgid = Self::kernel_id(&self.gid_map, sgid).unwrap_or(OVERFLOW_ID);
+            self.sgid = Self::kernel_id(self.gid_map.as_ref(), sgid).unwrap_or(OVERFLOW_ID);
         }
         Ok(())
     }
@@ -1666,14 +1670,14 @@ impl Credentials {
         let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
         let allowed_effective =
             |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.suid;
-        if !self.is_privileged() && !(allowed_real(ruid) && allowed_effective(euid)) {
+        if !self.is_privileged() && (!allowed_real(ruid) || !allowed_effective(euid)) {
             return Err(Errno::EPERM);
         }
         let new_suid = if ruid != u32::MAX || (euid != u32::MAX && euid != old_real) {
-            if euid != u32::MAX {
-                euid
-            } else {
+            if euid == u32::MAX {
                 old_effective
+            } else {
+                euid
             }
         } else {
             self.suid
@@ -1688,14 +1692,14 @@ impl Credentials {
         let allowed_real = |v: u32| v == u32::MAX || v == old_real || v == old_effective;
         let allowed_effective =
             |v: u32| v == u32::MAX || v == old_real || v == old_effective || v == self.sgid;
-        if !self.is_privileged() && !(allowed_real(rgid) && allowed_effective(egid)) {
+        if !self.is_privileged() && (!allowed_real(rgid) || !allowed_effective(egid)) {
             return Err(Errno::EPERM);
         }
         let new_sgid = if rgid != u32::MAX || (egid != u32::MAX && egid != old_real) {
-            if egid != u32::MAX {
-                egid
-            } else {
+            if egid == u32::MAX {
                 old_effective
+            } else {
+                egid
             }
         } else {
             self.sgid
@@ -1855,16 +1859,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             PrctlArg::SetSeccomp { mode, prog } => self.sys_prctl_set_seccomp(mode, prog),
             // Accepted so `g_spawn`'s child does not abort the whole spawn; the signal itself is
             // never delivered (a guest child cannot outlive the runner, so nothing is orphaned).
-            PrctlArg::SetPDeathSig(_) => Ok(0),
-            // Yama's ptrace permission: nothing here restricts ptrace in the first place, so
-            // accepting it is the truthful answer, not a workaround.
-            PrctlArg::SetPtracer(_) => Ok(0),
+            // Yama's ptrace permission shares this arm: nothing here restricts ptrace in the
+            // first place, so accepting it is the truthful answer, not a workaround.
+            PrctlArg::SetPDeathSig(_) | PrctlArg::SetPtracer(_) => Ok(0),
             PrctlArg::SetKeepCaps(value) => {
                 if value > 1 {
                     return Err(Errno::EINVAL);
                 }
                 let mut c = (*self.creds()).clone();
-                c.keep_caps = value as u32;
+                c.keep_caps = u32::from(value == 1);
                 self.set_creds(c);
                 Ok(0)
             }
@@ -1967,12 +1970,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // that was already unlocked and re-acquired by someone else, or never actually locked by
         // us despite being linked into our robust list (see `list_op_pending`'s doc comment),
         // must be left alone.
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "tid is always non-negative; only ever compared against another tid read \
-                      back from a futex word, never used arithmetically"
-        )]
-        if (word & FUTEX_TID_MASK) != self.tid.get() as u32 {
+        if (word & FUTEX_TID_MASK) != self.tid.get().cast_unsigned() {
             return Ok(());
         }
 
@@ -2469,41 +2467,40 @@ fn fixup_stale_elf_data_pointers<Platform: ShimPlatform>(
         let dest_top = dest_base + source_range.len();
         while addr < dest_top {
             let slot = UserPtrMut::<usize>::from_usize(addr);
-            if let Some(value) = slot.read_at_offset::<Platform>(0) {
-                if value.is_multiple_of(MIN_POINTER_ALIGN)
-                    && let Some(translated) = relocations.translate(value)
-                {
-                    // Was a DIAGNOSTIC here (temporary, per its own since-removed comment: "do not
-                    // commit"): an unconditional `litebox_util_log::error!` on every heal whose
-                    // translated value lands in an executable destination range, meant to test the
-                    // over-healing theory directly (`translate` is a RANGE-MEMBERSHIP check, not a
-                    // value-identity one, so an ordinary integer that happens to fall in some
-                    // tracked range's numeric span gets rewritten -- the same hazard
-                    // `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc
-                    // comment documents for mmap arenas).
-                    //
-                    // Removed as the root cause of a real host crash, not just log noise: this
-                    // crate is `#![no_std]`, so the diagnostic could not even be gated behind a
-                    // host env-var check the way sibling diagnostics elsewhere in this codebase
-                    // are. A `bash -c` fork-without-exec repro under `LITEBOX_PROCESS_FORK=1` hit
-                    // this branch hundreds of times in one fork (`healed_count=2460` total over the
-                    // whole pass), each firing a full `tracing`-backed formatted log event
-                    // (allocation + I/O) from inside the fork-time relocation-healing window -- the
-                    // same window `litebox_platform_windows_userland`'s own `!is_in_guest` VEH
-                    // branch doc comments already document as prone to a transient Windows
-                    // FS_BASE-clear race for host code. The crash this triggered
-                    // (`[diag-unrecov-av] ... addr=0xc0000100 ... is_in_guest=false -- no
-                    // exception-table entry found`) carries `0xc0000100` == `STATUS_VARIABLE_
-                    // NOT_FOUND`, a leaked-NTSTATUS-in-register signature this codebase's own
-                    // archived investigation notes (`docs/AGENTS_ARCHIVE_2026-09-03.md`) already
-                    // tie to Windows API activity reached from host code, not to guest memory
-                    // content -- consistent with the logging burst, not the pointer-healing
-                    // arithmetic itself, being the proximate trigger. If this diagnostic is needed
-                    // again, prefer a `static AtomicBool`/`OnceLock` toggled from the host side
-                    // (e.g. via a platform hook), not a direct `std::env` read, since this module
-                    // has no `std`.
-                    let _ = slot.write_at_offset::<Platform>(0, translated);
-                }
+            if let Some(value) = slot.read_at_offset::<Platform>(0)
+                && value.is_multiple_of(MIN_POINTER_ALIGN)
+                && let Some(translated) = relocations.translate(value)
+            {
+                // Was a DIAGNOSTIC here (temporary, per its own since-removed comment: "do not
+                // commit"): an unconditional `litebox_util_log::error!` on every heal whose
+                // translated value lands in an executable destination range, meant to test the
+                // over-healing theory directly (`translate` is a RANGE-MEMBERSHIP check, not a
+                // value-identity one, so an ordinary integer that happens to fall in some
+                // tracked range's numeric span gets rewritten -- the same hazard
+                // `AddressRelocations::private_data_ranges_excluding_anonymous_mmap`'s doc
+                // comment documents for mmap arenas).
+                //
+                // Removed as the root cause of a real host crash, not just log noise: this
+                // crate is `#![no_std]`, so the diagnostic could not even be gated behind a
+                // host env-var check the way sibling diagnostics elsewhere in this codebase
+                // are. A `bash -c` fork-without-exec repro under `LITEBOX_PROCESS_FORK=1` hit
+                // this branch hundreds of times in one fork (`healed_count=2460` total over the
+                // whole pass), each firing a full `tracing`-backed formatted log event
+                // (allocation + I/O) from inside the fork-time relocation-healing window -- the
+                // same window `litebox_platform_windows_userland`'s own `!is_in_guest` VEH
+                // branch doc comments already document as prone to a transient Windows
+                // FS_BASE-clear race for host code. The crash this triggered
+                // (`[diag-unrecov-av] ... addr=0xc0000100 ... is_in_guest=false -- no
+                // exception-table entry found`) carries `0xc0000100` == `STATUS_VARIABLE_
+                // NOT_FOUND`, a leaked-NTSTATUS-in-register signature this codebase's own
+                // archived investigation notes (`docs/AGENTS_ARCHIVE_2026-09-03.md`) already
+                // tie to Windows API activity reached from host code, not to guest memory
+                // content -- consistent with the logging burst, not the pointer-healing
+                // arithmetic itself, being the proximate trigger. If this diagnostic is needed
+                // again, prefer a `static AtomicBool`/`OnceLock` toggled from the host side
+                // (e.g. via a platform hook), not a direct `std::env` read, since this module
+                // has no `std`.
+                let _ = slot.write_at_offset::<Platform>(0, translated);
             }
             addr += core::mem::size_of::<usize>();
         }
@@ -3023,6 +3020,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         const WSTOPPED: i32 = 0x2;
         const WCONTINUED: i32 = 0x8;
         const WNOWAIT: i32 = 0x0100_0000;
+        // `siginfo_t` on x86-64: si_signo, si_errno, si_code are the first three 32-bit words,
+        // then 4 bytes of padding, then the SIGCHLD arm of `_sifields` at byte offset 16 --
+        // si_pid, si_uid, si_status. Indices below are in 32-bit units, so 4/5/6 are bytes
+        // 16/20/24. Unlike `wait4`'s packed status word, si_status carries the RAW exit code
+        // (or signal number), not an encoded value.
+        const SIGCHLD: i32 = 17;
+        const CLD_EXITED: i32 = 1;
+        const CLD_KILLED: i32 = 2;
 
         // Linux requires at least one state to wait for; without this a caller that forgot
         // `WEXITED` would block forever instead of being told its arguments are wrong.
@@ -3089,7 +3094,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 return Ok(0);
             }
-            let status = if packed & 0x7f == 0 {
+            // The exit code is the wait status's second byte, reinterpreted as the signed `i8`
+            // that `ExitStatus::Exit` carries; the wrap is the point.
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_wrap,
+                clippy::cast_possible_truncation
+            )]
+            let status = if packed.trailing_zeros() >= 7 {
                 ExitStatus::Exit(((packed >> 8) & 0xff) as u8 as i8)
             } else {
                 match litebox_common_linux::signal::Signal::try_from(packed & 0x7f) {
@@ -3194,14 +3206,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global.pid_namespaces.release(child_pid);
         }
 
-        // `siginfo_t` on x86-64: si_signo, si_errno, si_code are the first three 32-bit words,
-        // then 4 bytes of padding, then the SIGCHLD arm of `_sifields` at byte offset 16 --
-        // si_pid, si_uid, si_status. Indices below are in 32-bit units, so 4/5/6 are bytes
-        // 16/20/24. Unlike `wait4`'s packed status word, si_status carries the RAW exit code
-        // (or signal number), not an encoded value.
-        const SIGCHLD: i32 = 17;
-        const CLD_EXITED: i32 = 1;
-        const CLD_KILLED: i32 = 2;
         if let Some(infop) = infop {
             let (code, status) = match exit_status {
                 ExitStatus::Exit(c) => (CLD_EXITED, i32::from(c)),
@@ -3231,7 +3235,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         options: i32,
         _rusage: Option<UserPtrMut<u8>>,
     ) -> Result<usize, Errno> {
-        litebox_util_log::debug!(tid:% = self.tid.get(), pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
         // Shared by both the `pid == -1` ("any child") bounded-repoll fallback (below) and the
         // targeted `pid > 0` cross-process branch (twenty-fourth pass: that branch previously
         // called `wait_for_cross_process_exit` directly, an unbounded blocking wait with NO
@@ -3245,6 +3248,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // rendezvous mechanism has nothing to do with.
         const WAIT4_REPOLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(15);
         const WNOHANG: i32 = 0x1;
+        enum AnyChildExit {
+            Thread(i32, ExitStatus),
+            CrossProcess(i32, u32),
+        }
+        litebox_util_log::debug!(tid:% = self.tid.get(), pid:% = pid, options:% = options; "drm-diag: sys_wait4 entry");
         let no_hang = options & WNOHANG != 0;
         let process = self.process();
 
@@ -3320,7 +3328,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             raw_exit.is_some()
                         }) {
                         Ok(()) => break,
-                        Err(litebox::event::wait::WaitError::TimedOut) => continue,
+                        Err(litebox::event::wait::WaitError::TimedOut) => {}
                         Err(litebox::event::wait::WaitError::Interrupted) => {
                             // Same race as the `pid == -1` branch's own `Interrupted` handling:
                             // the child's own exit-notify SIGCHLD can itself be observed as "an
@@ -3374,11 +3382,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // on EVERY invocation -- including every time the blocking `wait_until` wakes and
         // re-polls -- so a cross-process child that exits AFTER this call starts blocking is
         // caught too, not just one that was already exited before the call began.
-        enum AnyChildExit {
-            Thread(i32, ExitStatus),
-            CrossProcess(i32, u32),
-        }
-
         // Unlike the blocking path, a `WNOHANG` poll must NOT remove the child from our children
         // list unless it has actually already exited -- otherwise a later real wait for that
         // same child would incorrectly see `ECHILD`.
@@ -3464,7 +3467,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             // Our own repoll bound elapsed with no wake -- loop back and re-scan
                             // both registries directly instead of waiting on the notify again.
                             wait4_spins += 1;
-                            if wait4_spins % 2000 == 0
+                            if wait4_spins.is_multiple_of(2000)
                                 && self.global.platform.env_flag("LITEBOX_DIAG_WAIT4")
                             {
                                 let children = process.children.lock();
@@ -3493,7 +3496,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                     );
                                 }
                             }
-                            continue;
                         }
                         Err(litebox::event::wait::WaitError::Interrupted) => {
                             // `wait_until`'s own `commit_wait` checks for a pending interrupt
@@ -3523,7 +3525,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             litebox_util_log::debug!(tid:% = self.tid.get(); "drm-diag: sys_wait4 re-poll found exited child");
                             break;
                         }
-                    };
+                    }
                 }
             }
             match found.expect("poll_once only returns true after `found` is set") {
@@ -3599,7 +3601,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             exit_status.is_some()
                         }) {
                         Ok(()) => break,
-                        Err(litebox::event::wait::WaitError::TimedOut) => continue,
+                        Err(litebox::event::wait::WaitError::TimedOut) => {}
                         Err(litebox::event::wait::WaitError::Interrupted) => {
                             // Same race as the `pid == -1`/cross-process branches' own
                             // `Interrupted` handling above: re-check synchronously before
@@ -3648,6 +3650,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 /// address written to the guest's FS-base / `TPIDR_EL0`, respectively). The TLS pointer can
 /// point to an arbitrary-sized memory region.
 type ThreadLocalDescriptor = UserPtrMut<u8>;
+/// The files and filesystem state a native-fork child shares with its parent.
+type SharedFileStates<Platform, FS> = Option<(
+    Arc<super::file::FilesState<Platform, FS>>,
+    Arc<super::file::FsState<Platform>>,
+)>;
 
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
     /// Task struct that maintains all per-thread data
@@ -3701,17 +3708,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         result: Result<usize, Errno>,
         task: &Self,
     ) -> Result<usize, Errno> {
+        // Throttled: a fork storm must not turn into a log storm. The first refusals are the
+        // informative ones, then one in 500 so a long storm is still countable.
+        static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let Err(errno) = result else {
             return result;
         };
         if args.flags.contains(CloneFlags::VM) {
             return result;
         }
-        // Throttled: a fork storm must not turn into a log storm. The first refusals are the
-        // informative ones, then one in 500 so a long storm is still countable.
-        static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let seen = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if seen > 50 && seen % 500 != 0 {
+        if seen > 50 && !seen.is_multiple_of(500) {
             return result;
         }
         let (in_use, sealed, members) = task.global.pid_namespaces.occupancy();
@@ -3789,10 +3796,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// space (safety: the spawn helper must not corrupt the caller's memory before `execve`), but
     /// shared fd table and signal-handler table for `posix_spawn`'s own contract. Real `fork()`/
     /// `vfork()` (no flags at all) falls out of the same `!CLONE_VM` test.
-    #[expect(
-        clippy::similar_names,
-        reason = "pid/ppid is standard Unix terminology"
-    )]
     /// Blocks (bounded, never forever) until one of the [`CROSS_PROCESS_FORK_SLOT_COUNT`]
     /// `cross_process_fork_slots` is free, claims it, and returns its index; see that field's doc
     /// comment for what a slot bounds. Always returns eventually -- fails OPEN (`None`, proceeding
@@ -3840,6 +3843,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `PageManager::new_adopting_existing_memory` consumes on the child side. The relocation map
     /// is the identity, because source and destination coordinates are the same here.
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)] // the fork inputs are naturally separate values
+    #[allow(
+        clippy::similar_names,
+        reason = "file_ro_* and file_rw_* name the two halves of one split"
+    )]
     fn try_cross_process_fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -3850,6 +3858,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         clone_flags: CloneFlags,
         child_ns: (u32, i32, i32),
     ) -> Option<litebox::platform::CrossProcessChildHandle> {
+        const GRANULE: usize = 0x1_0000;
         // A platform with a REAL `fork()` needs none of what follows below in this function: no
         // fd-eligibility scan, no CLOEXEC accounting, no pipe/file/eventfd bridging -- a real
         // `fork()` inherits every open fd natively (CLOEXEC ones included; the kernel only
@@ -4082,10 +4091,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                             // alive and may still yield bytes. Same for a
                                             // non-blocking end, whose caller expects EAGAIN, not
                                             // a closed fd.
-                                            Err(litebox::pipes::errors::ReadError::WouldBlock)
-                                            | Err(litebox::pipes::errors::ReadError::WaitError(
-                                                _,
-                                            )) => litebox::platform::ForkPipeRead::Empty,
+                                            Err(
+                                                litebox::pipes::errors::ReadError::WouldBlock
+                                                | litebox::pipes::errors::ReadError::WaitError(_),
+                                            ) => litebox::platform::ForkPipeRead::Empty,
                                             Err(_) => litebox::platform::ForkPipeRead::Eof,
                                         }
                                     }),
@@ -4250,7 +4259,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                 if self.raw_fd_is_cloexec(*raw_fd) {
                                     uncarriable_cloexec += 1;
                                 }
-                                if !uncarriable_kinds.iter().any(|k| *k == kind) {
+                                if !uncarriable_kinds.contains(&kind) {
                                     uncarriable_kinds.push(kind);
                                 }
                                 litebox_util_log::debug!(
@@ -4283,15 +4292,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     // INET socket a Python process held ever reached a forked child -- it read
                     // `EBADF` while the fork itself looked perfectly healthy.
                     None if self.raw_fd_subsystem_name(*raw_fd) == "socket" => {
-                        match self.raw_fd_inet_carry(*raw_fd) {
-                            Some(spec) => inet_to_carry.push((*raw_fd, spec)),
-                            None => {
-                                dropped_inet += 1;
-                                litebox_util_log::debug!(
-                                    tid:% = self.tid.get(), fd:% = raw_fd;
-                                    "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
-                                );
-                            }
+                        if let Some(spec) = self.raw_fd_inet_carry(*raw_fd) {
+                            inet_to_carry.push((*raw_fd, spec));
+                        } else {
+                            dropped_inet += 1;
+                            litebox_util_log::debug!(
+                                tid:% = self.tid.get(), fd:% = raw_fd;
+                                "clone: dropping an inet socket that cannot be named across the process boundary rather than refusing the fork; the child sees EBADF on it"
+                            );
                         }
                     }
                     // A close-on-exec fd does not block the fork, and is not carried.
@@ -4364,7 +4372,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         if self.raw_fd_is_cloexec(*raw_fd) {
                             uncarriable_cloexec += 1;
                         }
-                        if !uncarriable_kinds.iter().any(|k| *k == subsystem) {
+                        if !uncarriable_kinds.contains(&subsystem) {
                             uncarriable_kinds.push(subsystem);
                         }
                         litebox_util_log::debug!(
@@ -4558,7 +4566,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // failing the whole fork. A guard page still reaches the child: the VMA layout travels
         // separately (`ranges` above) and carries every region, accessible or not, so the child's
         // adoption still sees it and a guest touching it still faults, exactly as it should.
-        const GRANULE: usize = 0x1_0000;
         let mut sorted: alloc::vec::Vec<_> = layout
             .iter()
             .filter(|(_, f, _)| {
@@ -4608,8 +4615,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !withheld.is_empty() {
             let mut carved: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
             for group in groups {
-                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
-                pieces.push(group);
+                let mut pieces: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec![group];
                 for w in &withheld {
                     let cut_start = w.start.next_multiple_of(GRANULE);
                     let cut_end = w.end & !(GRANULE - 1);
@@ -4662,8 +4668,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             let mut file_ro_bytes: u64 = 0;
             let mut file_ro_regions: u64 = 0;
+            #[allow(clippy::similar_names)]
+            // `file_ro_*` / `file_rw_*` name the two halves of one split
             let mut file_rw_bytes: u64 = 0;
             let mut anon_bytes: u64 = 0;
+            #[allow(clippy::similar_names)]
+            // a guard page is a region kind of its own, not an anon one
             let mut guard_bytes: u64 = 0;
             for (range, flag_bits, is_file_backed) in &layout {
                 let len = (range.end - range.start) as u64;
@@ -4682,11 +4692,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
             let copied_total = file_ro_bytes + file_rw_bytes + anon_bytes;
-            let skippable_pct = if copied_total > 0 {
-                file_ro_bytes * 100 / copied_total
-            } else {
-                0
-            };
+            let skippable_pct = (file_ro_bytes * 100).checked_div(copied_total).unwrap_or(0);
             litebox_util_log::warn!(
                 tid:% = self.tid.get(),
                 file_ro_bytes:% = file_ro_bytes,
@@ -4772,7 +4778,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .platform
             .env_flag("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE")
         {
-            let owner_pid = self.pid.get() as u32;
+            let owner_pid = self.pid.get().cast_unsigned();
             let inserted = self.global.unix_addr_presence.insert(
                 crate::syscalls::unix::UNIX_ADDR_KIND_PATH,
                 b"PRESENCE_PROBE_BEFORE",
@@ -4807,25 +4813,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             });
         }
         for raw_fd in snap_to_carry {
-            match self.snapshot_nameless_file_for_carry(raw_fd) {
-                Some(spec) => {
-                    inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
-                        fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
-                        spec: alloc::format!(
-                            "snap:{}|{}",
-                            u8::from(self.raw_fd_is_cloexec(raw_fd)),
-                            spec
-                        ),
-                    });
-                }
-                None => {
-                    litebox_util_log::warn!(
-                        tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
-                        fd:% = raw_fd;
-                        "clone: cross-process fork() not eligible -- a nameless file could not be snapshotted"
-                    );
-                    return None;
-                }
+            if let Some(spec) = self.snapshot_nameless_file_for_carry(raw_fd) {
+                inherited_shim_fds.push(litebox::platform::ForkInheritedShimFd {
+                    fd: i32::try_from(raw_fd).expect("a guest fd fits in i32"),
+                    spec: alloc::format!(
+                        "snap:{}|{}",
+                        u8::from(self.raw_fd_is_cloexec(raw_fd)),
+                        spec
+                    ),
+                });
+            } else {
+                litebox_util_log::warn!(
+                    tid:% = self.tid.get(), pid:% = self.pid.get(), comm:? = self.comm.get(),
+                    fd:% = raw_fd;
+                    "clone: cross-process fork() not eligible -- a nameless file could not be snapshotted"
+                );
+                return None;
             }
         }
         for (raw_fd, spec) in inet_to_carry {
@@ -4974,7 +4977,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .platform
             .env_flag("LITEBOX_DIAG_UNIX_ADDR_PRESENCE_PROBE")
         {
-            let owner_pid = self.pid.get() as u32;
+            let owner_pid = self.pid.get().cast_unsigned();
             let inserted = self.global.unix_addr_presence.insert(
                 crate::syscalls::unix::UNIX_ADDR_KIND_PATH,
                 b"PRESENCE_PROBE_AFTER",
@@ -5031,6 +5034,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// respectively validated, earlier in `do_clone` -- threaded through rather than
     /// recomputed, since `next_thread_id` must be incremented exactly once per `clone()` either
     /// way).
+    #[allow(clippy::too_many_arguments, clippy::similar_names)] // mirrors the thread-based path's inputs
     fn try_native_cross_process_fork(
         &self,
         _ctx: &litebox_common_linux::PtRegs,
@@ -5182,10 +5186,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         new_pid: i32,
         exit_signal: u64,
-        shared_state: Option<(
-            Arc<super::file::FilesState<Platform, FS>>,
-            Arc<super::file::FsState<Platform>>,
-        )>,
+        shared_state: SharedFileStates<Platform, FS>,
         child_sp: Option<usize>,
         new_user_namespace: bool,
         child_ns: (u32, i32, i32),
@@ -5425,7 +5426,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             pid: child_tid,
             ppid: self.pid.get(),
             pgid,
-            pid_ns: pid_namespace.0 as i32,
+            pid_ns: pid_namespace.0.cast_signed(),
             ns_pid: pid_namespace.1,
             ns_tid: pid_namespace.2,
         }
@@ -5458,14 +5459,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
     }
 
+    #[allow(clippy::similar_names)] // the `child_ns_*`, `pid`/`ppid` names mirror the clone state they hold
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
         clone3: bool,
     ) -> Result<usize, Errno> {
-        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:start");
         const MAX_SIGNAL_NUMBER: u64 = 64;
+        const NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWNS
+            .union(CloneFlags::NEWNET)
+            .union(CloneFlags::NEWIPC)
+            .union(CloneFlags::NEWUTS)
+            .union(CloneFlags::NEWCGROUP);
+        crate::diag::set_thread_note(core::ptr::addr_of!(*self) as u64, "clone:start");
 
         let litebox_common_linux::CloneArgs {
             mut flags,
@@ -5550,11 +5557,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // administratively disabled, so this moves toward Linux behaviour rather than away.
         // Deliberately NOT a fake namespace implementation: claiming isolation we do not
         // provide would be far worse than an honest refusal.
-        const NAMESPACE_FLAGS: CloneFlags = CloneFlags::NEWNS
-            .union(CloneFlags::NEWNET)
-            .union(CloneFlags::NEWIPC)
-            .union(CloneFlags::NEWUTS)
-            .union(CloneFlags::NEWCGROUP);
         if flags.intersects(NAMESPACE_FLAGS) {
             log_unsupported!(
                 "clone with namespace flags (refused with EPERM): {:?}",
@@ -5772,7 +5774,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global
                     .process_table
                     .lookup(internal)
-                    .map_or(false, |view| platform.is_process_alive(view.host_pid))
+                    .is_some_and(|view| platform.is_process_alive(view.host_pid))
             };
             // `LITEBOX_PIDNS_RECLAIM_OFF=1` restores the pre-fix behaviour (a slot is allocated
             // once and never freed) so one binary proves both sides of this, see
@@ -6077,11 +6079,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                 }
                 let copied_total = file_ro_bytes + file_rw_bytes + anon_bytes;
-                let skippable_pct = if copied_total > 0 {
-                    file_ro_bytes * 100 / copied_total
-                } else {
-                    0
-                };
+                let skippable_pct = (file_ro_bytes * 100).checked_div(copied_total).unwrap_or(0);
                 litebox_util_log::warn!(
                     tid:% = self.tid.get(),
                     child_tid:% = child_tid,
@@ -6279,14 +6277,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // the current state. This lock is kept regardless: it closes a real, independently
                 // worth-fixing unlocked-concurrent-write gap on this pass, even though it is not a
                 // complete fix for the oracle.
-                let _fork_verify_heal_guard = self.global.platform.lock_fork_verify_heal();
+                let fork_verify_heal_guard = self.global.platform.lock_fork_verify_heal();
                 fixup_stale_stack_pointers::<Platform>(
                     &relocations,
                     child_ctx.rsp,
                     child_fs_base_for_stack_scan,
                 );
                 fixup_stale_elf_data_pointers::<Platform>(&relocations);
-                drop(_fork_verify_heal_guard);
+                drop(fork_verify_heal_guard);
             }
 
             // Diagnostic-only (pass 111, `LITEBOX_DIAG_PROCESS_FORK_SPAWN=1`, off by default): a
@@ -6813,7 +6811,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if let Some(idx) = fork_slot {
                     match self.global.platform.cross_process_child_host_pid(handle) {
                         Some(child_host) => {
-                            self.global.bind_cross_process_fork_slot(idx, child_host)
+                            self.global.bind_cross_process_fork_slot(idx, child_host);
                         }
                         None => self.global.release_unbound_cross_process_fork_slot(idx),
                     }
@@ -7649,15 +7647,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Some(now.checked_add(delay).ok_or(Errno::EINVAL)?)
         };
         alarm.interval = new_deadline.and(interval.filter(|d| !d.is_zero()));
-        if alarm.handle.is_none() {
-            match self
+        if alarm.handle.is_none()
+            && let Ok(handle) = self
                 .global
                 .platform
                 .create_timer(litebox_common_linux::signal::Signal::SIGALRM)
-            {
-                Ok(handle) => alarm.handle = Some(handle),
-                Err(_) => {}
-            }
+        {
+            alarm.handle = Some(handle);
         }
         if let Some(handle) = &alarm.handle {
             handle.set_timer(delay);
@@ -7804,6 +7800,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// enforced. `pid` may be the caller or one of its children -- local or cross-process -- the
     /// standard shell-job-control pattern of a parent shell moving a freshly forked child into a
     /// (possibly brand new) pipeline process group before letting it run.
+    // `target_pid` (the process) and `target_pgid` (its group) are the two halves of one call.
+    #[allow(clippy::similar_names)]
     pub(crate) fn sys_setpgid(&self, pid: i32, requested_group: i32) -> Result<(), Errno> {
         if requested_group < 0 {
             return Err(Errno::EINVAL);
@@ -7925,7 +7923,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn peer_cred(&self) -> litebox_common_linux::Ucred {
         let c = self.creds();
         litebox_common_linux::Ucred {
-            pid: self.pid.get() as u32,
+            pid: self.pid.get().cast_unsigned(),
             uid: c.euid,
             gid: c.egid,
         }
@@ -7939,7 +7937,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn scm_cred(&self) -> litebox_common_linux::Ucred {
         let c = self.creds();
         litebox_common_linux::Ucred {
-            pid: self.pid.get() as u32,
+            pid: self.pid.get().cast_unsigned(),
             uid: c.visible_uid(),
             gid: c.visible_gid(),
         }
@@ -8007,12 +8005,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .portable_snapshot(self.pid.get())
             .map(|info| {
                 let hex = |bytes: &[u8]| {
-                    bytes
-                        .iter()
-                        .fold(alloc::string::String::new(), |mut out, b| {
-                            out.push_str(&alloc::format!("{b:02x}"));
-                            out
-                        })
+                    use core::fmt::Write as _;
+                    let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
+                    for b in bytes {
+                        let _ = write!(out, "{b:02x}");
+                    }
+                    out
                 };
                 alloc::format!(
                     "\t{}\t{}\t{}\t{}",
@@ -8062,7 +8060,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         drop(process);
         *self.fs.borrow().cwd.write() = alloc::string::String::from(cwd);
         let unhex = |text: &str| -> Option<alloc::vec::Vec<u8>> {
-            if text.len() % 2 != 0 {
+            if !text.len().is_multiple_of(2) {
                 return None;
             }
             (0..text.len())
@@ -8087,6 +8085,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             )),
             _ => None,
         };
+        // Both arms build the same struct; the fallback arm also logs, so it stays a `match`.
+        #[allow(clippy::single_match_else)]
         let info = match decoded {
             Some((Some(exe_path), Some(comm), Some(cmdline), Some(environ))) => {
                 litebox::fs::procfs::ProcSelfInfo {
@@ -8190,12 +8190,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     /// Handle syscall `getgroups`. `size == 0` is the standard "just tell me the count" query
     /// and never touches `list`.
+    // `groups` is capped at 65536 entries by `sys_setgroups`, so the `u32` count cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn sys_getgroups(&self, size: i32, list: UserPtrMut<u32>) -> Result<u32, Errno> {
         let c = self.creds();
         if size == 0 {
             return Ok(c.groups.len() as u32);
         }
-        if size < 0 || (size as usize) < c.groups.len() {
+        let Ok(size) = usize::try_from(size) else {
+            return Err(Errno::EINVAL);
+        };
+        if size < c.groups.len() {
             return Err(Errno::EINVAL);
         }
         if !c.groups.is_empty() {
@@ -8204,7 +8209,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let visible: alloc::vec::Vec<u32> = c
                 .groups
                 .iter()
-                .map(|group| Credentials::visible_id(&c.gid_map, *group))
+                .map(|group| Credentials::visible_id(c.gid_map.as_ref(), *group))
                 .collect();
             list.copy_from_slice::<Platform>(0, &visible)
                 .ok_or(Errno::EFAULT)?;
@@ -8213,6 +8218,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     /// Handle syscall `setgroups`: only a privileged caller may replace the group list.
+    // `size` is at most 65536 here, so the index below cannot wrap into `isize`.
+    #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn sys_setgroups(&self, size: usize, list: UserPtr<u32>) -> Result<(), Errno> {
         let mut c = (*self.creds()).clone();
         if !c.is_privileged() {
@@ -8529,13 +8536,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     );
                 }
                 if shared {
-                    return match self.shared_futex_wait(
+                    return if self.shared_futex_wait(
                         &self.wait_cx().with_timeout(timeout),
                         addr,
                         val,
                     )? {
-                        true => Ok(0),
-                        false => Err(Errno::EAGAIN),
+                        Ok(0)
+                    } else {
+                        Err(Errno::EAGAIN)
                     };
                 }
                 let res = self.global.futex_manager.wait(
@@ -8573,13 +8581,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let shared = self.futex_is_cross_process(flags);
                 if shared {
-                    return match self.shared_futex_wait(
+                    return if self.shared_futex_wait(
                         &self.wait_cx().with_deadline(deadline),
                         addr,
                         val,
                     )? {
-                        true => Ok(0),
-                        false => Err(Errno::EAGAIN),
+                        Ok(0)
+                    } else {
+                        Err(Errno::EAGAIN)
                     };
                 }
                 self.global.futex_manager.wait(
@@ -8686,7 +8695,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     None
                 };
                 let shared = self.futex_is_cross_process(flags);
-                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get().cast_unsigned() & FUTEX_TID_MASK;
                 loop {
                     let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                     if current & FUTEX_TID_MASK == 0 {
@@ -8732,8 +8741,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         contended,
                         None,
                     ) {
-                        Ok(()) => {}
-                        Err(
+                        Ok(())
+                        | Err(
                             litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch,
                         ) => {}
                         Err(e) => return Err(e.into()),
@@ -8742,7 +8751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FutexArgs::TrylockPi { addr, flags } => {
                 self.futex_is_cross_process(flags);
-                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get().cast_unsigned() & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != 0 {
                     // Held. Linux reports a failed acquisition here as `EAGAIN`.
@@ -8761,7 +8770,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             FutexArgs::UnlockPi { addr, flags } => {
                 let shared = self.futex_is_cross_process(flags);
-                let me = self.tid.get() as u32 & FUTEX_TID_MASK;
+                let me = self.tid.get().cast_unsigned() & FUTEX_TID_MASK;
                 let current = addr.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 if current & FUTEX_TID_MASK != me {
                     // Releasing a lock this thread does not hold is the caller's bug, and Linux
@@ -9379,7 +9388,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         );
                     }
                 }
-                self.exit_group(ExitStatus::Exit(result.raw_status.clamp(0, 255) as u8 as i8));
+                self.exit_group(ExitStatus::Exit(
+                    result.raw_status.clamp(0, 255).to_le_bytes()[0].cast_signed(),
+                ));
                 {
                     self.process().signal_vfork_done();
                     self.signal_native_vfork_gate();
@@ -9517,9 +9528,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if self.global.platform.env_flag("LITEBOX_DIAG_FAULT") {
             // Where this image landed (`AT_ENTRY`), so a fault's absolute `rip` can be turned
             // into a file offset: offset = rip - AT_ENTRY + e_entry.
-            let at_entry = load_info
-                .auxv
-                .chunks_exact(16)
+            let (auxv_entries, _) = load_info.auxv.as_chunks::<16>();
+            let at_entry = auxv_entries
+                .iter()
                 .find(|c| usize::from_ne_bytes(c[..8].try_into().unwrap_or([0; 8])) == 9)
                 .map(|c| usize::from_ne_bytes(c[8..16].try_into().unwrap_or([0; 8])));
             crate::diag::emit_timeline_line(
@@ -9539,7 +9550,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.global
             .proc_self_info
             .write()
-            .with_mut(self.pid.get(), |info| info.auxv = load_info.auxv.clone());
+            .with_mut(self.pid.get(), |info| info.auxv.clone_from(&load_info.auxv));
 
         // `comm`/`cmdline` are final now, so publish them for every OTHER host process: under
         // `LITEBOX_PROCESS_FORK=1` this pid's `/proc` entry is read from processes that have no
@@ -9788,6 +9799,103 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+/// Credentials cell of the task whose syscall this host process is dispatching. Process-wide
+/// rather than per-task (this crate is `#![no_std]`, so there are no thread locals): it is
+/// published only for the duration of one syscall dispatch, and the only thing that ever reads it
+/// is a read or write of `/proc/self/{uid_map,gid_map,setgroups}` -- which a real caller does from
+/// the single-threaded child that just created its namespace, before it does anything else.
+static CURRENT_CREDENTIALS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Restores the credentials cell that was published before this dispatch.
+pub(crate) struct CurrentCredentialsGuard {
+    previous: usize,
+}
+
+impl Drop for CurrentCredentialsGuard {
+    fn drop(&mut self) {
+        CURRENT_CREDENTIALS.store(self.previous, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn publish_current_credentials(
+    cell: &RefCell<Arc<Credentials>>,
+) -> CurrentCredentialsGuard {
+    let previous = CURRENT_CREDENTIALS.swap(
+        core::ptr::from_ref(cell).addr(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    CurrentCredentialsGuard { previous }
+}
+
+/// Runs `f` against a copy of the current task's credentials and installs the copy back, which is
+/// how a write to one of the id-map files changes them. `None` when no dispatch is running.
+fn with_current_credentials<R>(f: impl FnOnce(&mut Credentials) -> R) -> Option<R> {
+    let raw = CURRENT_CREDENTIALS.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: the published pointer is the `credentials` field of the task whose syscall this host
+    // process is dispatching, cleared again when that dispatch ends, so the task -- and this field
+    // of it -- is alive for exactly as long as the pointer is published.
+    let cell = unsafe { &*(raw as *const RefCell<Arc<Credentials>>) };
+    let mut borrowed = cell.try_borrow_mut().ok()?;
+    let mut creds = (**borrowed).clone();
+    let result = f(&mut creds);
+    *borrowed = Arc::new(creds);
+    Some(result)
+}
+
+/// Answers a guest write to `/proc/self/{uid_map,gid_map,setgroups}`; registered with
+/// [`litebox::fs::ident::set_id_map_write_fn`]. Those files live in the fs layer, but what they
+/// change is the calling task's credentials, which only the shim knows about.
+pub(crate) fn apply_id_map_write(
+    file: litebox::fs::ident::IdMapFile,
+    buf: &[u8],
+) -> Result<(), u32> {
+    match with_current_credentials(|creds| creds.apply_id_map(file, buf)) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(errno)) => Err(i32::from(errno).cast_unsigned()),
+        None => Err(i32::from(Errno::EPERM).cast_unsigned()),
+    }
+}
+
+/// Answers a guest read of the same three files; registered with
+/// [`litebox::fs::ident::set_id_map_read_fn`].
+pub(crate) fn read_id_map_file(file: litebox::fs::ident::IdMapFile) -> alloc::vec::Vec<u8> {
+    let rendered = with_current_credentials(|creds| match file {
+        litebox::fs::ident::IdMapFile::Setgroups => alloc::format!(
+            "{}\n",
+            if creds.setgroups_denied {
+                "deny"
+            } else {
+                "allow"
+            }
+        ),
+        litebox::fs::ident::IdMapFile::UidMap => render_id_map(creds.uid_map.as_ref()),
+        litebox::fs::ident::IdMapFile::GidMap => render_id_map(creds.gid_map.as_ref()),
+    });
+    rendered.unwrap_or_else(|| render_id_map(None)).into_bytes()
+}
+
+/// Renders an id map the way the kernel does: right-aligned columns, one extent per line. `None`
+/// is the initial namespace, where every id maps to itself.
+fn render_id_map(map: Option<&alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
+    use core::fmt::Write as _;
+    let Some(extents) = map else {
+        return alloc::format!("{:>10} {:>10} {:>10}\n", 0, 0, u32::MAX);
+    };
+    let mut rendered = alloc::string::String::new();
+    for extent in extents {
+        let _ = writeln!(
+            rendered,
+            "{:>10} {:>10} {:>10}",
+            extent.inner, extent.outer, extent.count
+        );
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     /// `sched_setaffinity` must accept a narrowing of the mask `sched_getaffinity` just reported.
@@ -9831,6 +9939,7 @@ mod tests {
     /// whether it is privileged -- so reporting `ENOSYS` makes it refuse to continue rather than
     /// degrade. These were unimplemented and observed being called by a real session.
     #[test]
+    #[allow(clippy::similar_names)] // uid/euid and gid/egid are the real/effective pairs under test
     fn getresuid_and_getresgid_report_the_process_identity() {
         let task = crate::syscalls::tests::init_platform(None);
 
@@ -10960,104 +11069,4 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, Errno::ESRCH);
     }
-}
-
-/// Credentials cell of the task whose syscall this host process is dispatching. Process-wide
-/// rather than per-task (this crate is `#![no_std]`, so there are no thread locals): it is
-/// published only for the duration of one syscall dispatch, and the only thing that ever reads it
-/// is a read or write of `/proc/self/{uid_map,gid_map,setgroups}` -- which a real caller does from
-/// the single-threaded child that just created its namespace, before it does anything else.
-static CURRENT_CREDENTIALS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Restores the credentials cell that was published before this dispatch.
-pub(crate) struct CurrentCredentialsGuard {
-    previous: usize,
-}
-
-impl Drop for CurrentCredentialsGuard {
-    fn drop(&mut self) {
-        CURRENT_CREDENTIALS.store(self.previous, core::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn publish_current_credentials(
-    cell: &RefCell<Arc<Credentials>>,
-) -> CurrentCredentialsGuard {
-    let previous = CURRENT_CREDENTIALS.swap(
-        cell as *const RefCell<Arc<Credentials>> as usize,
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    CurrentCredentialsGuard { previous }
-}
-
-/// Runs `f` against a copy of the current task's credentials and installs the copy back, which is
-/// how a write to one of the id-map files changes them. `None` when no dispatch is running.
-fn with_current_credentials<R>(f: impl FnOnce(&mut Credentials) -> R) -> Option<R> {
-    let raw = CURRENT_CREDENTIALS.load(core::sync::atomic::Ordering::Relaxed);
-    if raw == 0 {
-        return None;
-    }
-    // SAFETY: the published pointer is the `credentials` field of the task whose syscall this host
-    // process is dispatching, cleared again when that dispatch ends, so the task -- and this field
-    // of it -- is alive for exactly as long as the pointer is published.
-    let cell = unsafe { &*(raw as *const RefCell<Arc<Credentials>>) };
-    let mut borrowed = cell.try_borrow_mut().ok()?;
-    let mut creds = (**borrowed).clone();
-    let result = f(&mut creds);
-    *borrowed = Arc::new(creds);
-    Some(result)
-}
-
-/// Answers a guest write to `/proc/self/{uid_map,gid_map,setgroups}`; registered with
-/// [`litebox::fs::ident::set_id_map_write_fn`]. Those files live in the fs layer, but what they
-/// change is the calling task's credentials, which only the shim knows about.
-pub(crate) fn apply_id_map_write(
-    file: litebox::fs::ident::IdMapFile,
-    buf: &[u8],
-) -> Result<(), u32> {
-    let result = match with_current_credentials(|creds| creds.apply_id_map(file, buf)) {
-        Some(Ok(())) => Ok(()),
-        Some(Err(errno)) => Err(i32::from(errno) as u32),
-        None => Err(i32::from(Errno::EPERM) as u32),
-    };
-    result
-}
-
-/// Answers a guest read of the same three files; registered with
-/// [`litebox::fs::ident::set_id_map_read_fn`].
-pub(crate) fn read_id_map_file(file: litebox::fs::ident::IdMapFile) -> alloc::vec::Vec<u8> {
-    let rendered = with_current_credentials(|creds| match file {
-        litebox::fs::ident::IdMapFile::Setgroups => alloc::format!(
-            "{}\n",
-            if creds.setgroups_denied {
-                "deny"
-            } else {
-                "allow"
-            }
-        ),
-        litebox::fs::ident::IdMapFile::UidMap => render_id_map(&creds.uid_map),
-        litebox::fs::ident::IdMapFile::GidMap => render_id_map(&creds.gid_map),
-    });
-    rendered
-        .unwrap_or_else(|| render_id_map(&None))
-        .into_bytes()
-}
-
-/// Renders an id map the way the kernel does: right-aligned columns, one extent per line. `None`
-/// is the initial namespace, where every id maps to itself.
-fn render_id_map(map: &Option<alloc::vec::Vec<IdExtent>>) -> alloc::string::String {
-    let Some(extents) = map else {
-        return alloc::format!("{:>10} {:>10} {:>10}\n", 0, 0, u32::MAX);
-    };
-    let mut rendered = alloc::string::String::new();
-    for extent in extents {
-        rendered.push_str(&alloc::format!(
-            "{:>10} {:>10} {:>10}\n",
-            extent.inner,
-            extent.outer,
-            extent.count
-        ));
-    }
-    rendered
 }

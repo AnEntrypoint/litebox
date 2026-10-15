@@ -153,7 +153,7 @@ fn host_process_tag() -> u64 {
     static MARKER: u8 = 0;
     match TAG.load(core::sync::atomic::Ordering::Relaxed) {
         0 => {
-            let v = &MARKER as *const u8 as usize as u64;
+            let v = core::ptr::from_ref(&MARKER) as usize as u64;
             TAG.store(v, core::sync::atomic::Ordering::Relaxed);
             v
         }
@@ -605,14 +605,14 @@ pub(crate) struct TcpSpecific {
 ///     `try_descriptor_table()` in that process fail FOREVER (see `litebox::sync::RwLock`),
 ///   * `iter_mut_nowait` skipping an entry a guest thread happens to hold,
 ///   * that process exiting, or dropping the descriptor with no other referent left,
-/// left the port's slots unrepaired: every slot it had was spent on a connection or wiped by a
-/// dead-holder reset, nothing ever re-armed it, and smoltcp answered every later SYN with an RST
-/// while the connections it had already accepted went on streaming. Measured over and over, and
-/// never explainable from the log: chrD92 (refused from t=120s to the end of the run while selkies'
-/// accepted websocket streamed), chrF10 (8081's repair heartbeat stopped at uptime 79.5s while
-/// 8082's and 9222's ran to ~300s), fl6 (refused from fork 8 on, backlog 8), chrF32 (8081's
-/// heartbeat stopped at uptime 518s with refusals still being logged 37k lines later, selkies
-/// encoding frames in a live process the whole time).
+///     left the port's slots unrepaired: every slot it had was spent on a connection or wiped by a
+///     dead-holder reset, nothing ever re-armed it, and smoltcp answered every later SYN with an RST
+///     while the connections it had already accepted went on streaming. Measured over and over, and
+///     never explainable from the log: chrD92 (refused from t=120s to the end of the run while selkies'
+///     accepted websocket streamed), chrF10 (8081's repair heartbeat stopped at uptime 79.5s while
+///     8082's and 9222's ran to ~300s), fl6 (refused from fork 8 on, backlog 8), chrF32 (8081's
+///     heartbeat stopped at uptime 518s with refusals still being logged 37k lines later, selkies
+///     encoding frames in a live process the whole time).
 ///
 /// The queue is per PORT, not per descriptor, which is also what retires the old `borrowed` arm of
 /// the repair sweep: one row can only ever hold `backlog` sockets, so a fork child that inherited
@@ -676,7 +676,7 @@ impl ListenQueue {
     }
 
     fn drop_referent(&mut self, pid: u32) {
-        for slot in self.ref_pids.iter_mut() {
+        for slot in &mut self.ref_pids {
             if *slot == pid {
                 *slot = 0;
             }
@@ -691,6 +691,7 @@ impl ListenQueue {
 
     /// Records a `listen(2)` backlog, capped to what one row can hold -- the way Linux caps a
     /// backlog at `somaxconn` rather than arming the thousands of sockets a caller may ask for.
+    #[allow(clippy::cast_possible_truncation)] // MAX_BACKLOG_SLOTS is 16, far below u16::MAX.
     fn set_backlog(&mut self, backlog: u16) {
         self.backlog = backlog.max(1).min(MAX_BACKLOG_SLOTS as u16);
     }
@@ -805,7 +806,7 @@ fn report_connect_failure(what: &'static str, port: u16) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     litebox_util_log::debug!(what:% = what, port = port, n = n; "diag-connect: connect(2) did not complete");
-    if n >= 4 && n % 64 != 0 {
+    if n >= 4 && !n.is_multiple_of(64) {
         return;
     }
     litebox_util_log::warn!(what:% = what, port = port; "diag-connect: connect(2) did not complete");
@@ -823,6 +824,7 @@ fn report_connect_failure(what: &'static str, port: u16) {
 /// `diag-port` prints as `sockets=`. chrF32 needed it: its refusals read `slots=none` while the
 /// poller's own heartbeat read `port=8081 slots=8 listening=8` at the same wall clock, so either
 /// the two processes hold DIFFERENT socket sets or one of them is not seeing the shared one.
+#[allow(clippy::too_many_arguments)] // One argument per diagnostic field; the call site is the only caller.
 fn report_connect_outcome(
     what: &'static str,
     port: u16,
@@ -850,7 +852,7 @@ fn report_connect_outcome(
         n = n;
         "diag-connect-outcome: a connect(2) that was left in progress ended without a connection"
     );
-    if n >= 4 && n % 64 != 0 {
+    if n >= 4 && !n.is_multiple_of(64) {
         return;
     }
     litebox_util_log::warn!(
@@ -918,7 +920,10 @@ fn report_exhausted_buffer_pool(
     port: u16,
 ) {
     static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+    if !SEEN
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(512)
+    {
         return;
     }
     let (data_granted, data_used, meta_granted, meta_used, owners) = buffers.occupancy();
@@ -1119,11 +1124,11 @@ fn slot_generation(
     slot_generations: &[SlotGenerationRow; MAX_SOCKETS],
     handle: smoltcp::iface::SocketHandle,
 ) -> Option<u32> {
-    for row in slot_generations.iter() {
-        if let Some((marked, generation)) = *row {
-            if marked == handle {
-                return Some(generation);
-            }
+    for row in slot_generations {
+        if let Some((marked, generation)) = *row
+            && marked == handle
+        {
+            return Some(generation);
         }
     }
     None
@@ -1143,10 +1148,10 @@ fn mint_slot_generation(
     handle: smoltcp::iface::SocketHandle,
 ) -> u32 {
     for row in slot_generations.iter_mut() {
-        if let Some((marked, generation)) = *row {
-            if marked == handle {
-                return generation;
-            }
+        if let Some((marked, generation)) = *row
+            && marked == handle
+        {
+            return generation;
         }
     }
     // Not in the table yet: this slot has never been vacated in this run, so it starts at 1 --
@@ -1176,11 +1181,11 @@ fn bump_slot_generation(
     handle: smoltcp::iface::SocketHandle,
 ) {
     for row in slot_generations.iter_mut() {
-        if let Some((marked, generation)) = row.as_mut() {
-            if *marked == handle {
-                *generation = generation.wrapping_add(1);
-                return;
-            }
+        if let Some((marked, generation)) = row.as_mut()
+            && *marked == handle
+        {
+            *generation = generation.wrapping_add(1);
+            return;
         }
     }
     // No row: this socket was never minted through `Network` (a listening socket a port's backlog
@@ -1252,7 +1257,7 @@ fn warn_stale_socket_handle(
     // a generation bug makes every handle look stale (one 300 s chromium run measured 288,137 of
     // these). Four up front to show a real cluster beginning, then one in 64 forever -- and the
     // `warn!` rides the very same gate, so a run at `warn` sees the same cadence it always did.
-    if n >= 4 && n % 64 != 0 {
+    if n >= 4 && !n.is_multiple_of(64) {
         return;
     }
     litebox_util_log::debug!(
@@ -1547,7 +1552,7 @@ where
         // nothing while its accepted connections keep streaming" shape; the rows are cleared to
         // empty instead, and `maintain_listening_queues` re-arms them on the next tick from the
         // backlog each row still records.
-        for queue in self.listen_queues.iter_mut() {
+        for queue in &mut self.listen_queues {
             queue.handles = [None; MAX_BACKLOG_SLOTS];
         }
         self.buffers.reset();
@@ -1622,6 +1627,8 @@ where
 
     /// (Internal-only API) Actually perform the queued interactions with the outside world.
     fn internal_perform_platform_interaction(&mut self) -> smoltcp::iface::PollResult {
+        // Last poll instant of the IP-interface owner, used by the `diag-poll-gap` check below.
+        static LAST_POLL_MS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
@@ -1645,7 +1652,6 @@ where
         // 20 s on the 40th, with two 8 s timeouts to two other ports from inside the guest, and
         // nothing in any log said why. The gap is the whole explanation, so it is logged whenever
         // this process was away for a second or more.
-        static LAST_POLL_MS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
         let now_ms = self.now().millis();
         let prev = LAST_POLL_MS.swap(now_ms, core::sync::atomic::Ordering::Relaxed);
         if prev != 0 {
@@ -2166,9 +2172,7 @@ where
     }
 
     fn is_shared_across_fork(&self, handle: smoltcp::iface::SocketHandle) -> bool {
-        self.shared_across_fork
-            .iter()
-            .any(|marked| *marked == Some(handle))
+        self.shared_across_fork.contains(&Some(handle))
     }
 
     /// Records that `handle` -- a backlog slot of some listening port -- has been handed out by
@@ -2370,7 +2374,10 @@ where
         // and 9222's ran to ~600s).
         let Some(table) = self.litebox.try_descriptor_table() else {
             static LOCKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-            if LOCKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 == 0 {
+            if LOCKED
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(512)
+            {
                 litebox_util_log::warn!(
                     tag = host_process_tag();
                     "diag-tick: this process's descriptor table was locked, no socket was swept"
@@ -2382,7 +2389,7 @@ where
         // own, even though the socket set it names is shared). `host_process_tag()` -- the address
         // of a static -- came out IDENTICAL for every host process, because they are all the same
         // image mapped at the same base, so it cannot tell one process's tick from another's.
-        let dtag = &*table as *const _ as usize as u64;
+        let dtag = core::ptr::from_ref(&*table) as usize as u64;
         let mut drain_seen = 0usize;
         for (_, entry) in table.iter_nowait::<Network<Platform>>() {
             drain_seen += 1;
@@ -2406,7 +2413,7 @@ where
         {
             static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if tick % 512 == 0 {
+            if tick.is_multiple_of(512) {
                 litebox_util_log::warn!(
                     tick = tick,
                     tag = host_process_tag(),
@@ -2432,7 +2439,7 @@ where
         // port's liveness on the very first tick, before anything was registered (chrF37: 8081 and
         // 8082 were retired 0.167 s into a spawned process). The sweep runs on 512-tick multiples,
         // which is the cadence `dev_tests` drives it with (`reclaim_tick = 512`).
-        if tick == 0 || tick % 512 != 0 {
+        if tick == 0 || !tick.is_multiple_of(512) {
             return;
         }
         let me = self.litebox.platform().current_pid();
@@ -2524,7 +2531,7 @@ where
         {
             static TICKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let tick = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if tick % 512 == 0 {
+            if tick.is_multiple_of(512) {
                 let maintained = alloc::format!(
                     "{:?}",
                     self.listen_queues
@@ -2554,7 +2561,7 @@ where
         let handles_before = queue.live_handles();
         // A slot wiped out of the shared set by a dead-holder `reset_after_poisoning()` elsewhere
         // is gone: forget it here rather than panic in smoltcp's `get` (see `socket_set_contains`).
-        for slot in queue.handles.iter_mut() {
+        for slot in &mut queue.handles {
             if let Some(handle) = *slot
                 && !Self::socket_set_contains(socket_set, handle)
             {
@@ -2570,7 +2577,10 @@ where
         );
         if reclaimed > 0 {
             static RECLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-            if RECLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+            if RECLAIMS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(64)
+            {
                 litebox_util_log::warn!(
                     port = port,
                     reclaimed = reclaimed;
@@ -2614,7 +2624,10 @@ where
         {
             static HEARTBEATS: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
-            if HEARTBEATS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 == 0 {
+            if HEARTBEATS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(512)
+            {
                 let (data_granted, data_used, meta_granted, meta_used, owners) =
                     buffers.occupancy();
                 let (total, census) = socket_census(socket_set);
@@ -3026,7 +3039,10 @@ where
     /// this is a guest-reachable failure path, so it can fire very often under load.
     fn warn_socket_refused(&self, protocol: &'static str, reason: &'static str) {
         static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 != 0 {
+        if !REFUSED
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
             return;
         }
         let (data_granted, data_used, meta_granted, meta_used, owners) = self.buffers.occupancy();
@@ -3164,11 +3180,7 @@ where
         let shared_across_fork = {
             let borrowed = table_entry.entry.borrowed;
             let handle = table_entry.entry.handle;
-            borrowed
-                || self
-                    .shared_across_fork
-                    .iter()
-                    .any(|marked| *marked == Some(handle))
+            borrowed || self.shared_across_fork.contains(&Some(handle))
         };
         if shared_across_fork {
             match proxy.as_ref() {
@@ -3228,7 +3240,7 @@ where
                         backlog
                     ));
                 }
-                let Some(socket) = try_get_socket::<tcp::Socket>(
+                let socket = try_get_socket::<tcp::Socket>(
                     &self.socket_set,
                     socket_handle.handle,
                     Some(SlotIdentity {
@@ -3236,9 +3248,7 @@ where
                         stamped: socket_handle.slot_gen,
                     }),
                     "fork_carry_spec:tcp",
-                ) else {
-                    return None;
-                };
+                )?;
                 // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
                 // so there is nothing a child could match it on -- and nothing to share yet either.
                 let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
@@ -3251,7 +3261,7 @@ where
                 ))
             }
             Protocol::Udp => {
-                let Some(socket) = try_get_socket::<udp::Socket>(
+                let socket = try_get_socket::<udp::Socket>(
                     &self.socket_set,
                     socket_handle.handle,
                     Some(SlotIdentity {
@@ -3259,9 +3269,7 @@ where
                         stamped: socket_handle.slot_gen,
                     }),
                     "fork_carry_spec:udp",
-                ) else {
-                    return None;
-                };
+                )?;
                 let endpoint = socket.endpoint();
                 let remote = socket_handle.udp().remote_endpoint;
                 if endpoint.port == 0 && remote.is_none() {
@@ -3286,6 +3294,8 @@ where
     /// Returns `None` (never panics) when the socket cannot be found or recreated -- most often
     /// because the parent closed it, or the socket table/buffer pool is exhausted -- and the
     /// caller then leaves the guest fd missing, which the guest sees as `EBADF`.
+    // The spec's ports and backlog were written as u16 by `fork_carry_spec`, so the hex values fit.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn fork_adopt(&mut self, spec: &str) -> Option<SocketFd<Platform>> {
         let mut parts = spec.split(',');
         let kind = parts.next()?;
@@ -3392,7 +3402,10 @@ where
                 {
                     static ADOPTS: core::sync::atomic::AtomicU32 =
                         core::sync::atomic::AtomicU32::new(0);
-                    if ADOPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+                    if ADOPTS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        .is_multiple_of(64)
+                    {
                         litebox_util_log::warn!(
                             port = lport,
                             sockets = self.socket_set.iter().count(),
@@ -3551,10 +3564,7 @@ where
                         // `close_handle` queues -- even if this process dies the instant
                         // `close()` returns.
                         let handle = entry.entry.handle;
-                        let shared_across_fork = self
-                            .shared_across_fork
-                            .iter()
-                            .any(|marked| *marked == Some(handle));
+                        let shared_across_fork = self.shared_across_fork.contains(&Some(handle));
                         Self::drain_socket_channel_buffers(
                             &mut self.socket_set,
                             &self.slot_generations,
@@ -3921,26 +3931,24 @@ where
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                     match state {
-                        tcp::State::Established => Ok(()),
                         // The handshake completed and the peer is already shutting the connection
                         // down (or this side is): `connect(2)` has succeeded and the application
                         // learns the rest from `read`/`write`, so this is not a refusal.
-                        tcp::State::CloseWait
+                        tcp::State::Established
+                        | tcp::State::CloseWait
                         | tcp::State::FinWait1
                         | tcp::State::FinWait2
                         | tcp::State::Closing
                         | tcp::State::LastAck => Ok(()),
-                        tcp::State::Closed | tcp::State::TimeWait => {
-                            Err(ConnectError::InvalidState)
-                        }
                         tcp::State::SynSent => Err(ConnectError::InProgress),
-                        // Neither is reachable for a socket this process just `connect`ed, and
-                        // none of them means "connected" -- a guest-reachable path must return an
-                        // errno rather than panic here, so report the refusal the peer's RST (or
-                        // the connect timeout) would have produced anyway.
-                        tcp::State::Listen | tcp::State::SynReceived => {
-                            Err(ConnectError::InvalidState)
-                        }
+                        // Closed/TimeWait are refusals, and Listen/SynReceived are unreachable for a
+                        // socket this process just `connect`ed. None of them means "connected" -- a
+                        // guest-reachable path must return an errno rather than panic here, so report
+                        // the refusal the peer's RST (or the connect timeout) would have produced anyway.
+                        tcp::State::Closed
+                        | tcp::State::TimeWait
+                        | tcp::State::Listen
+                        | tcp::State::SynReceived => Err(ConnectError::InvalidState),
                     }
                 };
 
@@ -4122,34 +4130,33 @@ where
                     // 0.0.0.0:0 is what a never-bound socket reports anyway.
                     return Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 };
-                match socket.local_endpoint() {
-                    Some(endpoint) => match endpoint.addr {
+                if let Some(endpoint) = socket.local_endpoint() {
+                    match endpoint.addr {
                         smoltcp::wire::IpAddress::Ipv4(ipv4) => {
                             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
                         }
-                    },
+                    }
+                } else {
                     // Bound but not connected (a listener, or a socket that only called
                     // `bind`): smoltcp has no local endpoint yet, but the address the guest bound
                     // is recorded on our side and is what `getsockname` must report.
-                    None => {
-                        let specific = socket_handle.tcp();
-                        if let Some(server) = &specific.server_socket {
-                            let ip = match server.ip_listen_endpoint.addr {
-                                Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
-                                None => Ipv4Addr::UNSPECIFIED,
-                            };
-                            Ok(SocketAddr::V4(SocketAddrV4::new(
-                                ip,
-                                server.ip_listen_endpoint.port,
-                            )))
-                        } else if let Some(local_port) = &specific.local_port {
-                            Ok(SocketAddr::V4(SocketAddrV4::new(
-                                Ipv4Addr::UNSPECIFIED,
-                                local_port.port(),
-                            )))
-                        } else {
-                            Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
-                        }
+                    let specific = socket_handle.tcp();
+                    if let Some(server) = &specific.server_socket {
+                        let ip = match server.ip_listen_endpoint.addr {
+                            Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                            None => Ipv4Addr::UNSPECIFIED,
+                        };
+                        Ok(SocketAddr::V4(SocketAddrV4::new(
+                            ip,
+                            server.ip_listen_endpoint.port,
+                        )))
+                    } else if let Some(local_port) = &specific.local_port {
+                        Ok(SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            local_port.port(),
+                        )))
+                    } else {
+                        Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
                     }
                 }
             }
@@ -4224,7 +4231,7 @@ where
                 }),
                 "get_remote_addr:tcp",
             )
-            .and_then(|socket| socket.remote_endpoint())
+            .and_then(tcp::Socket::remote_endpoint)
             .ok_or(RemoteAddrError::NotConnected)?,
             Protocol::Udp => socket_handle
                 .udp()
@@ -4484,9 +4491,8 @@ where
         // value for now until we have a better solution.
         let backlog = backlog.min(8);
 
-        // Assigned only by the TCP arm below; every other arm diverges, so no path reads it unset.
-        let armed_endpoint: Option<smoltcp::wire::IpListenEndpoint>;
-        match &mut socket_handle.specific {
+        // Only the TCP arm arms a queue; every other arm diverges.
+        let armed_endpoint = match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 if handle.server_socket.is_none() {
                     let local_port =
@@ -4528,12 +4534,12 @@ where
                 // the next refill, shrinking just stops re-arming past the new backlog (an
                 // already-connected slot is never dropped out from under a client).
                 server_socket.backlog = Some(backlog);
-                armed_endpoint = Some(server_socket.ip_listen_endpoint.clone());
+                Some(server_socket.ip_listen_endpoint)
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
             ProtocolSpecific::Raw(_) => unimplemented!(),
-        }
+        };
 
         if let Some(proxy) = &socket_handle.proxy {
             proxy.set_state(socket_channel::SocketState::Listening);
@@ -4546,16 +4552,16 @@ where
         // `&mut self` and has to wait until this process's descriptor-table guard is released.
         // Arming it HERE as well as from the tick is what makes a `listen()` that returns
         // immediately followed by a SYN work: the port is listening before the next tick.
-        if let Some(ip_listen_endpoint) = armed_endpoint {
-            if let Some(index) = self.register_listen_queue(ip_listen_endpoint, backlog) {
-                let Self {
-                    listen_queues,
-                    socket_set,
-                    buffers,
-                    ..
-                } = self;
-                listen_queues[index].refill(socket_set, buffers);
-            }
+        if let Some(ip_listen_endpoint) = armed_endpoint
+            && let Some(index) = self.register_listen_queue(ip_listen_endpoint, backlog)
+        {
+            let Self {
+                listen_queues,
+                socket_set,
+                buffers,
+                ..
+            } = self;
+            listen_queues[index].refill(socket_set, buffers);
         }
 
         self.automated_platform_interaction(PollDirection::Ingress);

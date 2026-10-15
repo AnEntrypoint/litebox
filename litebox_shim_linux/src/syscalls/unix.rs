@@ -271,6 +271,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
         let key = addr.to_key();
         let cred = task.peer_cred();
         let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, cred));
+        // A guest pid is never negative, so the sign-losing cast is the pid itself.
+        #[allow(clippy::cast_sign_loss)]
         let owner_pid = task.pid.get() as u32;
         let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
         litebox_util_log::debug!(
@@ -978,7 +980,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
     /// One holder of this side is gone. Once none remains, this side's write direction ends;
     /// once neither side is held, the slot returns to the pool.
     fn release_holder(&self) {
-        self.release_holder_for(self.platform().current_host_pid())
+        self.release_holder_for(self.platform().current_host_pid());
     }
 
     /// [`Self::release_holder`] for a holder counted under `host` rather than this process: the
@@ -1156,7 +1158,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
         if !self.platform().env_flag("LITEBOX_DIAG_UNIXZERO") {
             return;
         }
-        let peer = !self.is_client;
+        let counterpart = !self.is_client;
         let slot_ref = self.slot_ref();
         litebox_util_log::warn!(
             slot:% = self.slot,
@@ -1166,7 +1168,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> SharedView<'_, Platform, FS> {
             peer_gone:% = peer_gone,
             ring_shutdown:% = read_ring.is_shutdown(),
             ring_empty:% = read_ring.is_empty(),
-            peer_ever_held:% = slot_ref.side_ever_held[conn_side(peer)].load(Ordering::Acquire),
+            peer_ever_held:% = slot_ref.side_ever_held[conn_side(counterpart)].load(Ordering::Acquire),
             holders:% = slot_ref.holder_dump().as_str();
             "[diag-unixzero] AF_UNIX stream shared-slot read answering EOF"
         );
@@ -1664,9 +1666,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
                 ..
             } => (connected_send_channel, link),
         };
-        let _guard = link.lock.lock();
+        let guard = link.lock.lock();
         if let Some(view) = self.shared_view() {
-            drop(_guard);
+            drop(guard);
             return view.send(msg);
         }
         // An in-process delivery hands the receiver a real duplicate of every donated fd, so no
@@ -1681,7 +1683,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
         );
         // TODO: write partial data?
         let len = msg.data.len();
-        let sock_id = self as *const _ as usize;
+        let sock_id = core::ptr::from_ref(self) as usize;
         // `LITEBOX_DRM_TRACE=1` (reused; same flag already wired end-to-end for DRM tracing, see
         // `drm::drm_trace_enabled`'s doc comment): dump a bounded hex prefix of the bytes actually
         // written to a unix stream -- the X11-protocol-decode instrumentation for AGENTS.md's
@@ -1840,14 +1842,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
             // total_read`) bytes starting there were just written by the loop above.
             let prefix = unsafe { core::slice::from_raw_parts(buf_start, n) };
             litebox_util_log::debug!(
-                sock_id:% = self as *const _ as usize,
+                sock_id:% = core::ptr::from_ref(self) as usize,
                 total_read:% = total_read,
                 prefix_hex:? = prefix;
                 "diag-unix-stream-read-bytes"
             );
         }
         litebox_util_log::debug!(
-            sock_id:% = self as *const _ as usize,
+            sock_id:% = core::ptr::from_ref(self) as usize,
             total_read:% = total_read;
             "diag-unix-stream-read: try_recvfrom drained recv_channel"
         );
@@ -2044,7 +2046,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                 if let Some(view) = conn.shared_view() {
                     view.slot_ref().set_last_writer(view.is_client, *cred);
                 } else {
-                    conn.send_cred[0].store(cred.pid as u32, Ordering::Relaxed);
+                    conn.send_cred[0].store(cred.pid, Ordering::Relaxed);
                     conn.send_cred[1].store(cred.uid, Ordering::Relaxed);
                     conn.send_cred[2].store(cred.gid, Ordering::Relaxed);
                 }
@@ -2069,7 +2071,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     /// `None` for a socket that is not connected over the shared transport and for
     /// `LITEBOX_UNIX_CROSS_WAKE_OFF`.
     pub(crate) fn shared_wake(&self) -> Option<SharedWakeHandle<Platform, FS>> {
-        self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()))
+        self.with_state_ref(|state| state.connected().and_then(UnixConnectedStream::shared_wake))
     }
 
     fn new(state: UnixStreamState<Platform, FS>, preserve_boundaries: bool) -> Self {
@@ -2114,8 +2116,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     // a different error code (e.g., EADDRINUSE).
                     Err(Errno::EINVAL)
                 }
-                UnixStreamState::Connecting(_) => Err(Errno::EISCONN),
-                UnixStreamState::Connected(_) => Err(Errno::EISCONN),
+                UnixStreamState::Connecting(_) | UnixStreamState::Connected(_) => {
+                    Err(Errno::EISCONN)
+                }
             }
         })
     }
@@ -2138,8 +2141,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
                     listen.listen(backlog);
                     Ok(())
                 }
-                UnixStreamState::Connecting(_) => Err(Errno::EISCONN),
-                UnixStreamState::Connected(_) => Err(Errno::EISCONN),
+                UnixStreamState::Connecting(_) | UnixStreamState::Connected(_) => {
+                    Err(Errno::EISCONN)
+                }
             };
             (state, ret)
         })
@@ -2279,14 +2283,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 
     /// `ENOENT` when `addr` is a filesystem path with nothing at it, else `ECONNREFUSED`.
     fn refused_or_missing(task: &Task<Platform, FS>, addr: &UnixSocketAddr) -> Errno {
-        if let UnixSocketAddr::Path(path) = addr {
-            if let Err(litebox::fs::errors::FileStatusError::PathError(
+        if let UnixSocketAddr::Path(path) = addr
+            && let Err(litebox::fs::errors::FileStatusError::PathError(
                 litebox::fs::errors::PathError::NoSuchFileOrDirectory
                 | litebox::fs::errors::PathError::MissingComponent,
             )) = task.files.borrow().fs.symlink_metadata(path.as_str())
-            {
-                return Errno::ENOENT;
-            }
+        {
+            return Errno::ENOENT;
         }
         Errno::ECONNREFUSED
     }
@@ -2310,16 +2313,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             return Err(Errno::ECONNREFUSED);
         };
         let (kind, key_bytes) = presence_kind_and_bytes(&key);
+        // A guest pid is never negative, so the sign-losing cast is the pid itself.
+        #[allow(clippy::cast_sign_loss)]
         let self_pid = task.pid.get() as u32;
         // Any advertised listener, this process's own included: a listener carried into a
         // cross-process fork child is advertised under the child's pid but is not in its local
         // address table, and takes this connect from the shared queue.
-        match task.global.unix_addr_presence.lookup(kind, key_bytes) {
-            Some(_) => {}
-            None => {
-                log_cross_process_presence_miss(task, &key);
-                return Err(Errno::ECONNREFUSED);
-            }
+        if task
+            .global
+            .unix_addr_presence
+            .lookup(kind, key_bytes)
+            .is_none()
+        {
+            log_cross_process_presence_miss(task, &key);
+            return Err(Errno::ECONNREFUSED);
         }
         let client_cred = task.peer_cred();
         let Some(request_idx) =
@@ -2521,6 +2528,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         }
     }
 
+    // The Linux `sendto(2)` argument list is the reason for the count, not a seam to split.
+    #[allow(clippy::too_many_arguments)]
     fn sendto(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -2538,8 +2547,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             fd_specs,
         });
         // Owned, so the connection's own state lock is NOT held across the park below.
-        let wake =
-            self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()));
+        let wake = self
+            .with_state_ref(|state| state.connected().and_then(UnixConnectedStream::shared_wake));
         let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
@@ -2593,8 +2602,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     ) -> Result<(usize, AnyDupFds<Platform, FS>), Errno> {
         // Owned, so the connection's own state lock is NOT held across the park below (the peer's
         // write needs that lock, and holding it here would deadlock the very wake we wait for).
-        let wake =
-            self.with_state_ref(|state| state.connected().and_then(|conn| conn.shared_wake()));
+        let wake = self
+            .with_state_ref(|state| state.connected().and_then(UnixConnectedStream::shared_wake));
         let res = wait_on_events_polling_woken(
             &cx.with_timeout(timeout),
             is_nonblocking,
@@ -2942,6 +2951,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
     /// (which creates the name) and by a carried datagram's rebuild (which only re-opens it).
     fn attach(&mut self, task: &Task<Platform, FS>, bound_addr: UnixBoundSocketAddr<FS>) {
         let key = bound_addr.to_key();
+        // A guest pid is never negative, so the sign-losing cast is the pid itself.
+        #[allow(clippy::cast_sign_loss)]
         let owner_pid = task.pid.get() as u32;
         let (presence_kind, presence_bytes) = presence_kind_and_bytes(&key);
         task.global
@@ -2977,7 +2988,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
             if let Some((connected_send_channel, _)) = &self.connected_send_channel {
                 connected_send_channel.shutdown();
             }
-            if let Some(view) = self.slot.as_ref().and_then(|carried| carried.view()) {
+            if let Some(view) = self.slot.as_ref().and_then(DatagramSlot::view) {
                 let (_, write_ring) = view.rings();
                 if !write_ring.is_shutdown() {
                     write_ring.shutdown();
@@ -3201,7 +3212,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         let need = bytes + 4 * messages;
         let me = global.platform.current_host_pid();
         let existing = link.slot.load(Ordering::Acquire);
-        let peer_shutdown = recv.map_or(false, |channel| channel.is_peer_shutdown());
+        let peer_shutdown = recv.is_some_and(ReadEnd::is_peer_shutdown);
         let slot = if existing == u32::MAX {
             if need > SHARED_UNIX_CONN_BUF {
                 return Err(
@@ -3312,6 +3323,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         Ok(())
     }
 
+    // The Linux `recvfrom(2)` argument list is the reason for the count, not a seam to split.
+    #[allow(clippy::too_many_arguments)]
     fn recvfrom(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -3344,7 +3357,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
                         sender_cred.as_deref_mut(),
                     );
                 }
-                if let Some(view) = guard.slot.as_ref().and_then(|carried| carried.view()) {
+                if let Some(view) = guard.slot.as_ref().and_then(DatagramSlot::view) {
                     if guard.read_shutdown {
                         return Err(TryOpError::Other(Errno::ESHUTDOWN));
                     }
@@ -3413,8 +3426,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             inner
                 .slot
                 .as_ref()
-                .map(|carried| carried.link.slot.load(Ordering::Acquire) != u32::MAX)
-                .unwrap_or(false)
+                .is_some_and(|carried| carried.link.slot.load(Ordering::Acquire) != u32::MAX)
         };
         if addr.is_none() && promoted {
             return self.sendto_slot(task, timeout, buf, is_nonblocking);
@@ -3474,7 +3486,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
             },
             || {
                 let inner = self.inner.read();
-                let Some(view) = inner.slot.as_ref().and_then(|carried| carried.view()) else {
+                let Some(view) = inner.slot.as_ref().and_then(DatagramSlot::view) else {
                     return Err(TryOpError::Other(Errno::ENOTCONN));
                 };
                 if inner.write_shutdown {
@@ -3526,7 +3538,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         let inner = self.inner.read();
         let recv_shutdown = inner.read_shutdown;
         let send_shutdown = inner.write_shutdown;
-        if let Some(view) = inner.slot.as_ref().and_then(|carried| carried.view()) {
+        if let Some(view) = inner.slot.as_ref().and_then(DatagramSlot::view) {
             let mut events = view.events(recv_shutdown);
             if let Some(recv_channel) = &inner.recv_channel
                 && !recv_channel.is_empty()
@@ -3781,22 +3793,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| match state {
-                UnixStreamState::Connected(conn) => Some(match conn.shared_view() {
+                UnixStreamState::Connected(conn) => Some(if let Some(view) = conn.shared_view() {
                     // The peer that last SENT, not the one that connected.
-                    Some(view) => view
-                        .slot_ref()
+                    view.slot_ref()
                         .last_writer(!view.is_client)
-                        .unwrap_or(conn.peer_cred),
-                    None => {
-                        let pid = conn.recv_cred[0].load(Ordering::Relaxed);
-                        if pid == 0 {
-                            conn.peer_cred
-                        } else {
-                            Ucred {
-                                pid: pid as _,
-                                uid: conn.recv_cred[1].load(Ordering::Relaxed),
-                                gid: conn.recv_cred[2].load(Ordering::Relaxed),
-                            }
+                        .unwrap_or(conn.peer_cred)
+                } else {
+                    let pid = conn.recv_cred[0].load(Ordering::Relaxed);
+                    if pid == 0 {
+                        conn.peer_cred
+                    } else {
+                        Ucred {
+                            pid: pid as _,
+                            uid: conn.recv_cred[1].load(Ordering::Relaxed),
+                            gid: conn.recv_cred[2].load(Ordering::Relaxed),
                         }
                     }
                 }),
@@ -4089,8 +4099,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 | SocketOption::BROADCAST => {
                     unreachable!()
                 }
-                // Unix sockets don't track async errors
-                SocketOption::ERROR => 0,
+                // Unix sockets don't track async errors; `SO_PROTOCOL` (below) is 0 too.
+                SocketOption::ERROR
+                | SocketOption::PROTOCOL
+                | SocketOption::PRIORITY
+                | SocketOption::REUSEPORT => 0,
                 // `SO_DOMAIN` is the family `socket(2)` was called with, which is `AF_UNIX` for
                 // every socket here. `SO_PROTOCOL` is 0 because a unix socket has no protocol --
                 // that is Linux's own value (`sk->sk_protocol` stays `IPPROTO_IP`), not a
@@ -4099,7 +4112,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 // raising `OSError(92, 'Protocol not available')` made every carried unix
                 // socket unusable.
                 SocketOption::DOMAIN => AddressFamily::UNIX as u32,
-                SocketOption::PROTOCOL => 0,
                 SocketOption::TYPE => match &self.inner {
                     UnixSocketInner::Stream(stream) if stream.preserve_boundaries => {
                         SockType::SeqPacket as u32
@@ -4109,7 +4121,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 },
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.trunc(),
                 SocketOption::PASSCRED => u32::from(self.options.lock().passcred),
-                SocketOption::PRIORITY | SocketOption::REUSEPORT => 0,
                 SocketOption::RCVLOWAT => {
                     u32::try_from(self.options.lock().recv_lowat()).unwrap_or(u32::MAX)
                 }
@@ -4307,6 +4318,8 @@ impl SharedUnixAddrPresenceTable {
                 for (i, b) in key.iter().enumerate() {
                     slot.bytes[i].store(*b, Ordering::Relaxed);
                 }
+                // `key.len()` is checked against `UNIX_ADDR_KEY_MAX` on entry to `insert`.
+                #[allow(clippy::cast_possible_truncation)]
                 slot.len.store(key.len() as u32, Ordering::Relaxed);
                 slot.kind.store(kind, Ordering::Relaxed);
                 slot.owner_pid.store(owner_pid, Ordering::Relaxed);
@@ -4373,6 +4386,8 @@ pub(crate) fn presence_kind_and_bytes(key: &UnixSocketAddrKey) -> (u32, &[u8]) {
 /// [`SharedUnixAddrPresenceTable`]'s own doc comment explains why this table cannot yet also fix
 /// the connection itself). Always-on, not gated behind an env var: this fires only on an already-
 /// failing path, at most once per failed `connect`/`sendto`, so its cost is negligible.
+// A guest pid is never negative, so the sign-losing cast in the `owner_pid` check is the pid itself.
+#[allow(clippy::cast_sign_loss)]
 fn log_cross_process_presence_miss<Platform: ShimPlatform, FS: ShimFS>(
     task: &Task<Platform, FS>,
     key: &UnixSocketAddrKey,
@@ -4487,7 +4502,10 @@ impl<Platform: ShimPlatform> SharedWakeWord<Platform> {
         // line would be the whole log. Its presence at all is what proves the ON arm is live --
         // see the coordinator's rule that a `diag-*` count only means something when the binary
         // that ran actually contained the line.
-        if BUMPED.fetch_add(1, Ordering::Relaxed) % XWAKE_LOG_STRIDE == 0 {
+        if BUMPED
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(XWAKE_LOG_STRIDE)
+        {
             litebox_util_log::warn!(
                 bumps:% = BUMPED.load(Ordering::Relaxed), waiters:% = self.waiters.load(Ordering::Acquire);
                 "[diag-xwake] unix shared conn: bumped the cross-process wake word"
@@ -4507,10 +4525,13 @@ impl<Platform: ShimPlatform> SharedWakeWord<Platform> {
             return;
         }
         self.waiters.fetch_add(1, Ordering::AcqRel);
-        if PARKED.fetch_add(1, Ordering::Relaxed) % XWAKE_LOG_STRIDE == 0 {
+        if PARKED
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(XWAKE_LOG_STRIDE)
+        {
             litebox_util_log::warn!(
                 parks:% = PARKED.load(Ordering::Relaxed),
-                timeout_ms:% = timeout.as_millis() as u64;
+                timeout_ms:% = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
                 "[diag-xwake] unix shared conn: parked on the cross-process wake word"
             );
         }
@@ -4671,7 +4692,7 @@ where
         };
         // Snapshot BEFORE the attempt below: a bump racing it is then "already changed" to the
         // bounded wait, so it can never be lost.
-        let seen = wake.map(|w| w.wake_seq());
+        let seen = wake.map(SharedWake::wake_seq);
         // With a wake word the idle park is what the word replaces, so narrow this one to a poll:
         // `wait_on_events` still runs `try_op` and still collects an in-process event on the way
         // through, it just never sits out the whole tick waiting for something that cannot arrive.
@@ -4693,7 +4714,6 @@ where
                 if let (Some(w), Some(seen)) = (wake, seen) {
                     w.wake_wait_changed(seen, this_iter_timeout);
                 }
-                continue;
             }
             other => return other,
         }
@@ -5167,7 +5187,7 @@ struct SharedConnSlot<Platform: ShimPlatform> {
 const CONN_HOLDER_HOSTS: usize = 32;
 
 fn conn_side(is_client: bool) -> usize {
-    if is_client { 0 } else { 1 }
+    usize::from(!is_client)
 }
 
 impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
@@ -5270,7 +5290,10 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
             {
                 let n = c.load(Ordering::Acquire);
                 if n > 0 {
-                    out.push_str(&alloc::format!("{}x{} ", h.load(Ordering::Acquire), n));
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut out,
+                        format_args!("{}x{} ", h.load(Ordering::Acquire), n),
+                    );
                 }
             }
             out.push(']');
@@ -5414,7 +5437,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
         } else {
             &self.last_writer_s2c
         };
-        w[0].store(cred.pid as u32, Ordering::Relaxed);
+        w[0].store(cred.pid, Ordering::Relaxed);
         w[1].store(cred.uid, Ordering::Relaxed);
         w[2].store(cred.gid, Ordering::Relaxed);
     }
@@ -5435,7 +5458,7 @@ impl<Platform: ShimPlatform> SharedConnSlot<Platform> {
 
     fn server_cred(&self) -> Ucred {
         Ucred {
-            pid: self.server_pid.load(Ordering::Relaxed) as u32,
+            pid: self.server_pid.load(Ordering::Relaxed),
             uid: self.server_uid.load(Ordering::Relaxed),
             gid: self.server_gid.load(Ordering::Relaxed),
         }
@@ -5495,41 +5518,41 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
         // cannot place is an EMPTY pool, never a panic -- `alloc` then refuses every caller,
         // exactly as `arena_backed == false` already does, and cross-process AF_UNIX degrades
         // to the in-process path instead of the session dying here.
-        let (ptr, count, arena_backed) = match arena {
-            Some(ptr) => (
+        let (ptr, count, arena_backed) = if let Some(ptr) = arena {
+            (
                 ptr.cast::<SharedConnSlot<Platform>>(),
                 SHARED_UNIX_CONN_CAPACITY,
                 true,
-            ),
-            None => {
+            )
+        } else {
+            litebox_util_log::error!(
+                capacity:% = SHARED_UNIX_CONN_CAPACITY,
+                bytes:% = layout.size();
+                "shared unix connection table: shared kernel arena exhausted; cross-process \
+                 AF_UNIX is disabled in this process"
+            );
+            if let Some(ptr) =
+                core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+            {
+                (
+                    ptr.cast::<SharedConnSlot<Platform>>(),
+                    SHARED_UNIX_CONN_CAPACITY,
+                    false,
+                )
+            } else {
+                // Both the shared arena AND the process heap refused the pool. An empty
+                // slot slice is a valid, never-dereferenced stand-in: it hands out no
+                // index, so every caller takes its "no slot available" path.
                 litebox_util_log::error!(
-                    capacity:% = SHARED_UNIX_CONN_CAPACITY,
                     bytes:% = layout.size();
-                    "shared unix connection table: shared kernel arena exhausted; cross-process \
-                     AF_UNIX is disabled in this process"
+                    "shared unix connection table: fallback allocation failed; \
+                     cross-process AF_UNIX is disabled in this process"
                 );
-                match core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) }) {
-                    Some(ptr) => (
-                        ptr.cast::<SharedConnSlot<Platform>>(),
-                        SHARED_UNIX_CONN_CAPACITY,
-                        false,
-                    ),
-                    None => {
-                        // Both the shared arena AND the process heap refused the pool. An empty
-                        // slot slice is a valid, never-dereferenced stand-in: it hands out no
-                        // index, so every caller takes its "no slot available" path.
-                        litebox_util_log::error!(
-                            bytes:% = layout.size();
-                            "shared unix connection table: fallback allocation failed; \
-                             cross-process AF_UNIX is disabled in this process"
-                        );
-                        (
-                            core::ptr::NonNull::<SharedConnSlot<Platform>>::dangling(),
-                            0,
-                            false,
-                        )
-                    }
-                }
+                (
+                    core::ptr::NonNull::<SharedConnSlot<Platform>>::dangling(),
+                    0,
+                    false,
+                )
             }
         };
         for i in 0..count {
@@ -5628,7 +5651,10 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
     /// cases with completely different fixes.
     fn log_full(&self, platform: &Platform) {
         static STRIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        if STRIDE.fetch_add(1, Ordering::Relaxed) % Self::FULL_LOG_STRIDE != 0 {
+        if !STRIDE
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(Self::FULL_LOG_STRIDE)
+        {
             return;
         }
         let mut occupied = 0usize;
@@ -5730,14 +5756,14 @@ impl<Platform: ShimPlatform> SharedUnixConnTable<Platform> {
                 slot.client_to_server.reset();
                 slot.server_to_client.reset();
                 slot.reset_holders();
-                slot.client_pid
-                    .store(client_cred.pid as u32, Ordering::Relaxed);
+                slot.client_pid.store(client_cred.pid, Ordering::Relaxed);
                 slot.client_uid.store(client_cred.uid, Ordering::Relaxed);
                 slot.client_gid.store(client_cred.gid, Ordering::Relaxed);
-                slot.server_pid
-                    .store(server_cred.pid as u32, Ordering::Relaxed);
+                slot.server_pid.store(server_cred.pid, Ordering::Relaxed);
                 slot.server_uid.store(server_cred.uid, Ordering::Relaxed);
                 slot.server_gid.store(server_cred.gid, Ordering::Relaxed);
+                // `i` indexes `SHARED_UNIX_CONN_CAPACITY` slots, far below `u32::MAX`.
+                #[allow(clippy::cast_possible_truncation)]
                 return Some(i as u32);
             }
         }
@@ -5882,10 +5908,11 @@ impl SharedUnixConnectQueue {
                 for (j, b) in key.iter().enumerate() {
                     req.bytes[j].store(*b, Ordering::Relaxed);
                 }
+                // `key.len()` is checked against `UNIX_ADDR_KEY_MAX` on entry to `post`.
+                #[allow(clippy::cast_possible_truncation)]
                 req.len.store(key.len() as u32, Ordering::Relaxed);
                 req.kind.store(kind, Ordering::Relaxed);
-                req.client_pid
-                    .store(client_cred.pid as u32, Ordering::Relaxed);
+                req.client_pid.store(client_cred.pid, Ordering::Relaxed);
                 req.client_uid.store(client_cred.uid, Ordering::Relaxed);
                 req.client_gid.store(client_cred.gid, Ordering::Relaxed);
                 req.conn_slot.store(u32::MAX, Ordering::Relaxed);
@@ -5905,16 +5932,19 @@ impl SharedUnixConnectQueue {
     /// queue check was correct but functionally dead code, because nothing ever told the
     /// listener's `poll()` loop a cross-process connection was waiting, so it never got called.
     fn has_pending(&self, kind: u32, key: &[u8]) -> bool {
-        if key.len() > UNIX_ADDR_KEY_MAX {
-            return false;
-        }
         // DIAGNOSTIC (2026-09-18, twenty-fourth pass): throttled dump of the whole queue's real
         // state every ~6s (400 calls * the ~15ms bounded-repoll interval this is exclusively
         // called from) alongside the specific (kind, key) THIS check is looking for -- settles
         // live whether the livelock is "queue genuinely empty, nobody is posting" vs "queue HAS
         // pending entries but none match this listener's own key" (timing vs address-mismatch).
         static DIAG_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-        if DIAG_COUNTER.fetch_add(1, Ordering::Relaxed) % 400 == 0 {
+        if key.len() > UNIX_ADDR_KEY_MAX {
+            return false;
+        }
+        if DIAG_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(400)
+        {
             let snapshot: alloc::vec::Vec<_> = self
                 .requests
                 .iter()
@@ -5964,7 +5994,7 @@ impl SharedUnixConnectQueue {
                     .is_ok()
             {
                 let cred = Ucred {
-                    pid: req.client_pid.load(Ordering::Relaxed) as u32,
+                    pid: req.client_pid.load(Ordering::Relaxed),
                     uid: req.client_uid.load(Ordering::Relaxed),
                     gid: req.client_gid.load(Ordering::Relaxed),
                 };
@@ -6109,10 +6139,11 @@ impl SharedUnixConnectQueue {
 
 fn encode_unix_addr(addr: &UnixSocketAddr) -> String {
     let hex = |bytes: &[u8]| {
-        bytes
-            .iter()
-            .map(|b| alloc::format!("{b:02x}"))
-            .collect::<String>()
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{b:02x}"));
+        }
+        out
     };
     match addr {
         UnixSocketAddr::Unnamed => String::from("u"),
@@ -6197,8 +6228,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
                 // has beyond the two shutdown bits, and both survive the encode (Linux would hand
                 // over a dup sharing the same bound socket; litebox rebuilds one bound to the same
                 // name, which is the same approximation a carried listener `L` already makes).
-                UnixStreamState::Init(_) => Ok(()),
-                UnixStreamState::Listen(_) | UnixStreamState::Connected(_) => Ok(()),
+                UnixStreamState::Init(_)
+                | UnixStreamState::Listen(_)
+                | UnixStreamState::Connected(_) => Ok(()),
                 UnixStreamState::Connecting(_) => Err("unix-socket(connect-in-progress)"),
             }),
             // A bound-or-connected datagram carries by promoting its pair onto a shared,
@@ -6525,10 +6557,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
             // A carried bound-or-connected datagram: one end of the slot the parent promoted its
             // pair onto, plus the name the parent had bound, re-opened here rather than created --
             // the only way the child's copy still exchanges datagrams with the end its parent kept.
-            let Some(datagram) = UnixDatagram::<Platform, FS>::from_fork_spec_g(task, &mut fields)
-            else {
-                return None;
-            };
+            let datagram = UnixDatagram::<Platform, FS>::from_fork_spec_g(task, &mut fields)?;
             UnixSocketInner::Datagram(datagram)
         } else {
             let seq = fields.next()? == "1";

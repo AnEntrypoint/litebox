@@ -75,6 +75,8 @@ fn event_record(wd: i32, mask: u32, cookie: u32, name: Option<&str>) -> Vec<u8> 
     out.extend_from_slice(&wd.to_ne_bytes());
     out.extend_from_slice(&mask.to_ne_bytes());
     out.extend_from_slice(&cookie.to_ne_bytes());
+    // `name_len` is one directory entry's name plus padding, far below `u32::MAX` (Linux caps names at 255 bytes).
+    #[allow(clippy::cast_possible_truncation)]
     out.extend_from_slice(&(name_len as u32).to_ne_bytes());
     if let Some(name) = name {
         out.extend_from_slice(name.as_bytes());

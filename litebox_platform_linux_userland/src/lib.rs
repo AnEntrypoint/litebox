@@ -243,9 +243,15 @@ impl LinuxUserland {
             };
             // SAFETY: clock_gettime writes one timespec through a valid pointer.
             unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "CLOCK_REALTIME nanoseconds are always in 0..1e9"
+            )]
+            let nsec = ts.tv_nsec as u32;
             litebox::fs::Timestamp {
                 sec: ts.tv_sec,
-                nsec: ts.tv_nsec as u32,
+                nsec,
             }
         });
         litebox::fs::ident::set_thread_id_fn(cached_host_tid);
@@ -1958,6 +1964,10 @@ fn thread_start(
 pub struct ThreadHandle(std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>);
 
 /// The calling thread's host `(pid, tid)`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "gettid returns a pid_t, which always fits in i32"
+)]
 fn host_thread_ids() -> (i32, i32) {
     // SAFETY: getpid/gettid take no arguments and cannot fail.
     unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid) as i32) }
@@ -2021,8 +2031,9 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         HOST_TID.with(|t| t.set(0));
         if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
             // SAFETY: getpid/gettid take no arguments and cannot fail.
-            let (host_pid, host_tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
-            eprintln!("[diag-hostpid] host_pid={host_pid} host_tid={host_tid} guest_pid={pid}");
+            let (host_pid, host_thread) =
+                unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
+            eprintln!("[diag-hostpid] host_pid={host_pid} host_tid={host_thread} guest_pid={pid}");
         }
     }
 
@@ -2326,18 +2337,17 @@ impl litebox::platform::SharedKernelStateProvider for LinuxUserland {
         &self,
         layout: core::alloc::Layout,
     ) -> Option<core::ptr::NonNull<u8>> {
-        let addr = match take_recycled_arena_block(layout) {
-            Some(block) => block.addr,
-            None => {
-                // SAFETY: `layout` is non-zero-sized by this method's own contract, as in the
-                // default implementation. Zeroed, not merely allocated, so a recycled block and a
-                // fresh one are indistinguishable to a caller.
-                let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
-                if ptr.is_null() {
-                    return None;
-                }
-                ptr as usize
+        let addr = if let Some(block) = take_recycled_arena_block(layout) {
+            block.addr
+        } else {
+            // SAFETY: `layout` is non-zero-sized by this method's own contract, as in the
+            // default implementation. Zeroed, not merely allocated, so a recycled block and a
+            // fresh one are indistinguishable to a caller.
+            let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                return None;
             }
+            ptr as usize
         };
         let _ = PENDING_ARENA_BLOCKS.try_with(|cell| {
             cell.borrow_mut().push(ArenaBlock { addr, layout });
@@ -2462,13 +2472,13 @@ impl RawMutex {
             Err(e) => {
                 // Diagnostics for an unexpected errno: re-issue variations to see what the kernel
                 // (or the seccomp filter) objects to.
-                let addr = &self.inner as *const AtomicU32 as usize;
+                let addr = (&raw const self.inner) as usize;
                 let probe = |op: usize, ts: usize| -> isize {
                     // SAFETY: probes the same live futex word; a zero timeout pointer means none.
                     match unsafe {
                         syscalls::syscall6(syscalls::Sysno::futex, addr, op, val as usize, ts, 0, 0)
                     } {
-                        Ok(v) => v as isize,
+                        Ok(v) => v.cast_signed(),
                         Err(e) => -(e.into_raw() as isize),
                     }
                 };
@@ -2633,13 +2643,21 @@ impl litebox::platform::TimeProvider for LinuxUserland {
     }
 
     fn cpu_time(&self) -> Option<(core::time::Duration, core::time::Duration)> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "CPU-time clocks never report negative seconds or nanoseconds"
+        )]
         fn read(id: libc::clockid_t) -> Option<core::time::Duration> {
             let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
             if unsafe { libc::clock_gettime(id, t.as_mut_ptr()) } != 0 {
                 return None;
             }
             let t = unsafe { t.assume_init() };
-            Some(core::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+            Some(core::time::Duration::new(
+                t.tv_sec.cast_unsigned(),
+                t.tv_nsec as u32,
+            ))
         }
         // The guest runs on this host process's own threads, so the host process's CPU time is
         // the guest's, up to the other guest processes sharing this host process.
@@ -2912,6 +2930,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 0,
             )
         };
+        #[allow(
+            clippy::match_same_arms,
+            reason = "ENOMEM is spelled out next to the other errno mappings; the catch-all arm is the same resource refusal"
+        )]
         let ptr = r.map_err(|err| match err {
             syscalls::Errno::ENOMEM => litebox::platform::page_mgmt::AllocationError::OutOfMemory,
             syscalls::Errno::EEXIST => {
@@ -3107,6 +3129,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             return Ok(h);
         }
         // FNV-1a; 0 is reserved for "anonymous".
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "FNV offset basis: the hash key is intentionally narrowed to usize on 32-bit targets"
+        )]
         let mut key: usize = 0xcbf2_9ce4_8422_2325_u64 as usize;
         for b in name.bytes() {
             key = (key ^ usize::from(b)).wrapping_mul(0x0100_0000_01b3);
@@ -3449,6 +3475,11 @@ fn native_fork_waitpid(
     const MARKER: u32 = 0xC0DE_0000;
     const SIGNAL_FLAG: u32 = 0x0000_8000;
     let mut status: libc::c_int = 0;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "a native-fork child handle holds its host pid_t widened to usize"
+    )]
     let r = unsafe { libc::waitpid(handle.0 as libc::pid_t, &raw mut status, options) };
     if r <= 0 {
         // `0` = WNOHANG-not-yet; `-1` = EINTR (retry) or ECHILD (someone else reaped it: report
@@ -3459,9 +3490,9 @@ fn native_fork_waitpid(
         return None;
     }
     Some(if libc::WIFEXITED(status) {
-        MARKER | (libc::WEXITSTATUS(status) as u32 & 0xff)
+        MARKER | (libc::WEXITSTATUS(status).cast_unsigned() & 0xff)
     } else {
-        MARKER | SIGNAL_FLAG | (libc::WTERMSIG(status) as u32 & 0xff)
+        MARKER | SIGNAL_FLAG | (libc::WTERMSIG(status).cast_unsigned() & 0xff)
     })
 }
 
@@ -3530,6 +3561,10 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
     ) -> bool {
         // SAFETY: zeroed siginfo is a valid out-parameter for waitid.
         let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a native-fork child handle holds its host pid_t widened to usize"
+        )]
         let r = unsafe {
             libc::waitid(
                 libc::P_PID,
@@ -3587,6 +3622,10 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
         std::thread::spawn(move || {
             shared_heap::mark_shared_thread(true);
             let _unshare = litebox::utils::defer(|| shared_heap::mark_shared_thread(false));
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a native-fork child handle holds its host pid_t widened to usize"
+            )]
             let pid = handle.0 as libc::id_t;
             let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
             loop {
@@ -3606,7 +3645,7 @@ impl litebox::platform::ForkChildVerificationProvider for LinuxUserland {
                     return;
                 }
             }
-            let code = unsafe { info.si_status() } as u32 & 0xff;
+            let code = unsafe { info.si_status() }.cast_unsigned() & 0xff;
             let marker = 0xC0DE_0000_u32;
             on_exit(if info.si_code == libc::CLD_EXITED {
                 marker | code
@@ -3664,10 +3703,10 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
             .spawn(move || {
                 loop {
                     std::thread::sleep(interval);
+                    #[allow(clippy::cast_possible_truncation, reason = "milliseconds since the epoch fit in u64 for hundreds of millions of years")]
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+                        .map_or(0, |d| d.as_millis() as u64);
                     tick(now);
                 }
             });
@@ -4298,7 +4337,8 @@ static DIAG_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "raw register-width bit-pattern reinterpretation (u64 -> isize on aarch64's SIGSYS path), not a semantically-bounded numeric conversion"
+    clippy::cast_sign_loss,
+    reason = "raw register-width bit-pattern reinterpretation (u64 -> isize on aarch64's SIGSYS path); the diagnostic digits come from a small non-negative signal number, not a semantically-bounded numeric conversion"
 )]
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -4309,7 +4349,7 @@ unsafe extern "C" fn exception_signal_handler(
     // which instruction, touching which address) on stderr. Async-signal-safe: no allocation.
     #[cfg(target_arch = "x86_64")]
     if DIAG_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
-        let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let rip = context.uc_mcontext.gregs[libc::REG_RIP as usize].reinterpret_as_unsigned();
         let addr = unsafe { info.si_addr() } as u64;
         // THIS THREAD'S FS BASE AT FAULT TIME, which is the whole point of this diag: the kernel
         // does not touch FSBASE when it delivers a signal, so this is exactly the `%fs` the guest
@@ -4355,7 +4395,10 @@ unsafe extern "C" fn exception_signal_handler(
         hex(addr, &mut h);
         put(&h);
         put(b" pid=");
-        let mut pid = GUEST_PID.load(core::sync::atomic::Ordering::Relaxed).max(0) as u32;
+        let mut pid = GUEST_PID
+            .load(core::sync::atomic::Ordering::Relaxed)
+            .max(0)
+            .cast_unsigned();
         let mut digits = [0u8; 10];
         let mut nd = 0;
         loop {
@@ -4376,10 +4419,10 @@ unsafe extern "C" fn exception_signal_handler(
         unsafe { libc::write(2, buf.as_ptr().cast(), n) };
         // Frame-pointer walk (Chromium and most distro binaries keep frame pointers): the
         // return addresses name the callers, which is usually enough to identify the site.
-        let rsp = context.uc_mcontext.gregs[libc::REG_RSP as usize] as u64;
-        let mut rbp = context.uc_mcontext.gregs[libc::REG_RBP as usize] as u64;
+        let rsp = context.uc_mcontext.gregs[libc::REG_RSP as usize].reinterpret_as_unsigned();
+        let mut rbp = context.uc_mcontext.gregs[libc::REG_RBP as usize].reinterpret_as_unsigned();
         for _ in 0..14 {
-            if rbp % 8 != 0 || rbp < rsp || rbp > rsp + (1 << 22) {
+            if !rbp.is_multiple_of(8) || rbp < rsp || rbp > rsp + (1 << 22) {
                 break;
             }
             let ret = unsafe { *((rbp + 8) as *const u64) };
@@ -4562,7 +4605,9 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "x86_64")]
     {
         let sigctx = &context.uc_mcontext;
-        let rip = sigctx.gregs[libc::REG_RIP as usize] as usize;
+        let rip: usize = sigctx.gregs[libc::REG_RIP as usize]
+            .reinterpret_as_unsigned()
+            .trunc();
         // litebox emits `ICEBP;HLT` (F1 F4) at unpatched syscall sites when a
         // direct JMP trampoline could not be placed (e.g. the dynamic loader /
         // shared libs the guest mmaps at runtime). icebp is trap-class, so the
@@ -4690,8 +4735,8 @@ unsafe fn next_signal_handler(
                         buf.len(),
                         c"litebox host fault: sig=%d ip=0x%llx sp=0x%llx addr=0x%llx\n".as_ptr(),
                         signum,
-                        ip as libc::c_ulonglong,
-                        sp as libc::c_ulonglong,
+                        ip.reinterpret_as_unsigned(),
+                        sp.reinterpret_as_unsigned(),
                         info.si_addr() as libc::c_ulonglong,
                     );
                     libc::write(2, buf.as_ptr().cast(), usize::try_from(n).unwrap_or(0));
@@ -5104,6 +5149,11 @@ fn cached_host_tid() -> usize {
             return cached;
         }
         // SAFETY: gettid takes no arguments and cannot fail.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "gettid is a positive pid_t, always in range for usize"
+        )]
         let tid = (unsafe { libc::syscall(libc::SYS_gettid) }) as usize;
         t.set(tid);
         tid

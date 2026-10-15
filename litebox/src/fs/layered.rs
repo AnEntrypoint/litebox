@@ -345,14 +345,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             // Two threads can genuinely race to migrate the same path and both reach this insert;
             // `node_info_lookup` is a cache, not the source of truth for identity, so never panic
             // here -- gm mutable `layered-node-info-insert-race`.
-            if let Some(old_id) = old {
-                if old_id != layered_id {
-                    litebox_util_log::warn!(
-                        old_id:? = old_id, new_id:? = layered_id;
-                        "migrate_file_up: node_info_lookup insert raced with a different \
-                         layered_id for the same upper node-info key -- keeping the newer entry"
-                    );
-                }
+            if let Some(old_id) = old
+                && old_id != layered_id
+            {
+                litebox_util_log::warn!(
+                    old_id:? = old_id, new_id:? = layered_id;
+                    "migrate_file_up: node_info_lookup insert raced with a different \
+                     layered_id for the same upper node-info key -- keeping the newer entry"
+                );
             }
         }
         self.upper.close(&upper_fd.unwrap()).unwrap();
@@ -412,7 +412,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         unreachable!()
                     };
                     self.upper.close(&upper_fd).ok();
-                    continue;
                 }
                 3 => {
                     // Compare-and-skip rather than blindly swapping: a concurrent `close`/`dup`
@@ -471,10 +470,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // is stale by construction; leaving it made a just-migrated path keep serving
         // pre-migration lower-layer content to every future `open()`, across processes -- gm
         // mutable `layered-stale-lower-cache-after-migration`.
-        if let Some(existing) = root_entries.get(path) {
-            if matches!(**existing, EntryX::Lower { .. }) {
-                root_entries.remove(path);
-            }
+        if let Some(existing) = root_entries.get(path)
+            && matches!(**existing, EntryX::Lower { .. })
+        {
+            root_entries.remove(path);
         }
 
         Ok(())
@@ -589,6 +588,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
 /// drew inode 7 loaded correctly). That is what killed chromium's GPU process: it dlopens its GL
 /// stack inside a zygote fork child, stored NULL for every GL entry point, and died on a call through
 /// a NULL pointer -- `Exception(14) rip=0x0 cr2=0x0 error_code=0x14`.
+// The final `u64 -> usize` narrows only on 32-bit hosts; litebox runs on 64-bit hosts only.
+#[allow(clippy::cast_possible_truncation)]
 fn layered_ino(dev: usize, ino: usize, rdev: Option<core::num::NonZeroUsize>) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -599,7 +600,7 @@ fn layered_ino(dev: usize, ino: usize, rdev: Option<core::num::NonZeroUsize>) ->
         rdev.map_or(0, core::num::NonZeroUsize::get) as u64,
     ] {
         for byte in word.to_le_bytes() {
-            hash ^= byte as u64;
+            hash ^= u64::from(byte);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
     }
@@ -843,10 +844,10 @@ impl<
         // re-queried on the lower layer under the symlink's own name, which only exists on the
         // upper layer. `O_NOFOLLOW` skips the retry entirely -- gm mutable
         // `layered-open-upper-symlink-resolve-retry`.
-        if !flags.contains(OFlags::NOFOLLOW) {
-            if let Some(resolved) = self.resolve_symlink_chain(path.as_str())? {
-                return self.open(resolved, flags, mode);
-            }
+        if !flags.contains(OFlags::NOFOLLOW)
+            && let Some(resolved) = self.resolve_symlink_chain(path.as_str())?
+        {
+            return self.open(resolved, flags, mode);
         }
         // We must check the lower level, creating an entry if needed
         let original_flags = flags;
@@ -1185,7 +1186,7 @@ impl<
             Ok(()) => {}
             // Not `NotForWriting`: that is this function's "migrate through an outer fs's upper
             // instead" signal, and an outer fs retrying would fail reading the same lower copy.
-            Err(MigrationError::NoReadPerms) => return Err(WriteError::Io),
+            Err(MigrationError::NoReadPerms | MigrationError::Io) => return Err(WriteError::Io),
             // A device or other special node cannot be copied up. Its lower fd is CACHED per path
             // with the flags of whoever opened it first, so a writer arriving after a read-only
             // opener (bash opens `/dev/null` read-only for a background job's stdin, then again
@@ -1203,7 +1204,6 @@ impl<
                 let _ = self.lower.close(&lower_fd);
                 return written;
             }
-            Err(MigrationError::Io) => return Err(WriteError::Io),
             Err(MigrationError::PathError(_e)) => unreachable!(),
             // `NotForWriting` is imprecise but is exactly the signal an outer fs composing this one
             // as its `lower` matches on to migrate through its own upper instead -- gm mutable
@@ -1569,17 +1569,17 @@ impl<
                         FileStatusError::PathError(p) => UnlinkError::PathError(p),
                         FileStatusError::ClosedFd => unreachable!(),
                     })? {
-                        FileType::RegularFile | FileType::Symlink | FileType::Fifo => {
+                        // A device node is unlinkable exactly like a regular file: `rm /dev/null`
+                        // succeeds on Linux, and the tombstone reproduces that without touching the
+                        // synthetic `/dev` mount -- gm mutable `layered-unlink-chardev-tombstone`.
+                        FileType::RegularFile
+                        | FileType::Symlink
+                        | FileType::Fifo
+                        | FileType::CharacterDevice => {
                             // fallthrough
                         }
                         FileType::Directory => {
                             return Err(UnlinkError::IsADirectory);
-                        }
-                        // A device node is unlinkable exactly like a regular file: `rm /dev/null`
-                        // succeeds on Linux, and the tombstone reproduces that without touching the
-                        // synthetic `/dev` mount -- gm mutable `layered-unlink-chardev-tombstone`.
-                        FileType::CharacterDevice => {
-                            // fallthrough
                         }
                     }
                 }

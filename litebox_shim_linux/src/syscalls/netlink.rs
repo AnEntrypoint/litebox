@@ -35,6 +35,9 @@ impl FdEnabledSubsystemEntry for NetlinkSocket {}
 /// distinct from any real PID, is sufficient to give each auto-bound socket a unique identity).
 static NEXT_AUTO_PID: AtomicU32 = AtomicU32::new(1);
 
+/// Weak observers of a socket's readiness, each with the events it asked for.
+type ObserverList = spin::Mutex<alloc::vec::Vec<(alloc::sync::Weak<dyn Observer<Events>>, Events)>>;
+
 pub(crate) struct NetlinkSocket {
     status: core::sync::atomic::AtomicU32,
     /// `nl_pid` as bound by the guest, or 0 if never explicitly bound (matching real Linux's
@@ -45,7 +48,7 @@ pub(crate) struct NetlinkSocket {
     protocol: u8,
     /// Replies the (synthetic) kernel generated for requests sent on this socket, one datagram each.
     rx: spin::Mutex<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>,
-    observers: spin::Mutex<alloc::vec::Vec<(alloc::sync::Weak<dyn Observer<Events>>, Events)>>,
+    observers: ObserverList,
 }
 
 const NETLINK_ROUTE: u8 = 0;
@@ -78,6 +81,8 @@ impl NetlinkSocket {
     /// `bind(2)`: stores whatever `(nl_pid, nl_groups)` the guest provides. `nl_pid == 0` means
     /// "auto-assign", matching real Linux. No real validation is possible or needed -- there is
     /// no real netlink routing table this socket could conflict with.
+    // Kept fallible: the shared socket dispatch calls every bind-style op through `Result`.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn bind(&self, nl_pid: u32, nl_groups: u32) -> Result<(), Errno> {
         let assigned_pid = if nl_pid == 0 {
             NEXT_AUTO_PID.fetch_add(1, Ordering::Relaxed)
@@ -101,6 +106,8 @@ impl NetlinkSocket {
     /// `sendmsg`/`write`-family. On a `NETLINK_ROUTE` socket the synthetic kernel answers the
     /// link/address/route dump requests (the only ones this guest's fixed interface set can
     /// meaningfully serve); everything else is accepted and discarded.
+    // Kept fallible: the shared socket dispatch calls every send-style op through `Result`.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn send(&self, data: &[u8]) -> Result<usize, Errno> {
         if self.protocol == NETLINK_ROUTE {
             self.handle_route_requests(data);
@@ -118,6 +125,7 @@ impl NetlinkSocket {
         if flags & NLM_F_ACK == 0 {
             return;
         }
+        #[allow(clippy::cast_possible_truncation)] // a constant 36, far below u32::MAX
         let acknowledgement_len = (NLMSG_HEADER_BYTES + 4 + NLMSG_HEADER_BYTES) as u32;
         let mut reply = Vec::with_capacity(acknowledgement_len as usize);
         reply.extend_from_slice(&acknowledgement_len.to_le_bytes());
@@ -291,6 +299,8 @@ fn ifaces() -> [Iface; 2] {
     ]
 }
 
+// Netlink message lengths and ports are small by construction; the `as` casts are the wire format.
+#[allow(clippy::cast_possible_truncation)]
 fn push_hdr(
     out: &mut alloc::vec::Vec<u8>,
     len: usize,
@@ -308,11 +318,13 @@ fn push_hdr(
     body(out);
 }
 
+// Route attribute payloads are a few bytes each; the `as u16` is the wire length field.
+#[allow(clippy::cast_possible_truncation)]
 fn attr(b: &mut alloc::vec::Vec<u8>, ty: u16, payload: &[u8]) {
     b.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
     b.extend_from_slice(&ty.to_ne_bytes());
     b.extend_from_slice(payload);
-    while b.len() % 4 != 0 {
+    while !b.len().is_multiple_of(4) {
         b.push(0);
     }
 }
@@ -323,7 +335,7 @@ fn message(
     seq: u32,
     port: u32,
     fixed: &[u8],
-    attrs: &alloc::vec::Vec<u8>,
+    attrs: &[u8],
 ) {
     let len = 16 + fixed.len() + attrs.len();
     push_hdr(out, len, ty, NLM_F_MULTI, seq, port, |b| {
@@ -343,7 +355,7 @@ fn route_links(out: &mut alloc::vec::Vec<u8>, seq: u32, port: u32) {
         let mut fixed = alloc::vec::Vec::new();
         fixed.extend_from_slice(&[0, 0]);
         fixed.extend_from_slice(&i.ty.to_ne_bytes());
-        fixed.extend_from_slice(&(i.index as i32).to_ne_bytes());
+        fixed.extend_from_slice(&i.index.cast_signed().to_ne_bytes());
         fixed.extend_from_slice(&i.flags.to_ne_bytes());
         fixed.extend_from_slice(&0u32.to_ne_bytes());
         let mut a = alloc::vec::Vec::new();
@@ -371,11 +383,13 @@ fn route_addrs(out: &mut alloc::vec::Vec<u8>, seq: u32, port: u32) {
     done(out, seq, port);
 }
 
+/// One route as `(dst_len, dst, gateway, scope, oif)`.
+type RouteSpec = (u8, [u8; 4], Option<[u8; 4]>, u8, u32);
+
 fn route_routes(out: &mut alloc::vec::Vec<u8>, seq: u32, port: u32) {
     let gw = litebox::net::GATEWAY_IP_ADDR.octets();
     let net = litebox::net::INTERFACE_IP_ADDR.octets();
-    // (dst_len, dst, gateway, scope, oif)
-    let routes: [(u8, [u8; 4], Option<[u8; 4]>, u8, u32); 2] = [
+    let routes: [RouteSpec; 2] = [
         (0, [0; 4], Some(gw), 0, 2),
         (24, [net[0], net[1], net[2], 0], None, 253, 2),
     ];
@@ -455,6 +469,6 @@ mod tests {
         let dup_fd = task
             .sys_dup(i32::try_from(raw_fd).unwrap(), None, None)
             .expect("sys_dup on netlink socket must succeed");
-        assert_ne!(dup_fd, raw_fd as u32);
+        assert_ne!(dup_fd, u32::try_from(raw_fd).unwrap());
     }
 }

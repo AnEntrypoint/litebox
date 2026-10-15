@@ -599,7 +599,7 @@ pub mod ident {
     /// Non-zero token naming the calling thread, or 0 when the platform registered no id function.
     #[must_use]
     pub fn thread_token() -> u32 {
-        current_thread().map_or(0, |t| t as u32)
+        current_thread().map_or(0, |t| u32::try_from(t).unwrap_or(0))
     }
 
     /// Whether the thread named by `token` (from [`thread_token`]) is still alive; `true` when
@@ -678,13 +678,15 @@ pub mod ident {
 
     /// The acting identity, if the shim has set one.
     #[must_use]
+    // `UserInfo` carries 16-bit ids; a larger guest id keeps the historical low-bits truncation.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get() -> Option<UserInfo> {
         if thread_is_root() {
             return Some(UserInfo::ROOT);
         }
         let user = USER.load(Ordering::Relaxed);
         let group = GROUP.load(Ordering::Relaxed);
-        (user != u32::MAX && group != u32::MAX).then(|| UserInfo {
+        (user != u32::MAX && group != u32::MAX).then_some(UserInfo {
             user: user as u16,
             group: group as u16,
         })

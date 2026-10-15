@@ -137,10 +137,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
-        let idx = match fd.x.as_usize() {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let idx = fd.x.as_usize()?;
         let Some(old) = self.entries[idx].take() else {
             // Guest-reachable, and a real run reached it (chrD91: `unreachable` at this line
             // killed a cross-process fork child's guest-execution thread). An owned, unclosed

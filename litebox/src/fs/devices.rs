@@ -211,6 +211,10 @@ pub fn devpts_slave_status(id: u32) -> FileStatus {
 /// rather than widening the general writable-layer sync to a periodic/continuous mechanism (a
 /// much larger, racier undertaking for content this table doesn't even carry).
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the FNV-1a value is an opaque identity; narrowing it to usize on 32-bit targets is intended"
+)]
 pub fn cross_process_bound_unix_socket_status(path: &str) -> FileStatus {
     // FNV-1a over the path, so two different bound paths never collide on `(dev, ino)` -- no
     // hashing crate needed for this `no_std` module.
@@ -584,12 +588,9 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
-        let device = match Device::from_name(name) {
-            Some(device) => device,
-            None => {
-                diag_raw_print_dev_open_miss(self.litebox.x.platform, name);
-                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
-            }
+        let Some(device) = Device::from_name(name) else {
+            diag_raw_print_dev_open_miss(self.litebox.x.platform, name);
+            return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
         };
 
         if flags.contains(OFlags::DIRECTORY) {
@@ -639,8 +640,8 @@ where
                 .platform
                 .read_from_stdin(buf)
                 .map_err(|e| match e {
-                    crate::platform::StdioReadError::Closed => ReadError::Io,
-                    crate::platform::StdioReadError::Io => ReadError::Io,
+                    crate::platform::StdioReadError::Closed
+                    | crate::platform::StdioReadError::Io => ReadError::Io,
                 }),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
@@ -673,14 +674,11 @@ where
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
-            Device::Null | Device::URandom | Device::Random => {
+            // /dev/zero discards writes, same as /dev/null.
+            Device::Null | Device::Zero | Device::URandom | Device::Random => {
                 // Discarded, not stirred in: a real `/dev/[u]random` write perturbs the entropy
                 // pool (without raising the entropy count), which litebox does not model.
                 // See gm mutable mut-1789043610245.
-                return Ok(buf.len());
-            }
-            Device::Zero => {
-                // /dev/zero discards writes, same as /dev/null.
                 return Ok(buf.len());
             }
             Device::Full => {
@@ -699,8 +697,9 @@ where
             .platform
             .write_to(stream, buf)
             .map_err(|e| match e {
-                crate::platform::StdioWriteError::Closed => WriteError::Io,
-                crate::platform::StdioWriteError::Io => WriteError::Io,
+                crate::platform::StdioWriteError::Closed | crate::platform::StdioWriteError::Io => {
+                    WriteError::Io
+                }
             })
     }
 

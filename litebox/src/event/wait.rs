@@ -489,7 +489,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         // A fresh call from a spinning site never loops inside one wait, so sample the entries
         // themselves: the site that dominates a stalled log is the one that spins.
         let entries = WAIT_ENTRIES.fetch_add(1, Ordering::Relaxed) + 1;
-        if entries % WAIT_ENTRY_SAMPLE_EVERY == 0 {
+        if entries.is_multiple_of(WAIT_ENTRY_SAMPLE_EVERY) {
             litebox_util_log::warn!(
                 file:% = caller.file(),
                 line = caller.line(),
@@ -528,7 +528,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
             // count threshold misses a slow one (hs2 re-parked about 60k times in 420 s), so name
             // the caller once when one wait has looped for 30 s of wall clock.
             reparks += 1;
-            if !reported && reparks % REPARK_CLOCK_CHECK_EVERY == 0 {
+            if !reported && reparks.is_multiple_of(REPARK_CLOCK_CHECK_EVERY) {
                 let looped = self
                     .waker
                     .0

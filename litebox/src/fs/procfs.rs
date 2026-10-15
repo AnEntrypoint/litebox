@@ -24,6 +24,9 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 
+/// Lists a process's open raw file descriptors as `(fd, link target)` pairs, for `/proc/self/fd`.
+type FdLister = alloc::sync::Arc<dyn Fn() -> Vec<(i32, String)> + Send + Sync>;
+
 /// Per-process data backing `/proc/self/*`, refreshed on every `execve` by whoever owns the shared
 /// [`ProcSelfTable`] this backend reads through (see [`ProcSelf::new`]).
 ///
@@ -62,7 +65,7 @@ pub struct ProcSelfInfo {
     /// reason as `maps`: the set changes with every `clone` and thread exit.
     pub tids: Option<alloc::sync::Arc<dyn Fn() -> Vec<i32> + Send + Sync>>,
     /// Lists this process's open raw file descriptors, for `/proc/self/fd`.
-    pub fds: Option<alloc::sync::Arc<dyn Fn() -> Vec<(i32, String)> + Send + Sync>>,
+    pub fds: Option<FdLister>,
     /// Renders `/proc/[pid]/statm` for the CURRENT process, or `None` when this entry describes a
     /// process whose page manager this host process cannot reach -- a `portable_snapshot` handed
     /// to a cross-process fork child, or a pid that only exists in another host process. A
@@ -239,12 +242,14 @@ fn cpu_flags() -> String {
 }
 
 fn format_cpuinfo(cpu_count: usize) -> Vec<u8> {
+    use core::fmt::Write as _;
     let flags = cpu_flags();
     let mut s = String::new();
     for i in 0..cpu_count.max(1) {
-        s.push_str(&format!(
+        let _ = write!(
+            s,
             "processor\t: {i}\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t: 158\nmodel name\t: LiteBox Virtual CPU\nstepping\t: 0\ncpu MHz\t: 2000.000\ncache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: {cpu_count}\ncore id\t: {i}\ncpu cores\t: {cpu_count}\nfpu\t: yes\nflags\t: {flags}\nbogomips\t: 4000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n"
-        ));
+        );
     }
     s.into_bytes()
 }
@@ -268,7 +273,7 @@ fn format_mounts() -> Vec<u8> {
     b"rootfs / rootfs rw 0 0\n".to_vec()
 }
 
-/// Real `/proc/filesystems`: one type per line, `nodev	` prefixed when no block device is needed.
+/// Real `/proc/filesystems`: one type per line, prefixed by `nodev` and a tab when no block device is needed.
 /// Must list only what litebox actually serves -- a missing file reads to `mount`/`libmount` and
 /// GIO's volume monitor as "this kernel supports nothing". See gm mutable `mut-1789043857688`.
 fn format_filesystems() -> Vec<u8> {
@@ -287,17 +292,16 @@ nodev	devpts
 /// honestly zero (litebox does not schedule guest threads); the `cpuN` count is the real payload
 /// `nproc` and GLib read. See gm mutable `mut-1789043865374`.
 fn format_stat_global(cpu_count: usize, boot_unix_secs: u64) -> Vec<u8> {
+    use core::fmt::Write as _;
     let mut out = String::from(
         "cpu  0 0 0 0 0 0 0 0 0 0
 ",
     );
     for cpu in 0..cpu_count {
-        out.push_str(&format!(
-            "cpu{cpu} 0 0 0 0 0 0 0 0 0 0
-"
-        ));
+        let _ = writeln!(out, "cpu{cpu} 0 0 0 0 0 0 0 0 0 0");
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "intr 0
 ctxt 0
 btime {boot_unix_secs}
@@ -305,7 +309,7 @@ processes 0
 procs_running 1
 procs_blocked 0
 "
-    ));
+    );
     out.into_bytes()
 }
 
@@ -498,6 +502,8 @@ pub struct Procfs<Platform>
 where
     Platform: RawSyncPrimitivesProvider + crate::platform::ThreadProvider + 'static,
 {
+    // Kept alive for the backend's lifetime; read through `caller_pid`.
+    #[allow(clippy::used_underscore_binding)]
     _litebox: LiteBox<Platform>,
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
@@ -522,6 +528,7 @@ where
     /// table instance passed to `/proc/self`'s own [`ProcSelf::new`] -- see gm mutable
     /// `mut-1789043963534`.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // Each field is a distinct host-provided value; one call site.
     pub fn new(
         litebox: &LiteBox<Platform>,
         allocator: InodeAllocator,
@@ -548,6 +555,7 @@ where
 
     /// The pid of the guest process whose syscall is being dispatched -- the same pid `/proc/self`
     /// resolves for this caller. `None` when the platform cannot name it.
+    #[allow(clippy::used_underscore_binding)] // `_litebox` is the keep-alive handle, read here.
     fn caller_pid(&self) -> Option<i32> {
         crate::platform::ThreadProvider::current_guest_pid(self._litebox.x.platform)
     }
@@ -609,6 +617,7 @@ where
     /// Applies a write to one of the id-map control files served as `/proc/<own-pid>/...`; see
     /// [`ProcSelf::write`], which does the same thing for the `/proc/self` spellings of the same
     /// three files.
+    #[allow(clippy::unused_self)] // Kept a method so callers keep the same receiver shape.
     fn write_id_map_file(
         &self,
         id_map: crate::fs::ident::IdMapFile,
@@ -866,14 +875,14 @@ where
                     stop_reason: WalkStopReason::StoppedAtNonDirectory,
                 });
             }
-            if let Some(pid) = parse_pid_component(component) {
-                if self.pid_resolvable(pid) {
-                    walked.push(super::backend::WalkedComponent {
-                        permissions: PermissionCheck::ByBackend,
-                    });
-                    current = ProcfsDirHandle::Pid(pid);
-                    continue;
-                }
+            if let Some(pid) = parse_pid_component(component)
+                && self.pid_resolvable(pid)
+            {
+                walked.push(super::backend::WalkedComponent {
+                    permissions: PermissionCheck::ByBackend,
+                });
+                current = ProcfsDirHandle::Pid(pid);
+                continue;
             }
             if ProcfsEntry::from_name(component).is_none() {
                 return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
@@ -916,7 +925,7 @@ where
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
         let (kind, content) = match dir {
-            ProcfsDirHandle::PidFd(_) => {
+            ProcfsDirHandle::PidFd(_) | ProcfsDirHandle::PidTask(_) => {
                 return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
             ProcfsDirHandle::Root => {
@@ -975,9 +984,6 @@ where
                     }
                 };
                 (ProcfsFileKind::Pid(pid, entry), content)
-            }
-            ProcfsDirHandle::PidTask(_) => {
-                return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
             }
         };
         Ok(Permissioned {
@@ -1161,7 +1167,7 @@ where
             // (global entries use 6, `/proc/self` uses 7).
             ProcfsFileKind::Pid(pid, entry) => NodeInfo {
                 dev: 8,
-                ino: (pid as i64).unsigned_abs() as usize * 8 + entry as usize,
+                ino: pid.unsigned_abs() as usize * 8 + entry as usize,
                 rdev: None,
             },
         };
@@ -1193,17 +1199,17 @@ where
             ProcfsDirHandle::Root => self.root_inode.clone(),
             ProcfsDirHandle::Pid(pid) => NodeInfo {
                 dev: 8,
-                ino: (pid as i64).unsigned_abs() as usize * 8 + 100,
+                ino: pid.unsigned_abs() as usize * 8 + 100,
                 rdev: None,
             },
             ProcfsDirHandle::PidTask(pid) => NodeInfo {
                 dev: 8,
-                ino: (pid as i64).unsigned_abs() as usize * 8 + 101,
+                ino: pid.unsigned_abs() as usize * 8 + 101,
                 rdev: None,
             },
             ProcfsDirHandle::PidFd(pid) => NodeInfo {
                 dev: 8,
-                ino: (pid as i64).unsigned_abs() as usize * 8 + 102,
+                ino: pid.unsigned_abs() as usize * 8 + 102,
                 rdev: None,
             },
         };
@@ -1649,11 +1655,9 @@ where
                     }
                     Some(ProcSelfDirHandle::Root)
                 }
-                ProcSelfDirHandle::Fd => None,
-                ProcSelfDirHandle::Ns => None,
                 // `fdinfo/<fd>` is always a file, never a directory: it has no subdirectory, which
                 // is what makes it usable as a `chroot` target.
-                ProcSelfDirHandle::FdInfo => None,
+                ProcSelfDirHandle::Fd | ProcSelfDirHandle::Ns | ProcSelfDirHandle::FdInfo => None,
             };
             if let Some(next) = next {
                 walked.push(super::backend::WalkedComponent {
@@ -1666,8 +1670,9 @@ where
             let exists = match current {
                 ProcSelfDirHandle::Root => ProcSelfEntry::from_name(component).is_some(),
                 ProcSelfDirHandle::Ns => matches!(component, "user" | "pid"),
-                ProcSelfDirHandle::Fd => component.parse::<i32>().is_ok(),
-                ProcSelfDirHandle::FdInfo => component.parse::<i32>().is_ok(),
+                ProcSelfDirHandle::Fd | ProcSelfDirHandle::FdInfo => {
+                    component.parse::<i32>().is_ok()
+                }
                 ProcSelfDirHandle::Task => false,
             };
             if !exists {
@@ -1775,7 +1780,7 @@ where
             // Real Linux reports the descriptor's file offset and status flags here. litebox's
             // per-fd status flags live in the descriptor table, not in this backend, so this stays
             // a well-formed stub: the file's EXISTENCE and type are what a consumer checks.
-            ProcSelfEntry::FdInfoFile => alloc::format!("pos:\t0\nflags:\t0\n").into_bytes(),
+            ProcSelfEntry::FdInfoFile => b"pos:\t0\nflags:\t0\n".to_vec(),
         };
         Ok(Permissioned {
             item: FileHandle::from_typed::<Self>(ProcSelfFileHandle { entry, content }),
@@ -1997,9 +2002,7 @@ where
             }
             // `.`, plus one for each subdirectory (`task`, `fd`, `fdinfo`, `ns`).
             ProcSelfDirHandle::Root => 5,
-            ProcSelfDirHandle::Fd => 2,
-            ProcSelfDirHandle::FdInfo => 2,
-            ProcSelfDirHandle::Ns => 2,
+            ProcSelfDirHandle::Fd | ProcSelfDirHandle::FdInfo | ProcSelfDirHandle::Ns => 2,
         };
         Ok(FileStatus {
             nlink: nlink as _,

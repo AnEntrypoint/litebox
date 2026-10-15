@@ -168,6 +168,11 @@ fn is_private() -> bool {
 /// Releases the heap lock if the calling thread holds it: only for a thread that is about to
 /// die from a panic raised inside an allocator critical section, so the panic message itself can
 /// still allocate.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "gettid returns a positive tid that fits usize"
+)]
 pub fn release_lock_if_held_by_current_thread() {
     if !is_active() {
         return;
@@ -201,6 +206,11 @@ impl SharedHeap {
     }
 
     #[cold]
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "POOL_SIZE is a small constant; the memfd fd is checked >= 0 before the cast"
+    )]
     fn init(&self) -> u8 {
         if self
             .state
@@ -300,6 +310,10 @@ impl Default for SharedHeap {
 pub static BIG_DIAG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[inline(never)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "v % 10 is always below 10, so it fits the digit byte"
+)]
 fn report_big_alloc(size: usize) {
     let mut buf = [0u8; 512];
     let mut n = 0;
@@ -338,7 +352,7 @@ fn report_big_alloc(size: usize) {
     // SAFETY: reads the frame-pointer register only.
     unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp) };
     for _ in 0..12 {
-        if rbp < 0x1000 || rbp % 8 != 0 {
+        if rbp < 0x1000 || !rbp.is_multiple_of(8) {
             break;
         }
         // SAFETY: best-effort frame-pointer walk on the calling thread's own stack.
@@ -365,6 +379,10 @@ fn put_bytes(out: &mut [u8], n: &mut usize, b: &[u8]) {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "v % 10 is always below 10, so it fits the digit byte"
+)]
 fn put_dec(mut v: usize, out: &mut [u8], n: &mut usize) {
     let mut digits = [0u8; 20];
     let mut k = 0;
@@ -387,6 +405,10 @@ fn put_dec(mut v: usize, out: &mut [u8], n: &mut usize) {
 /// holder is running, parked in the kernel, or stopped. Runs inside the allocator: it touches only
 /// stack buffers and raw syscalls.
 #[inline(never)]
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "errno values and the tkill probe result are non-negative in this path"
+)]
 fn report_lock_owner(owner: usize, me: usize) {
     // SAFETY: tkill with signal 0 only probes for the thread's existence.
     let probe = unsafe { libc::syscall(libc::SYS_tkill, owner as libc::c_long, 0) };
@@ -461,6 +483,11 @@ const HEAPLOCK_BACKOFF_NANOS: libc::c_long = 20_000;
 struct Guard<'a>(&'a Header, usize);
 
 impl<'a> Guard<'a> {
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "gettid returns a positive tid that fits usize"
+    )]
     fn lock(h: &'a Header) -> Self {
         // The lock word holds the owner's kernel thread id, so a stuck lock names its holder.
         // SAFETY: gettid has no arguments and cannot fail.
@@ -472,7 +499,7 @@ impl<'a> Guard<'a> {
             .is_err()
         {
             spins += 1;
-            if spins % 200_000 == 0 {
+            if spins.is_multiple_of(200_000) {
                 // A holder that died (killed, or crashed mid-allocation) can never release. The
                 // heap's critical sections are single pointer pushes/pops, so taking the lock
                 // over from a vanished owner leaves the free lists consistent.
@@ -496,7 +523,7 @@ impl<'a> Guard<'a> {
             // stalled run passes after a takeover, the holder had abandoned the lock.
             if spins == HEAPLOCK_STEAL_SPINS
                 // SAFETY: getenv with a NUL-terminated literal name; no allocation.
-                && !unsafe { libc::getenv(b"LITEBOX_HEAPLOCK_STEAL\0".as_ptr().cast()) }.is_null()
+                && !unsafe { libc::getenv(c"LITEBOX_HEAPLOCK_STEAL".as_ptr()) }.is_null()
             {
                 let owner = h.lock.load(Ordering::Relaxed);
                 if owner != 0 && owner != me {
@@ -515,7 +542,7 @@ impl<'a> Guard<'a> {
             if spins == 20_000_000 {
                 let owner = h.lock.load(Ordering::Relaxed);
                 // SAFETY: getenv with a NUL-terminated literal name; no allocation.
-                let diag = unsafe { libc::getenv(b"LITEBOX_DIAG_HEAPLOCK\0".as_ptr().cast()) };
+                let diag = unsafe { libc::getenv(c"LITEBOX_DIAG_HEAPLOCK".as_ptr()) };
                 if owner != 0 && owner != me && !diag.is_null() {
                     report_lock_owner(owner, me);
                 }
@@ -533,7 +560,7 @@ impl<'a> Guard<'a> {
             // not change the stall rate, so the default keeps the measured spin behaviour.
             if spins > HEAPLOCK_SPIN_BEFORE_BACKOFF
                 // SAFETY: getenv with a NUL-terminated literal name; no allocation.
-                && !unsafe { libc::getenv(b"LITEBOX_HEAPLOCK_BACKOFF\0".as_ptr().cast()) }.is_null()
+                && !unsafe { libc::getenv(c"LITEBOX_HEAPLOCK_BACKOFF".as_ptr()) }.is_null()
             {
                 // Past a short spin, sleep instead: on an oversubscribed host, waiters that keep
                 // every core busy starve the holder, which then never finishes its critical section.
@@ -543,7 +570,14 @@ impl<'a> Guard<'a> {
                     tv_nsec: HEAPLOCK_BACKOFF_NANOS,
                 };
                 // SAFETY: zero fds with a valid timespec only sleeps for it.
-                unsafe { libc::ppoll(core::ptr::null_mut(), 0, &ts, core::ptr::null()) };
+                unsafe {
+                    libc::ppoll(
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::from_ref(&ts),
+                        core::ptr::null(),
+                    )
+                };
             } else {
                 core::hint::spin_loop();
             }
@@ -574,14 +608,14 @@ unsafe impl GlobalAlloc for SharedHeap {
             report_big_alloc(size);
         }
         let h = Self::header();
-        let _g = Guard::lock(h);
+        let guard = Guard::lock(h);
         let head = h.free[class].load(Ordering::Relaxed);
         if head != 0 {
             if POISON.load(Ordering::Relaxed) && size >= 32 {
                 // SAFETY: the block is free and `size` bytes; debug-only read.
                 let s = unsafe { core::slice::from_raw_parts((head + 16) as *const u8, size - 16) };
                 if s.iter().any(|&b| b != 0xDD) {
-                    drop(_g);
+                    drop(guard);
                     panic!("shared heap: write to freed block {head:#x} (size class {size})");
                 }
             }
@@ -606,6 +640,10 @@ unsafe impl GlobalAlloc for SharedHeap {
         start as *mut u8
     }
 
+    #[allow(
+        clippy::cast_ptr_alignment,
+        reason = "free blocks are at least 16 bytes and aligned to their size class, so the usize link word is aligned"
+    )]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if !Self::in_arena(ptr) {
             return unsafe { System.dealloc(ptr, layout) };
@@ -622,7 +660,7 @@ unsafe impl GlobalAlloc for SharedHeap {
             }
         }
         let h = Self::header();
-        let _g = Guard::lock(h);
+        let guard = Guard::lock(h);
         if POISON.load(Ordering::Relaxed) {
             let size = Self::class_of(layout).unwrap().1;
             // A block already carrying the poison pattern past its free-list link was freed
@@ -633,14 +671,14 @@ unsafe impl GlobalAlloc for SharedHeap {
                     .iter()
                     .all(|&b| b == 0xDD);
             if already {
-                drop(_g);
+                drop(guard);
                 panic!("shared heap: double free of {ptr:p} (size class {size})");
             }
             // SAFETY: the block is `size` bytes and no longer in use.
             unsafe { core::ptr::write_bytes(ptr, 0xDD, size) };
         }
         // SAFETY: the block is at least 16 bytes and no longer in use.
-        unsafe { *(ptr as *mut usize) = h.free[class].load(Ordering::Relaxed) };
+        unsafe { *ptr.cast::<usize>() = h.free[class].load(Ordering::Relaxed) };
         h.free[class].store(ptr as usize, Ordering::Relaxed);
     }
 

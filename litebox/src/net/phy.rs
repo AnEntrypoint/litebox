@@ -52,10 +52,9 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
             self.receive_buffer[..size].copy_from_slice(&packet[..size]);
             Some(size)
         } else {
-            match self.platform.receive_ip_packet(&mut self.receive_buffer) {
-                Ok(size) => Some(size),
-                Err(platform::ReceiveError::WouldBlock) => None,
-            }
+            self.platform
+                .receive_ip_packet(&mut self.receive_buffer)
+                .ok()
         };
         received.map(|size| {
             (
@@ -135,9 +134,12 @@ fn diag_loop(dir: &'static str, packet: &[u8], depth: usize) {
     }
     let tcp = &packet[ihl..];
     let flags = tcp[13];
-    if flags & 0x07 == 0 {
+    if flags.trailing_zeros() >= 3 {
         static OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 512 != 0 {
+        if !OTHER
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(512)
+        {
             return;
         }
     }

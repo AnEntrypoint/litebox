@@ -770,6 +770,8 @@ bitflags::bitflags! {
 }
 
 impl FcntlArg {
+    // F_SETOWN takes a C `int`; Linux keeps the low 32 bits of the register, which this wrap does.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn try_from(cmd: i32, arg: usize) -> Option<Self> {
         Some(match cmd {
             F_GETFD => Self::GETFD,
@@ -5619,10 +5621,6 @@ impl SyscallRequest {
         time_param: impl FnOnce(Option<UserPtrMut<T>>) -> TimeParam,
         unsupported_einval: impl Fn(core::fmt::Arguments<'_>) -> errno::Errno,
     ) -> Result<SyscallRequest, errno::Errno> {
-        let addr = ctx.sys_req_ptr(0);
-        let op_and_flags: i32 = ctx.sys_req_arg(1);
-        let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
-        let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
         // The remaining priority-inheritance futex ops return EOPNOTSUPP, not EINVAL/ENOSYS --
         // that errno choice is load-bearing (glibc's futex wrappers abort on an unexpected
         // error), not incidental. See AGENTS.md's "Webtop browser-verified video pipeline" item 4
@@ -5632,6 +5630,10 @@ impl SyscallRequest {
             12, // FUTEX_CMP_REQUEUE_PI
             13, // FUTEX_LOCK_PI2
         ];
+        let addr = ctx.sys_req_ptr(0);
+        let op_and_flags: i32 = ctx.sys_req_arg(1);
+        let op = op_and_flags & FutexFlags::FUTEX_CMD_MASK.bits();
+        let flags = op_and_flags & !FutexFlags::FUTEX_CMD_MASK.bits();
         if FUTEX_PI_OPS.contains(&op) {
             // Still routed through the unsupported-feature census; only the errno differs.
             let _ = unsupported_einval(format_args!("futex(priority-inheritance op = {op})"));

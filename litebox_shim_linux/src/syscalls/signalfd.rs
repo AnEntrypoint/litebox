@@ -69,6 +69,10 @@ struct SignalfdSiginfo {
 const _: () = assert!(core::mem::size_of::<SignalfdSiginfo>() == 128);
 
 impl SignalfdSiginfo {
+    #[allow(
+        clippy::similar_names,
+        reason = "ssi_pid and ssi_uid are the two named fields of one signalfd_siginfo"
+    )]
     fn from_siginfo(info: &Siginfo) -> Self {
         // `SiginfoData::new_addr` is the only populated-field constructor any signal-raising path
         // in this codebase uses (see e.g. `syscalls/signal/mod.rs`'s SIGSEGV/SIGBUS delivery);
@@ -93,6 +97,8 @@ impl SignalfdSiginfo {
         } else {
             0
         };
+        // `ssi_pid`/`ssi_uid` are the two named fields of one `signalfd_siginfo`; keep both names.
+        #[allow(clippy::similar_names)]
         let (ssi_pid, ssi_uid) = if is_fault {
             (0, 0)
         } else {
@@ -106,7 +112,7 @@ impl SignalfdSiginfo {
         };
 
         Self {
-            ssi_signo: info.signo as u32,
+            ssi_signo: info.signo.cast_unsigned(),
             ssi_errno: info.errno,
             ssi_code: info.code,
             ssi_pid,

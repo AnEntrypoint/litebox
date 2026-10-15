@@ -9,6 +9,10 @@ use anyhow::{Result, anyhow};
 
 /// Walks up from the current directory to find the workspace root (identified by a `target`
 /// directory), then `chdir`s into it.
+///
+/// # Panics
+///
+/// Panics if the current directory cannot be read (for example, it was deleted).
 pub fn project_root() -> Result<PathBuf> {
     let mut dir = std::env::current_dir().ok().unwrap();
     loop {

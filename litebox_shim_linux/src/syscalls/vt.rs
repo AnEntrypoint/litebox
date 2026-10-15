@@ -103,6 +103,10 @@ pub(crate) fn get_mode<Platform: ShimPlatform>(ptr: UserPtrMut<VtMode>) -> Resul
 /// switching to perform (see module doc comment), so any request unconditionally succeeds --
 /// there is nothing to validate the requested VT number against, since no other VT could ever
 /// exist for this device to reject a request for.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "keeps the Result signature of the sibling VT handler set_mode_kd"
+)]
 pub(crate) fn activate(_vt: i32) -> Result<u32, Errno> {
     Ok(0)
 }
@@ -111,6 +115,10 @@ pub(crate) fn activate(_vt: i32) -> Result<u32, Errno> {
 /// shape as `VT_ACTIVATE`). Since `activate` above completes the "switch" synchronously and
 /// unconditionally, the VT it targets is already active by the time any caller could issue this
 /// -- an immediate, unconditional success is the correct answer, not a real wait.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "keeps the Result signature of the sibling VT handler set_mode_kd"
+)]
 pub(crate) fn wait_active(_vt: i32) -> Result<u32, Errno> {
     Ok(0)
 }
@@ -133,6 +141,10 @@ pub(crate) fn set_mode_kd(mode: i32) -> Result<u32, Errno> {
 /// VT's keyboard mode), so every mode value is accepted unconditionally: unlike `KDSETMODE`
 /// above, real Linux itself accepts any value here too (silently clamping an out-of-range one),
 /// so there is no real `EINVAL` case to preserve.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "keeps the Result signature of the sibling VT handler set_mode_kd"
+)]
 pub(crate) fn set_kbmode(_mode: i32) -> Result<u32, Errno> {
     Ok(0)
 }

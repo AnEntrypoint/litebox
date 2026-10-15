@@ -169,6 +169,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         self.enter_shim(false, ctx, Task::handle_syscall_request)
     }
 
+    // Guest addresses and register values are u64 and pointers here are 64-bit (x86_64/aarch64 only);
+    // the diagnostic dumps truncate nothing on the supported hosts.
+    #[allow(clippy::cast_possible_truncation)]
     fn exception(
         &self,
         ctx: &mut Self::ExecutionContext,
@@ -304,11 +307,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
                     Some(u64::from_le_bytes(w))
                 };
-                let slot_addr = (ctx.rbp as usize).saturating_sub(0x30);
+                let slot_addr = ctx.rbp.saturating_sub(0x30);
                 let guard_addr = fs_base.saturating_add(0x28);
                 let slot = read_u64(slot_addr);
                 let guard = read_u64(guard_addr);
-                let frame = UserPtr::<u8>::from_usize((ctx.rbp as usize).saturating_sub(0x40))
+                let frame = UserPtr::<u8>::from_usize(ctx.rbp.saturating_sub(0x40))
                     .to_owned_slice::<Platform>(0x48);
                 litebox_util_log::warn!(
                     fs_base:% = format_args!("{:#x}", fs_base),
@@ -316,7 +319,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     slot_addr:% = format_args!("{:#x}", slot_addr), slot:? = slot,
                     guard_addr:% = format_args!("{:#x}", guard_addr), guard:? = guard,
                     equal:% = (slot.is_some() && slot == guard),
-                    slot_low_byte_zero:% = slot.map_or(false, |s| s & 0xff == 0),
+                    slot_low_byte_zero:% = slot.is_some_and(|s| s.trailing_zeros() >= 8),
                     frame_bytes:% = format_args!("{:02x?}", frame.as_deref());
                     "diag-guest-exception: stack canary check"
                 );
@@ -336,12 +339,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                     let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
                     Some(u64::from_le_bytes(w))
                 };
-                let window_start = (ctx.rbp as usize).saturating_sub(0x260);
+                let window_start = ctx.rbp.saturating_sub(0x260);
                 let frame =
                     UserPtr::<u8>::from_usize(window_start).to_owned_slice::<Platform>(0x270);
                 let (h_begin, h_end) = (
-                    read_u64((ctx.rbp as usize).saturating_sub(0x250)),
-                    read_u64((ctx.rbp as usize).saturating_sub(0x248)),
+                    read_u64(ctx.rbp.saturating_sub(0x250)),
+                    read_u64(ctx.rbp.saturating_sub(0x248)),
                 );
                 let handles = match (h_begin, h_end) {
                     (Some(b), Some(e)) if e > b && e - b <= 0x400 => {
@@ -367,6 +370,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // guest maps the PIE at a biased base, so the on-disk offset is `va - 0x1000` for
             // exec segment 2 and `va - 0x2000` for segment 3 once the bias is removed).
             {
+                const GUEST_LOAD_BIAS: u64 = 0x9_1000_0000;
                 let read_u64 = |addr: usize| -> Option<u64> {
                     let b = UserPtr::<u8>::from_usize(addr).to_owned_slice::<Platform>(8);
                     let w: [u8; 8] = b.as_deref()?.get(..8)?.try_into().ok()?;
@@ -377,15 +381,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 // RUN, not of the binary -- a different ASLR draw maps it elsewhere -- so `raw`
                 // below is the authoritative field and this one is only a convenience: subtract
                 // the bias you actually measured before handing it to `objdump --adjust-vma`.
-                const GUEST_LOAD_BIAS: u64 = 0x9_1000_0000;
                 let mut raw = [0u64; 24];
                 let mut biased = [0u64; 24];
                 let mut n = 0usize;
-                let mut rbp = ctx.rbp as usize;
+                let mut rbp = ctx.rbp;
                 for _ in 0..24 {
-                    let ret = match read_u64(rbp.saturating_add(8)) {
-                        Some(v) => v,
-                        None => break, // unmapped -- the chain ends here, honestly
+                    let Some(ret) = read_u64(rbp.saturating_add(8)) else {
+                        break; // unmapped -- the chain ends here, honestly
                     };
                     if ret < 0x1_0000 {
                         break; // not a plausible text address
@@ -480,7 +482,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 .pm()
                 .mappings()
                 .into_iter()
-                .find(|(r, _)| r.contains(&(ctx.rip as usize)));
+                .find(|(r, _)| r.contains(&ctx.rip));
             if let Some((r, flags)) = &rip_range {
                 litebox_util_log::warn!(
                     rip:% = format_args!("{:#x}", ctx.rip),
@@ -496,7 +498,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // containing rip" and "rip byte dump" above both print nothing for it: the only way to
             // name the CALL SITE is the 8 bytes immediately below rsp, which hold the return
             // address a `call` pushed (or the address a `ret` popped).
-            let stack_lo = (ctx.rsp as usize).saturating_sub(0x40);
+            let stack_lo = ctx.rsp.saturating_sub(0x40);
             let stack = UserPtr::<u8>::from_usize(stack_lo).to_owned_slice::<Platform>(0x48);
             litebox_util_log::warn!(
                 reg:% = "rsp-0x40", addr:% = format_args!("{:#x}", stack_lo),
@@ -508,7 +510,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             // how chrshot7 proved the faulting instruction was a call, not a ret.
             for (slot, delta) in [("rsp-8", 8usize), ("rsp+0", 0usize)] {
                 let addr = stack.as_deref().and_then(|s| {
-                    let off = (ctx.rsp as usize).saturating_sub(delta) - stack_lo;
+                    let off = ctx.rsp.saturating_sub(delta) - stack_lo;
                     let w: [u8; 8] = s.get(off..off + 8)?.try_into().ok()?;
                     Some(u64::from_le_bytes(w))
                 });
@@ -560,7 +562,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         }
         #[cfg(target_arch = "x86_64")]
         for (name, value) in [("rdx", ctx.rdx), ("rdi", ctx.rdi), ("rsi", ctx.rsi)] {
-            let base = (value as usize) & !0xf;
+            let base = value & !0xf;
             let bytes = UserPtr::<u8>::from_usize(base.saturating_sub(0x10))
                 .to_owned_slice::<Platform>(0x40);
             litebox_util_log::warn!(
@@ -826,6 +828,9 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// consistent address. See `Self::proc_self_info`'s own doc comment for the other known
     /// exceptions, and `GlobalStateHandle`'s own doc comment's "Sixth instance" section for
     /// `futex_manager`, which is deliberately NOT part of `GlobalState` at all.
+    // `my_pts_registry`/`my_pty_registry` are two distinct per-process copies named after their
+    // own sources (`pts` and `pty`); renaming either would only obscure which registry is which.
+    #[allow(clippy::similar_names)]
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
         let platform = self.platform;
         let slot = litebox::platform::SharedKernelStateSlot::ShimGlobalState;
@@ -960,7 +965,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                             alloc::collections::BTreeMap::new(),
                         ),
                         unix_addr_presence: syscalls::unix::SharedUnixAddrPresenceTable::new(),
-                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(&platform),
+                        unix_shared_conn_table: syscalls::unix::SharedUnixConnTable::new(platform),
                         unix_shared_connect_queue: syscalls::unix::SharedUnixConnectQueue::new(),
                         shared_file_publish: syscalls::file::SharedFilePublishTable::new(),
                         shared_file_spill: syscalls::file_spill::SharedFileSpill::new(),
@@ -972,10 +977,10 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         // (fixed-address, so cross-process-valid) region pointer plus one counter
                         // -- same shape as `unix_shared_conn_table` above, and same reason it can
                         // be a plain field here while `flock_registry` cannot.
-                        shared_flock: syscalls::file::SharedFlockTable::new(&platform),
+                        shared_flock: syscalls::file::SharedFlockTable::new(platform),
                         record_locks: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                         record_lock_pollee: litebox::event::polling::Pollee::new(),
-                        shared_record_locks: syscalls::file::SharedRecordLockTable::new(&platform),
+                        shared_record_locks: syscalls::file::SharedRecordLockTable::new(platform),
                         shared_pty: syscalls::pty::SharedPtyTable::new(),
                         process_table: syscalls::signal::xproc::SharedProcessTable::new(
                             self.platform,
@@ -984,8 +989,8 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
                         next_pty_id: core::sync::atomic::AtomicU32::new(0),
                         next_unix_autobind_id: core::sync::atomic::AtomicU32::new(0),
                         next_memfd_id: core::sync::atomic::AtomicU64::new(0),
-                        drm: syscalls::drm::SharedDrmTable::new(&platform),
-                        evdev: syscalls::evdev::SharedEvdevTable::new(&platform),
+                        drm: syscalls::drm::SharedDrmTable::new(platform),
+                        evdev: syscalls::evdev::SharedEvdevTable::new(platform),
                         shared_futex_wake: syscalls::process::SharedFutexWake::new(),
                     },
                 )
@@ -1451,6 +1456,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
     /// 100%-reproducible `SIGSEGV` on a fork-without-`execve()` child needing to return from a
     /// signal via the trampoline its own already-copied guest memory correctly still has the real
     /// bytes for, but whose ADDRESS this process's own fresh `SignalState` no longer recognizes).
+    // Every argument is a distinct piece of the forked task's identity and must stay explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn adopt_forked_process(
         &self,
         fs: alloc::sync::Arc<FS>,
@@ -1700,6 +1707,9 @@ fn default_fs<Platform: ShimPlatform>(
     proc_self_info: Arc<litebox::sync::RwLock<Platform, litebox::fs::procfs::ProcSelfTable>>,
     pts_registry: Arc<litebox::sync::RwLock<Platform, litebox::fs::devices::PtsRegistry>>,
 ) -> (LinuxFS<Platform>, Option<Cow<'static, [u8]>>) {
+    // Timestamps fall back to a fixed placeholder (before `GlobalState::boot_time` exists) --
+    // see `format_uptime`'s doc comment.
+    const BOOT_UPTIME_SECS: u64 = litebox::fs::procfs::FAKE_BOOT_UPTIME_SECS;
     // Populated as a side effect of the `/`-mount closure below, ONLY on the
     // `BuildFresh { capture_for_caller: true }` branch -- `Composer::builder().mount`'s closure
     // must return just the backend itself (`TarRo`), so there is no direct return path for this;
@@ -1720,11 +1730,8 @@ fn default_fs<Platform: ShimPlatform>(
     // formula -- advertised exactly 3 GiB free to every guest regardless of what the host actually
     // had. Xorg sized an allocation to precisely that figure and repeatedly got the whole guest
     // killed by the host's low-memory watchdog. See `SystemInfoProvider::memory_info_kb`.
-    let (mem_total_kb, mem_avail_kb) = platform.memory_info_kb();
     // No live wall-clock uptime source is reachable from this `no_std` shim at `default_fs` time
-    // (before `GlobalState::boot_time` exists) -- a fixed placeholder is fine, see
-    // `format_uptime`'s doc comment.
-    const BOOT_UPTIME_SECS: u64 = litebox::fs::procfs::FAKE_BOOT_UPTIME_SECS;
+    let (mem_total_kb, mem_avail_kb) = platform.memory_info_kb();
     let boot_unix_secs = {
         use litebox::platform::SystemTime as _;
         <Platform as litebox::platform::TimeProvider>::current_time(platform)
@@ -2455,7 +2462,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // summary is on, so a thread spinning at 16.5k syscalls/s costs 258 histogram inserts
         // per second rather than 16.5k. See `diag::record_syscall_rip`.
         #[cfg(target_arch = "x86_64")]
-        let (syscall_rip, syscall_rsp) = (ctx.rip, ctx.rsp);
+        // The instruction and stack pointers of one sample.
+        let (ip_sample, sp_sample) = (ctx.rip, ctx.rsp);
         litebox::fs::set_effective_identity(self.creds().fsuid, self.creds().fsgid);
         // A write to `/proc/self/uid_map` is a credentials change, so the fs layer hands it to the
         // shim, which needs to know WHOSE syscall is running to answer it. Published for this
@@ -2556,11 +2564,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .platform
                 .get_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase)
             {
-                let tid = (self.tid.get() as u32) & 0xffff;
+                let tid = self.tid.get().cast_unsigned() & 0xffff;
                 let fs = (fs as u64) & 0xffff_ffff_ffff;
-                let pack = ((tid as u64) << 48) | fs;
+                let pack = (u64::from(tid) << 48) | fs;
                 let prev = LAST.swap(pack, Ordering::Relaxed);
-                if (prev >> 48) == tid as u64 {
+                if (prev >> 48) == u64::from(tid) {
                     let prev_fs = prev & 0xffff_ffff_ffff;
                     if prev_fs != fs {
                         litebox_util_log::warn!(
@@ -2666,7 +2674,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         );
                     }
                 }
-                let sp = ctx.rsp as usize;
+                let sp = ctx.rsp;
                 let qwords = unsafe { core::slice::from_raw_parts(sp as *const u64, 64) };
                 let mut line = alloc::format!(
                     "[diag-mainstack] pid={} tid={} rsp={:#x} n={}",
@@ -2677,7 +2685,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 for w in qwords {
                     use core::fmt::Write;
-                    let _ = write!(line, " {:#x}", w);
+                    let _ = write!(line, " {w:#x}");
                 }
                 crate::diag::emit_timeline_line(self.global.platform, &line);
             }
@@ -2693,6 +2701,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             0
         };
         if parked {
+            #[allow(clippy::cast_possible_wrap)] // Windows PIDs are DWORDs far below 2^31.
             let host_pid = self.global.platform.current_host_pid() as i32;
             crate::diag::inflight_enter(
                 core::ptr::addr_of!(*self) as u64,
@@ -2711,8 +2720,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
         if stuck {
+            #[allow(clippy::cast_possible_wrap)] // Windows PIDs are DWORDs far below 2^31.
+            let host_pid = self.global.platform.current_host_pid() as i32;
             crate::diag::stuck_enter(
-                self.global.platform.current_host_pid() as i32,
+                host_pid,
                 core::ptr::addr_of!(*self) as u64,
                 syscall_number,
                 [
@@ -2740,7 +2751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     crate::diag::check_path_marker(
                         self.global.platform,
                         syscall_number,
-                        ctx.syscall_arg(a) as usize & 0x0000_ffff_ffff_ffff,
+                        ctx.syscall_arg(a) & 0x0000_ffff_ffff_ffff,
                         self.pid.get(),
                         self.tid.get(),
                     );
@@ -2786,7 +2797,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "x86_64")]
         crate::diag::record_syscall_rip(
             syscall_number,
-            syscall_rip as u64,
+            ip_sample as u64,
             // The trampoline is entered by a `call`, so `[rsp]` is the guest instruction right
             // after the original `syscall` -- the call site as the binary knows it. Read
             // directly: guest memory is this process's memory (see the `is_syscall_trap`
@@ -2805,7 +2816,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         #[cfg(target_arch = "x86_64")]
         crate::diag::maybe_dump_rip_histogram(self.global.platform);
         #[cfg(target_arch = "x86_64")]
-        crate::diag::maybe_dump_spin_stack(self.global.platform, syscall_number, syscall_rsp);
+        crate::diag::maybe_dump_spin_stack(self.global.platform, syscall_number, sp_sample);
         #[cfg(target_arch = "x86_64")]
         crate::diag::dump_guest_mappings_once(self.global.platform, || {
             self.process()
@@ -2866,6 +2877,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "oldpath: UserPtr(",
             "newpath: UserPtr(",
         ];
+        use core::fmt::Write as _;
         let mut decoded = alloc::string::String::new();
         for field in PATH_FIELDS {
             let Some(start) = request_debug.find(field) else {
@@ -2881,16 +2893,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             let path = UserPtr::<core::ffi::c_char>::from_usize(address)
                 .to_cstring::<Platform>()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|| alloc::string::String::from("<unreadable>"));
-            decoded.push_str(&alloc::format!(
+                .map_or_else(
+                    || alloc::string::String::from("<unreadable>"),
+                    |c| c.to_string_lossy().into_owned(),
+                );
+            let _ = write!(
+                decoded,
                 "{}={path:?} ",
                 field.split(':').next().unwrap_or("")
-            ));
+            );
         }
         decoded
     }
 
+    // Syscall numbers are far below 2^31; the seccomp verdict keeps the historical `as i32` wrap.
+    #[allow(clippy::cast_possible_truncation)]
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         // Helper macro to unify the return value from `sys_*`.
         macro_rules! syscall {
@@ -2906,7 +2923,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // seccomp is evaluated on the RAW syscall number, before `try_from_raw` decodes it: a
         // filter must also see the syscalls this shim has no request type for, exactly as Linux
         // runs its filters before `sys_call_table` dispatch.
-        let verdict = self.seccomp_verdict(ctx, syscall_number as i32);
+        let verdict = self.seccomp_verdict(ctx, i32::try_from(syscall_number).unwrap_or(-1));
         if let Some(verdict) = verdict {
             match verdict {
                 crate::syscalls::seccomp::Verdict::Allow => {}
@@ -2915,7 +2932,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     "seccomp: SECCOMP_RET_LOG"
                 ),
                 other => {
-                    return self.apply_seccomp_verdict(other, syscall_number as i32, ctx.get_ip());
+                    return self.apply_seccomp_verdict(
+                        other,
+                        i32::try_from(syscall_number).unwrap_or(-1),
+                        ctx.get_ip(),
+                    );
                 }
             }
         }
@@ -3047,13 +3068,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             )
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
-                                self.sys_lseek(
+                                let _ = self.sys_lseek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
-                                )
-                                .map(|_| ())
-                                .unwrap_or(());
+                                );
                             }),
                         Err(Errno::EBADF) => Err(Errno::EBADF),
                         Err(Errno::ESPIPE) => self.read_with_user_buf_no_offset(fd, buf, count),
@@ -3644,12 +3663,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // live via `touch` under `--oci-image webtop:debian-i3`: `pathname=0x0`,
                 // `path_ok=0x0`, guest reports "setting times of '/tmp/direct_touch': Bad
                 // address".
-                let path = if pathname.is_null() {
+                if pathname.is_null() {
                     Some(alloc::ffi::CString::default())
                 } else {
                     pathname.to_cstring::<Platform>()
-                };
-                path
+                }
             }
             .map_or(Err(Errno::EFAULT), |path| {
                 let times = if times.is_null() {
@@ -3870,9 +3888,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::SchedGetScheduler { pid } => {
                 Ok(self.sys_sched_getscheduler(pid).reinterpret_as_unsigned() as usize)
             }
+            // Priority bounds are never negative (0 or 1..=99), so the i32 -> usize cast keeps the value.
+            #[allow(clippy::cast_sign_loss)]
             SyscallRequest::SchedGetPriorityMax { policy } => {
                 Ok(sched_priority_range(policy)?.1 as usize)
             }
+            #[allow(clippy::cast_sign_loss)]
             SyscallRequest::SchedGetPriorityMin { policy } => {
                 Ok(sched_priority_range(policy)?.0 as usize)
             }
@@ -4096,12 +4117,7 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     /// process -- but NOT across processes" -- i.e. this too was always meant to be per-process
     /// private state, mistakenly placed as a byte-shared `GlobalState` field. Fixed the identical
     /// way, shadowing `GlobalState`'s (now removed) field.
-    fifo_registry: Arc<
-        litebox::sync::RwLock<
-            Platform,
-            alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
-        >,
-    >,
+    fifo_registry: FifoRegistry<Platform>,
     /// Eleventh instance of the SAME defect class this struct's own doc comment documents ten
     /// times over: a real cross-process-forked child's copy of this `BTreeMap<u32,
     /// syscalls::pty::PtyFd<Platform>>`'s root pointer is the first creator's, meaningless in its
@@ -4179,6 +4195,14 @@ pub(crate) struct GlobalStateHandle<Platform: ShimPlatform, FS: ShimFS> {
     evdev_pollee_local: Arc<litebox::event::polling::Pollee<Platform>>,
     bootstrap_process: Arc<once_cell::race::OnceBox<Arc<syscalls::process::Process<Platform>>>>,
 }
+
+/// The per-process named-pipe (FIFO) registry field type used by `GlobalStateHandle`.
+type FifoRegistry<Platform> = Arc<
+    litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<(usize, usize), FifoPipe<Platform>>,
+    >,
+>;
 
 impl<Platform: ShimPlatform, FS: ShimFS> Clone for GlobalStateHandle<Platform, FS> {
     fn clone(&self) -> Self {

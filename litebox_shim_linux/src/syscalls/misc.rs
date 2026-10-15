@@ -155,6 +155,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         for i in 0..words {
             let shift = 32 * i;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "each 32-bit capability word is the low half of the 64-bit set at this shift"
+            )]
             let cap = litebox_common_linux::CapData {
                 effective: (eff >> shift) as u32,
                 permitted: (perm >> shift) as u32,

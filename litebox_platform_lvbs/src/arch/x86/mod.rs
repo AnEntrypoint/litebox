@@ -21,6 +21,10 @@ pub(crate) use x86_64::{
 pub(crate) use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
 
 /// Get the APIC ID of the current core.
+///
+/// # Panics
+///
+/// Panics if CPUID does not report feature information on this core.
 #[inline]
 pub fn get_core_id() -> usize {
     let apic_id = raw_cpuid::CpuId::new()

@@ -940,11 +940,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
                 root.entries.insert(rekeyed, entry);
             }
         }
-        if let Some(Entry::File(replaced)) = root.entries.insert(to, moved.clone()) {
-            if !matches!(&moved, Entry::File(m) if Arc::ptr_eq(m, &replaced)) {
-                let mut replaced = replaced.write();
-                replaced.nlink = replaced.nlink.saturating_sub(1);
-            }
+        if let Some(Entry::File(replaced)) = root.entries.insert(to, moved.clone())
+            && !matches!(&moved, Entry::File(m) if Arc::ptr_eq(m, &replaced))
+        {
+            let mut replaced = replaced.write();
+            replaced.nlink = replaced.nlink.saturating_sub(1);
         }
 
         Ok(())

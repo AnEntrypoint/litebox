@@ -177,7 +177,10 @@ pub fn record_syscall_rip(
     if !rip_hist_enabled() && !strace_summary_enabled() {
         return;
     }
-    if RIP_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) % RIP_SAMPLE_EVERY != 0 {
+    if !RIP_DISPATCH_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(RIP_SAMPLE_EVERY)
+    {
         return;
     }
     // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
@@ -194,7 +197,8 @@ pub fn record_syscall_rip(
     hit.count += 1;
     // `fetch_add` returns the PREVIOUS value, so 0 would trip the modulo on the very first
     // sample and dump a one-row table before anything has happened. Add 1 first.
-    if (RIP_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1) % RIP_DUMP_EVERY_SAMPLES == 0 {
+    if (RIP_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(RIP_DUMP_EVERY_SAMPLES)
+    {
         RIP_DUMP_DUE.store(true, Ordering::Release);
     }
 }
@@ -273,6 +277,10 @@ static MAINTHREAD_MS: [core::sync::atomic::AtomicU64; MAINTHREAD_SLOTS] =
 const MAINTHREAD_THROTTLE_MS: u64 = 250;
 
 /// Rate-limit one main-thread line for `pid` to [`MAINTHREAD_THROTTLE_MS`], per pid.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "pid is a positive host pid; the u32 is only a slot key"
+)]
 pub fn mainthread_should_emit(pid: i32, now_ms: u64) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let key = pid as u32;
@@ -307,6 +315,10 @@ static MAINTHREAD_STACK_PID: [core::sync::atomic::AtomicU32; MAINTHREAD_SLOTS] =
     [const { core::sync::atomic::AtomicU32::new(0) }; MAINTHREAD_SLOTS];
 const MAINTHREAD_STACK_EVERY_MS: u64 = 2000;
 
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "pid is a positive host pid; the u32 is only a slot key"
+)]
 pub fn mainthread_should_dump_stack(pid: i32, now_ms: u64) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let key = pid as u32;
@@ -385,6 +397,10 @@ pub fn thread_note(task: u64) -> Option<&'static str> {
     THREAD_NOTES.lock().get(&task).copied()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one syscall entry's fields; a wrapper struct would only repack them"
+)]
 pub fn inflight_enter(
     task: u64,
     host_pid: i32,
@@ -422,12 +438,12 @@ pub fn inflight_exit(task: u64) {
     INFLIGHT.lock().remove(&task);
 }
 
-pub fn maybe_dump_inflight<Platform: litebox::platform::TimeProvider>(
+pub fn maybe_dump_inflight<
+    Platform: litebox::platform::TimeProvider + litebox::platform::StdioProvider,
+>(
     platform: &Platform,
     now_ms: u64,
-) where
-    Platform: litebox::platform::StdioProvider,
-{
+) {
     if !parked_enabled() {
         return;
     }
@@ -442,7 +458,7 @@ pub fn maybe_dump_inflight<Platform: litebox::platform::TimeProvider>(
         .filter(|(_, f)| now_ms.saturating_sub(f.started_ms) >= PARKED_MIN_MS)
         .map(|(k, f)| (*k, f))
         .collect();
-    rows.sort_by(|a, b| a.1.started_ms.cmp(&b.1.started_ms));
+    rows.sort_by_key(|a| a.1.started_ms);
     emit_timeline_line(
         platform,
         &alloc::format!(
@@ -581,6 +597,11 @@ fn stuck_slot_at(base: *const StuckSlot, index: usize) -> &'static StuckSlot {
 
 /// Finds this thread's slot, claiming a free one when `claim`. See [`StuckSlot::key_pid`] for why
 /// the key is `(pid, tid)`.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "the hash only picks a probe start (same arithmetic in every process of the family); pid/tid are positive"
+)]
 fn stuck_slot(pid: i32, tid: i32, claim: bool) -> Option<(&'static StuckSlot, bool)> {
     let base = stuck_base()?;
     let h = (pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (tid as u64).wrapping_mul(0x85EB);
@@ -615,6 +636,12 @@ fn stuck_slot(pid: i32, tid: i32, claim: bool) -> Option<(&'static StuckSlot, bo
     None
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "one syscall entry's fields; host pid is positive; sysno fits the u32 diagnostic slot"
+)]
 pub fn stuck_enter(
     host: i32,
     task: u64,
@@ -703,7 +730,7 @@ fn stuck_mix(s: &StuckSlot) -> String {
             pairs.push((s.mix_count[k].load(Ordering::Relaxed), n));
         }
     }
-    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    pairs.sort_by_key(|p| core::cmp::Reverse(p.0));
     let mut out = String::new();
     for (count, n) in pairs {
         use core::fmt::Write as _;
@@ -764,7 +791,7 @@ pub fn maybe_dump_stuck(now_ms: u64) {
         pids.len(),
     );
     litebox_util_log::warn!(stuck:% = header.as_str(); "[diag-stuck]");
-    parked.sort_by(|a, b| b.0.cmp(&a.0));
+    parked.sort_by_key(|p| core::cmp::Reverse(p.0));
     for (dur, i) in parked.iter().take(40) {
         let s = stuck_slot_at(base, *i);
         let sysno = s.sysno.load(Ordering::Relaxed) as usize;
@@ -783,7 +810,7 @@ pub fn maybe_dump_stuck(now_ms: u64) {
         );
         litebox_util_log::warn!(stuck:% = line.as_str(); "[diag-stuck]");
     }
-    hot.sort_by(|a, b| b.0.cmp(&a.0));
+    hot.sort_by_key(|h| core::cmp::Reverse(h.0));
     for (since, i) in hot.iter().take(8) {
         let s = stuck_slot_at(base, *i);
         let line = alloc::format!(
@@ -862,9 +889,8 @@ pub fn check_path_marker<Platform: litebox::platform::StdioProvider>(
         return;
     }
     let guard = PATH_MARKER.lock();
-    let marker = match guard.as_ref() {
-        None => return,
-        Some(m) => m,
+    let Some(marker) = guard.as_ref() else {
+        return;
     };
     let mut buf: [u8; 256] = [0; 256];
     let mut len = 0;
@@ -878,9 +904,8 @@ pub fn check_path_marker<Platform: litebox::platform::StdioProvider>(
         buf[len] = b;
         len += 1;
     }
-    let s = match core::str::from_utf8(&buf[..len]) {
-        Ok(s) => s,
-        Err(_) => return,
+    let Ok(s) = core::str::from_utf8(&buf[..len]) else {
+        return;
     };
     if !s.contains(marker.as_str()) {
         return;
@@ -928,10 +953,14 @@ pub fn maybe_dump_spin_stack<Platform: litebox::platform::StdioProvider>(
     syscall_number: usize,
     rsp: usize,
 ) {
+    use core::fmt::Write as _;
     if SPIN_STACK_SYSCALL.load(Ordering::Acquire) != syscall_number as u64 {
         return;
     }
-    if SPIN_STACK_COUNT.fetch_add(1, Ordering::Relaxed) % SPIN_STACK_EVERY != 0 {
+    if !SPIN_STACK_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(SPIN_STACK_EVERY)
+    {
         return;
     }
     // Guest memory is this process's memory (see the `is_syscall_trap` byte read in the platform
@@ -943,7 +972,7 @@ pub fn maybe_dump_spin_stack<Platform: litebox::platform::StdioProvider>(
             emit_timeline_line(platform, &line);
             line = alloc::format!("[diag-spin-stack]   +{:#x}:", i * 8);
         }
-        line.push_str(&alloc::format!(" {w:#x}"));
+        let _ = write!(line, " {w:#x}");
     }
     emit_timeline_line(platform, &line);
 }
@@ -955,10 +984,10 @@ pub fn dump_guest_mappings_once<Platform: litebox::platform::StdioProvider>(
     platform: &Platform,
     lines: impl FnOnce() -> Vec<String>,
 ) {
+    static DUMPED: AtomicBool = AtomicBool::new(false);
     if !rip_hist_enabled() {
         return;
     }
-    static DUMPED: AtomicBool = AtomicBool::new(false);
     if DUMPED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -978,7 +1007,7 @@ pub fn maybe_dump_rip_histogram<Platform: litebox::platform::StdioProvider>(plat
     }
     let mut guard = RIP_HISTOGRAM.lock();
     let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
-    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    rows.sort_by_key(|r| core::cmp::Reverse(r.1.count));
     emit_timeline_line(
         platform,
         "[diag-rip-hist] busiest syscall call sites since last dump:",
@@ -1014,7 +1043,7 @@ pub fn print_rip_histogram(mut eprint: impl FnMut(&str)) {
         "\n=== LITEBOX_STRACE_SUMMARY: syscall call sites (1-in-64 sampled rip histogram) ===\n",
     );
     let mut rows: Vec<(&(usize, u64), &RipHit)> = guard.iter().collect();
-    rows.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    rows.sort_by_key(|r| core::cmp::Reverse(r.1.count));
     for ((num, rip), hit) in rows.iter().take(60) {
         eprint(&alloc::format!(
             "count={count} syscall={name}({num}) rip={rip:#x} pid={pid} tid={tid} comm={comm}\n",
@@ -1507,6 +1536,10 @@ struct LastTrail {
 }
 
 impl LastTrail {
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "const-evaluated into the static LAST_TRAIL, never a stack frame"
+    )]
     const NEW: Self = Self {
         entries: [LastTrailEntry::EMPTY; LAST_TRAIL_LEN],
         next: 0,
@@ -1604,6 +1637,10 @@ static CHILD_EXIT_TRAIL_INIT: AtomicBool = AtomicBool::new(false);
 /// register snapshot in its own environment (`LITEBOX_INTERNAL_FORK_CHILD_GPRS`, read once) --
 /// and fires on the `exit`/`exit_group` SYSCALL NUMBER, before dispatch, so it cannot be bypassed
 /// by whatever the exit path turns out to be.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the exit status is the guest's i32 exit code; truncating args[0] is the existing semantics"
+)]
 pub fn maybe_dump_child_exit_trail<Platform>(
     platform: &Platform,
     syscall_number: usize,
@@ -1895,7 +1932,7 @@ pub fn emit_child_exit_last_trail<Platform: litebox::platform::StdioProvider>(
     }
     let comm = String::from_utf8_lossy(trimmed);
     for (i, entry) in entries.iter().enumerate() {
-        let signed = entry.ret as i64;
+        let signed = entry.ret.cast_signed();
         let _ = platform.write_to(
             litebox::platform::StdioOutStream::Stderr,
             alloc::format!(
@@ -1921,6 +1958,10 @@ static CHILD_IPC_COMM: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 /// [`init_child_exit_trail`] (`<n>`, `<comm>` or `<comm>:<n>`), and prints one
 /// `[diag-child-ipc-init]` line per host process so a silent instrument is distinguishable from a
 /// child that never made an IPC syscall.
+#[allow(
+    clippy::similar_names,
+    reason = "pid/ppid are the kernel's own names and the edge set is printed as ppid=/pid="
+)]
 pub fn init_child_ipc<Platform: litebox::platform::StdioProvider>(
     value: impl FnOnce() -> Option<String>,
     platform: &Platform,
@@ -2000,7 +2041,7 @@ pub fn maybe_trace_child_ipc<Platform>(
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let trimmed = &comm[..end];
     let wanted = CHILD_IPC_COMM.lock();
-    if !wanted.is_empty() && !(trimmed == wanted.as_slice() || wanted.starts_with(trimmed)) {
+    if !wanted.is_empty() && trimmed != wanted.as_slice() && !wanted.starts_with(trimmed) {
         return;
     }
     if !IS_FORK_CHILD_HOST.load(Ordering::Acquire) {
@@ -2027,7 +2068,7 @@ pub fn maybe_trace_child_ipc<Platform>(
     if budget == 0 {
         return;
     }
-    let signed = ret as i64;
+    let signed = ret.cast_signed();
     let _ = platform.write_to(
         litebox::platform::StdioOutStream::Stderr,
         alloc::format!(
@@ -2045,9 +2086,10 @@ pub fn maybe_trace_child_ipc<Platform>(
 fn syscall_name(number: usize) -> String {
     #[cfg(target_arch = "x86_64")]
     {
-        ::syscalls::Sysno::new(number)
-            .map(|s| s.name().to_string())
-            .unwrap_or_else(|| alloc::format!("sysno_{number}"))
+        ::syscalls::Sysno::new(number).map_or_else(
+            || alloc::format!("sysno_{number}"),
+            |s| s.name().to_string(),
+        )
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2058,6 +2100,7 @@ fn syscall_name(number: usize) -> String {
 /// Prints the accumulated per-syscall summary to stderr via the platform's stdio, if enabled.
 /// Called once at runner exit.
 pub fn print_strace_summary(mut eprint: impl FnMut(&str)) {
+    use core::fmt::Write as _;
     if !strace_summary_enabled() {
         return;
     }
@@ -2066,7 +2109,7 @@ pub fn print_strace_summary(mut eprint: impl FnMut(&str)) {
     eprint("\n=== LITEBOX_STRACE_SUMMARY: per-syscall table ===\n");
     eprint("syscall(number)                     count    total_ns      max_ns  errors\n");
     let mut rows: Vec<(&usize, &SyscallStats)> = guard.by_syscall.iter().collect();
-    rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns));
+    rows.sort_by_key(|r| core::cmp::Reverse(r.1.total_ns));
     for (num, stats) in rows {
         let name = syscall_name(*num);
         let mut errs = String::new();
@@ -2074,7 +2117,7 @@ pub fn print_strace_summary(mut eprint: impl FnMut(&str)) {
             if !errs.is_empty() {
                 errs.push_str(", ");
             }
-            errs.push_str(&alloc::format!("{errno}={count}"));
+            let _ = write!(errs, "{errno}={count}");
         }
         eprint(&alloc::format!(
             "{name}({num})  count={count} total_ns={total_ns} max_ns={max_ns} errors=[{errs}]\n",
@@ -2134,6 +2177,10 @@ pub fn next_seq() -> u64 {
 }
 
 /// Record (or update) a pid -> (ppid, comm) edge for the exit-time process-tree dump.
+#[allow(
+    clippy::similar_names,
+    reason = "pid/ppid are the kernel's own names and the edge set is printed as ppid=/pid="
+)]
 pub fn record_process(pid: i32, ppid: i32, comm: &str) {
     // These grow a `static` collection; keep its nodes in private memory so a native-`fork()`
     // child's copy of the static never aliases the parent's (see `PrivateAllocGuard`).

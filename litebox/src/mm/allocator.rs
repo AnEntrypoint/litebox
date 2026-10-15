@@ -322,9 +322,10 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                                 // allocation that panicked here. A plain string literal (no `{}`
                                 // placeholders) never reaches `format!`, so it can never recurse
                                 // into this allocator no matter which lock is held when it fires.
-                                if unsafe { zone_allocator.refill(layout, page) }.is_err() {
-                                    panic!("SafeZoneAllocator: refill failed");
-                                }
+                                assert!(
+                                    unsafe { zone_allocator.refill(layout, page) }.is_ok(),
+                                    "SafeZoneAllocator: refill failed"
+                                );
                                 let Ok(ptr) = zone_allocator.allocate(layout) else {
                                     panic!("SafeZoneAllocator: allocate failed right after refill");
                                 };
@@ -375,9 +376,10 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                     // `"{msg}: {error:?}"`, which would allocate through this very
                     // `#[global_allocator]` while `slab_allocator.lock()`'s guard (the temporary
                     // this whole chained call holds) is still alive.
-                    if self.slab_allocator.lock().deallocate(ptr, layout).is_err() {
-                        panic!("SafeZoneAllocator: failed to deallocate");
-                    }
+                    assert!(
+                        self.slab_allocator.lock().deallocate(ptr, layout).is_ok(),
+                        "SafeZoneAllocator: failed to deallocate"
+                    );
                 }
 
                 // TODO: An proper reclamation strategy could be implemented here

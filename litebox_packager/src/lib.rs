@@ -706,10 +706,6 @@ struct TarEntry {
 }
 
 fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
-    let file = std::fs::File::create(output)
-        .with_context(|| format!("failed to create output file {}", output.display()))?;
-    let mut builder = Builder::new(file);
-
     // Copy-on-write mapping alignment. `MapViewOfFile3` (the Win32 primitive behind
     // `try_allocate_cow_pages`) requires a view's FILE OFFSET to be 64KiB-aligned -- unlike
     // Linux `mmap`, which needs only 4KiB. Tar's 512-byte block layout means a natural archive
@@ -724,6 +720,10 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     // libssl) -- so the whole change costs 0.41 MB on 8.43 MB, 4.8%.
     const COW_VIEW_ALIGN: u64 = 65536;
     const TAR_BLOCK: u64 = 512;
+    let file = std::fs::File::create(output)
+        .with_context(|| format!("failed to create output file {}", output.display()))?;
+    let mut builder = Builder::new(file);
+
     // Tracks the byte offset the next entry's HEADER will be written at, mirroring what the
     // builder itself emits: one header block, then the data rounded up to a block boundary.
     let mut offset: u64 = 0;

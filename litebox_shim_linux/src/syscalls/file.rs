@@ -165,6 +165,9 @@ impl SharedFilePublishTable {
     /// `false` -- never panics, this is a guest-reachable path -- if `path` exceeds this table's
     /// fixed bounds or every slot is occupied by a DIFFERENT path; either only degrades this side
     /// channel, never the real per-process write a caller already performed first.
+    // `path.len()` is checked against `FILE_PUBLISH_PATH_MAX` and every stored length is clamped to
+    // `FILE_PUBLISH_CONTENT_MAX` (both far below `u32::MAX`), so the `u32` stores cannot truncate.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn publish_at(
         &self,
         path: &[u8],
@@ -272,11 +275,11 @@ fn diag_raw_print_proc_sys_open_miss<Platform: litebox::platform::StdioProvider>
     path: &str,
     errno: Errno,
 ) {
+    const PREFIX: &[u8] = b"[diag-proc-sys-open-miss] unregistered path opened: ";
+    const ERRNO_MARK: &[u8] = b" errno=";
     if !(path.starts_with("/proc/") || path.starts_with("/sys/")) {
         return;
     }
-    const PREFIX: &[u8] = b"[diag-proc-sys-open-miss] unregistered path opened: ";
-    const ERRNO_MARK: &[u8] = b" errno=";
     let mut line = [0u8; 256];
     let mut pos = 0usize;
     let n = PREFIX.len().min(line.len());
@@ -1058,6 +1061,8 @@ impl SharedFlockSlot {
     }
 
     /// Writes this slot's key. Callers hold `guard` and pass a path of at least one byte.
+    // `path.len()` is at most the key array length (indexed above), which fits `u32`.
+    #[allow(clippy::cast_possible_truncation)]
     fn set_key(&self, dev: usize, path: &[u8]) {
         self.dev.store(dev, Ordering::Release);
         for (i, b) in path.iter().enumerate() {
@@ -1181,7 +1186,7 @@ impl<Platform: ShimPlatform> SharedFlockRegion<Platform> {
     /// recovery makes. Pid 0 means "no holder recorded" and is skipped.
     fn reclaim_dead(&self, platform: &Platform) -> bool {
         let mut reclaimed = false;
-        for slot in self.slots.iter() {
+        for slot in &self.slots {
             match slot.kind.load(Ordering::Acquire) {
                 FLOCK_SLOT_RESERVED | FLOCK_SLOT_EXCLUSIVE => {
                     let pid = slot.exclusive_pid.load(Ordering::Acquire);
@@ -1228,33 +1233,31 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// (the same create-vs-attach split `SharedUnixConnTable::new` relies on).
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedFlockRegion<Platform>>();
-        match platform.shared_kernel_arena_alloc_bytes(layout) {
-            Some(ptr) => Self::new_in(Some(ptr.cast::<SharedFlockRegion<Platform>>()), true),
-            None => {
-                // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
-                // process IS the whole guest session). Fall back to a process-private allocation,
-                // leaked so every later access stays memory-safe, and let `excludes` disable the
-                // table so this process stops pretending it can exclude anyone else.
+        if let Some(ptr) = platform.shared_kernel_arena_alloc_bytes(layout) {
+            Self::new_in(Some(ptr.cast::<SharedFlockRegion<Platform>>()), true)
+        } else {
+            // Arena exhausted: still never a panic (AGENTS.md's standing rule -- the host
+            // process IS the whole guest session). Fall back to a process-private allocation,
+            // leaked so every later access stays memory-safe, and let `excludes` disable the
+            // table so this process stops pretending it can exclude anyone else.
+            litebox_util_log::error!(
+                bytes:% = layout.size();
+                "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
+                 this host process only"
+            );
+            let fallback = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                .map(core::ptr::NonNull::cast::<SharedFlockRegion<Platform>>);
+            if fallback.is_none() {
+                // Neither memory holds it. `new_in(None, _)` yields a table with no region, and
+                // every operation on it answers "cannot key this lock" -- the caller's
+                // per-process `FlockFile`, which is where `excludes == false` already lands.
                 litebox_util_log::error!(
                     bytes:% = layout.size();
-                    "shared flock table: shared kernel arena exhausted; flock(2) excludes within \
-                     this host process only"
+                    "shared flock table: fallback allocation failed; flock(2) will not exclude \
+                     at all in this host process"
                 );
-                let fallback =
-                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .map(|p| p.cast::<SharedFlockRegion<Platform>>());
-                if fallback.is_none() {
-                    // Neither memory holds it. `new_in(None, _)` yields a table with no region, and
-                    // every operation on it answers "cannot key this lock" -- the caller's
-                    // per-process `FlockFile`, which is where `excludes == false` already lands.
-                    litebox_util_log::error!(
-                        bytes:% = layout.size();
-                        "shared flock table: fallback allocation failed; flock(2) will not exclude \
-                         at all in this host process"
-                    );
-                }
-                Self::new_in(fallback, false)
             }
+            Self::new_in(fallback, false)
         }
     }
 
@@ -1331,9 +1334,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// lock without a `&Platform` or a `&GlobalState`. `0` when there is no region, which
     /// `FlockHolderInner::shared_region` already reads as "nothing to release".
     fn region_addr(&self) -> usize {
-        self.region
-            .map(|r| r as *const SharedFlockRegion<Platform> as usize)
-            .unwrap_or(0)
+        self.region.map_or(0, |r| core::ptr::from_ref(r) as usize)
     }
 
     /// Lowest-index slot currently carrying `dev`/`path` in a non-free state. Callers hold `guard`.
@@ -1376,6 +1377,8 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// One critical section that finds the slot for `dev`/`ino` (claiming a free one if this file is
     /// new here) AND applies the state transition. Doing both under one lock is what makes the
     /// "which slot owns this file" question unarguable.
+    // Eight inputs are the lock-request fields; bundling them would only move the list elsewhere.
+    #[allow(clippy::too_many_arguments)]
     fn try_lock(
         &self,
         region: &SharedFlockRegion<Platform>,
@@ -1394,12 +1397,11 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                 // Table full: try once to take back holdings of processes that died without
                 // unlocking, since those would otherwise pin their files for the whole session.
                 None if region.reclaim_dead(platform) => {
-                    match self.claim_free(region, dev, path, host, id) {
-                        Some(i) => i,
-                        None => {
-                            self.log_degraded();
-                            return SharedFlockOutcome::Unavailable;
-                        }
+                    if let Some(i) = self.claim_free(region, dev, path, host, id) {
+                        i
+                    } else {
+                        self.log_degraded();
+                        return SharedFlockOutcome::Unavailable;
                     }
                 }
                 None => {
@@ -1467,19 +1469,16 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                 if exclusive {
                     return SharedFlockOutcome::Conflict;
                 }
-                match slot.first_free_shared() {
-                    Some(j) => {
-                        slot.shared_ids[j].store(id, Ordering::Release);
-                        slot.shared_pids[j].store(host, Ordering::Release);
-                        region.bump();
-                        SharedFlockOutcome::Acquired
-                    }
+                if let Some(j) = slot.first_free_shared() {
+                    slot.shared_ids[j].store(id, Ordering::Release);
+                    slot.shared_pids[j].store(host, Ordering::Release);
+                    region.bump();
+                    SharedFlockOutcome::Acquired
+                } else {
                     // Out of shared-holder rows. `LOCK_SH` is compatible with `LOCK_SH` anyway, so
                     // the caller's per-process fallback cannot produce a wrong answer here.
-                    None => {
-                        self.log_degraded();
-                        SharedFlockOutcome::Unavailable
-                    }
+                    self.log_degraded();
+                    SharedFlockOutcome::Unavailable
                 }
             }
             _ => SharedFlockOutcome::Conflict,
@@ -1491,19 +1490,16 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// Leaves the hold EXCLUSIVE if there is no row to put it in: stronger than the `LOCK_SH` that
     /// was asked for, but never a lost lock.
     fn move_to_shared(&self, slot: &SharedFlockSlot, host: u32, id: u64) {
-        match slot.first_free_shared() {
-            Some(j) => {
-                slot.exclusive_id.store(0, Ordering::Release);
-                slot.exclusive_pid.store(0, Ordering::Release);
-                slot.shared_ids[j].store(id, Ordering::Release);
-                slot.shared_pids[j].store(host, Ordering::Release);
-            }
-            None => {
-                slot.exclusive_id.store(id, Ordering::Release);
-                slot.exclusive_pid.store(host, Ordering::Release);
-                slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
-                self.log_degraded();
-            }
+        if let Some(j) = slot.first_free_shared() {
+            slot.exclusive_id.store(0, Ordering::Release);
+            slot.exclusive_pid.store(0, Ordering::Release);
+            slot.shared_ids[j].store(id, Ordering::Release);
+            slot.shared_pids[j].store(host, Ordering::Release);
+        } else {
+            slot.exclusive_id.store(id, Ordering::Release);
+            slot.exclusive_pid.store(host, Ordering::Release);
+            slot.kind.store(FLOCK_SLOT_EXCLUSIVE, Ordering::Release);
+            self.log_degraded();
         }
     }
 
@@ -1512,6 +1508,8 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     /// Returns `None` when the table cannot represent this lock, meaning the caller must fall back
     /// to the per-process `FlockFile`; never a panic. `interrupted` is the task's own
     /// `check_for_interrupt`, so a blocked `flock(2)` stays responsive to signals.
+    // The nine inputs are the flock(2) request fields; a struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn lock(
         &self,
         platform: &Platform,
@@ -1561,7 +1559,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
                         .wake
                         .block_or_timeout(sampled, SHARED_FLOCK_WAIT_CHUNK);
                     chunks = chunks.wrapping_add(1);
-                    if chunks % SHARED_FLOCK_RECLAIM_EVERY == 0 {
+                    if chunks.is_multiple_of(SHARED_FLOCK_RECLAIM_EVERY) {
                         let _guard = region.guard.lock();
                         region.reclaim_dead(platform);
                     }
@@ -1591,7 +1589,7 @@ impl<Platform: ShimPlatform> SharedFlockTable<Platform> {
     fn log_degraded(&self) {
         let n = self.degraded.fetch_add(1, Ordering::Relaxed);
         // Gap-filtered: a full table is a capacity signal worth seeing, not a per-call event.
-        if n & 0x3f == 0 {
+        if n.trailing_zeros() >= 6 {
             litebox_util_log::warn!(
                 capacity:% = SHARED_FLOCK_CAPACITY,
                 degraded:% = n + 1;
@@ -1713,6 +1711,9 @@ impl SharedRecordLockRow {
     }
 
     /// Callers hold `guard` and pass a path of at least one byte.
+    // `path.len()` is at most the key array length (indexed below), which fits `u32`. The eight
+    // inputs are the record-lock row fields.
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     fn set(
         &self,
         dev: usize,
@@ -1778,7 +1779,7 @@ impl<Platform: ShimPlatform> SharedRecordLockRegion<Platform> {
     /// skipped.
     fn reclaim_dead(&self, platform: &Platform) -> bool {
         let mut reclaimed = false;
-        for row in self.rows.iter() {
+        for row in &self.rows {
             let host = row.host_pid.load(Ordering::Acquire);
             if !row.is_free() && host != 0 && !platform.is_process_alive(host) {
                 row.clear();
@@ -1808,31 +1809,29 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
     /// process in the family attaches to the already-built `GlobalState` and never calls this.
     pub(crate) fn new(platform: &Platform) -> Self {
         let layout = core::alloc::Layout::new::<SharedRecordLockRegion<Platform>>();
-        match platform.shared_kernel_arena_alloc_bytes(layout) {
-            Some(ptr) => Self::new_in(Some(ptr.cast::<SharedRecordLockRegion<Platform>>()), true),
-            None => {
-                // Arena exhausted: still never a panic (the host process IS the whole guest session).
-                // Fall back to a process-private allocation, leaked so every later access stays
-                // memory-safe, and let `excludes` disable the table.
+        if let Some(ptr) = platform.shared_kernel_arena_alloc_bytes(layout) {
+            Self::new_in(Some(ptr.cast::<SharedRecordLockRegion<Platform>>()), true)
+        } else {
+            // Arena exhausted: still never a panic (the host process IS the whole guest session).
+            // Fall back to a process-private allocation, leaked so every later access stays
+            // memory-safe, and let `excludes` disable the table.
+            litebox_util_log::error!(
+                bytes:% = layout.size();
+                "shared record lock table: shared kernel arena exhausted; fcntl(2) record locks \
+                 exclude within this host process only"
+            );
+            let fallback = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
+                .map(core::ptr::NonNull::cast::<SharedRecordLockRegion<Platform>>);
+            if fallback.is_none() {
+                // Neither memory holds it: `new_in(None, _)` yields a table with no region, whose
+                // every operation degrades instead of aborting the process.
                 litebox_util_log::error!(
                     bytes:% = layout.size();
-                    "shared record lock table: shared kernel arena exhausted; fcntl(2) record locks \
-                     exclude within this host process only"
+                    "shared record lock table: fallback allocation failed; fcntl(2) record locks \
+                     will not exclude at all in this host process"
                 );
-                let fallback =
-                    core::ptr::NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) })
-                        .map(|p| p.cast::<SharedRecordLockRegion<Platform>>());
-                if fallback.is_none() {
-                    // Neither memory holds it: `new_in(None, _)` yields a table with no region, whose
-                    // every operation degrades instead of aborting the process.
-                    litebox_util_log::error!(
-                        bytes:% = layout.size();
-                        "shared record lock table: fallback allocation failed; fcntl(2) record locks \
-                         will not exclude at all in this host process"
-                    );
-                }
-                Self::new_in(fallback, false)
             }
+            Self::new_in(fallback, false)
         }
     }
 
@@ -1907,7 +1906,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         let n = self.degraded.fetch_add(1, Ordering::Relaxed);
         // Gap-filtered: a table that cannot key a lock is a capacity/reachability signal worth
         // seeing, not a per-call event.
-        if n & 0x3f == 0 {
+        if n.trailing_zeros() >= 6 {
             litebox_util_log::warn!(
                 rows:% = SHARED_RECORD_LOCK_ROWS,
                 degraded:% = n + 1;
@@ -1919,6 +1918,8 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
 
     /// One critical section that scans for a conflicting claim AND commits the request, so two
     /// processes can never disagree about who holds a range.
+    // The eleven inputs are the fcntl(2) request fields; a struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
     fn try_apply(
         &self,
         region: &SharedRecordLockRegion<Platform>,
@@ -1974,11 +1975,11 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
                     pool.push(i);
                 }
             }
-            for (i, _, _, _) in mine.iter() {
+            for (i, _, _, _) in &mine {
                 region.rows[*i].clear();
             }
             let mut at = 0usize;
-            for (_, w, rs, re) in mine.iter() {
+            for (_, w, rs, re) in &mine {
                 if *rs < start {
                     region.rows[pool[at]].set(dev, path, host, guest, *w, *rs, start);
                     at += 1;
@@ -2002,6 +2003,8 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
     /// Returns `None` when the table cannot key the lock, meaning the caller must fall back to its
     /// per-process table; never a panic. `interrupted` is the task's own `check_for_interrupt`, so a
     /// blocked `F_SETLKW` stays responsive to signals.
+    // The twelve inputs are the fcntl(2) request fields; a struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         &self,
         platform: &Platform,
@@ -2049,7 +2052,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
                         .wake
                         .block_or_timeout(sampled, SHARED_RECORD_LOCK_WAIT_CHUNK);
                     chunks = chunks.wrapping_add(1);
-                    if chunks % SHARED_RECORD_LOCK_RECLAIM_EVERY == 0 {
+                    if chunks.is_multiple_of(SHARED_RECORD_LOCK_RECLAIM_EVERY) {
                         let _guard = region.guard.lock();
                         region.reclaim_dead(platform);
                     }
@@ -2059,6 +2062,8 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
     }
 
     /// The first claim that would stop `(host, guest)` from taking `write` over `start..end`.
+    // The seven inputs are the fcntl(2) query fields; a struct would only rename the same list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn conflicting_claim(
         &self,
         dev: usize,
@@ -2076,7 +2081,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
             return SharedRecordLockQuery::Unavailable;
         };
         let _guard = region.guard.lock();
-        for row in region.rows.iter() {
+        for row in &region.rows {
             if row.is_free() || !row.key_matches(dev, path) || row.owned_by(host, guest) {
                 continue;
             }
@@ -2104,7 +2109,7 @@ impl<Platform: ShimPlatform> SharedRecordLockTable<Platform> {
         }
         let _guard = region.guard.lock();
         let mut released = false;
-        for row in region.rows.iter() {
+        for row in &region.rows {
             if !row.is_free() && row.owned_by(host, guest) {
                 row.clear();
                 released = true;
@@ -2590,11 +2595,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // because it is a second HOST process and the mirror only ever holds its own allocations.
         // `LITEBOX_PTS_LIST_SHARED_OFF=1` restores the per-process-only listing.
         if path_str == "/dev/pts"
-            && !self
+            && self
                 .global
                 .platform
                 .env_value("LITEBOX_PTS_LIST_SHARED_OFF")
-                .is_some()
+                .is_none()
         {
             self.global.sync_pts_registry();
         }
@@ -3031,7 +3036,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let memfds = self.global.memfds.lock();
             memfds.get(&key).map(|e| (e.handle, e.size, e.mapped))
         };
-        let old_was_mapped = old_entry.map(|(_, _, mapped)| mapped).unwrap_or(false);
+        let old_was_mapped = old_entry.is_some_and(|(_, _, mapped)| mapped);
         let old_entry = old_entry.map(|(handle, size, _)| (handle, size));
         let mut carry_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         if let Some((old_handle, old_size)) = old_entry
@@ -3092,27 +3097,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.global.platform.current_host_pid(),
                 MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
             );
-            match self
+            if let Ok(handle) = self
                 .global
                 .platform
                 .create_named_shared_memory(&requested_name, page_aligned_size)
             {
-                Ok(handle) => (handle, Some(requested_name)),
-                Err(_) => {
-                    let handle = self
-                        .global
-                        .platform
-                        .create_shared_memory(page_aligned_size)
-                        .map_err(|_| Errno::ENOMEM)?;
-                    // The named table is spent (128 slots, never freed -- see
-                    // `create_named_shared_memory`). The object still exists; it just has no NAME.
-                    // Ask the platform whether its handle is itself a cross-process identity and
-                    // use that in place of a name, so the memfd is still carryable. Without this
-                    // the object was uncarryable and the whole `sendmsg(SCM_RIGHTS)` was refused,
-                    // which killed the receiving child (`cs4`: 8 refused fds, all `size=131072`,
-                    // all `memfd=registered-but-unnamed`).
-                    (handle, self.global.platform.shared_memory_token_for(handle))
-                }
+                (handle, Some(requested_name))
+            } else {
+                let handle = self
+                    .global
+                    .platform
+                    .create_shared_memory(page_aligned_size)
+                    .map_err(|_| Errno::ENOMEM)?;
+                // The named table is spent (128 slots, never freed -- see
+                // `create_named_shared_memory`). The object still exists; it just has no NAME.
+                // Ask the platform whether its handle is itself a cross-process identity and
+                // use that in place of a name, so the memfd is still carryable. Without this
+                // the object was uncarryable and the whole `sendmsg(SCM_RIGHTS)` was refused,
+                // which killed the receiving child (`cs4`: 8 refused fds, all `size=131072`,
+                // all `memfd=registered-but-unnamed`).
+                (handle, self.global.platform.shared_memory_token_for(handle))
             }
         } else {
             // A counter-derived name is unique only inside one process: a fork child starts from
@@ -3340,6 +3344,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 handle,
             )
         } {
+            // `start` is a page-aligned-mapping offset inside the memfd's length, far below `isize::MAX`.
+            #[allow(clippy::cast_possible_wrap)]
             let _ = ptr.write_slice_at_offset(start as isize, &bytes[..end - start]);
             let user_ptr = UserPtrMut::from_platform_ptr::<Platform>(ptr);
             let _ = litebox_common_linux::mm::sys_munmap(
@@ -3370,10 +3376,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Option<Result<usize, Errno>> {
         let (handle, size) = {
             let memfds = self.global.memfds.lock();
-            match memfds.get(&key) {
-                Some(entry) => (entry.handle, entry.size),
-                None => return None,
-            }
+            let entry = memfds.get(&key)?;
+            (entry.handle, entry.size)
         };
         // `read(2)` with no explicit offset reads at the fd's own current position; the shared
         // object carries no position of its own, so ask the file for it. A pure query -- it moves
@@ -3394,24 +3398,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Some(Ok(0));
         }
         let mapped_len = (start + n).next_multiple_of(PAGE_SIZE);
-        let Some(length) = litebox::mm::linux::NonZeroPageSize::new(mapped_len) else {
-            return None;
-        };
+        let length = litebox::mm::linux::NonZeroPageSize::new(mapped_len)?;
         // SAFETY: a fresh, private, non-fixed mapping of `handle`, read and unmapped here; no
         // guest code ever observes this address and `handle` is owned by `memfds`, so it outlives
         // this transient mapping.
-        let ptr = match unsafe {
+        // Fall through to the ordinary file read rather than failing a read the fd can still
+        // serve from its own bytes.
+        let Ok(ptr) = (unsafe {
             self.process().pm().map_existing_shared_pages(
                 None,
                 length,
                 litebox::mm::linux::CreatePagesFlags::empty(),
                 handle,
             )
-        } {
-            Ok(ptr) => ptr,
-            // Fall through to the ordinary file read rather than failing a read the fd can still
-            // serve from its own bytes.
-            Err(_) => return None,
+        }) else {
+            return None;
         };
         let mut read = 0usize;
         for (i, slot) in buf[..n].iter_mut().enumerate() {
@@ -3782,20 +3783,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 MEMFD_OBJECT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
             );
             // A spent name table must not cost the sender its ability to carry this file at all.
-            match self
+            if let Ok(h) = self
                 .global
                 .platform
                 .create_named_shared_memory(&name, aligned)
             {
-                Ok(h) => (h, Some(name)),
-                Err(_) => {
-                    let h = self
-                        .global
-                        .platform
-                        .create_shared_memory(aligned)
-                        .map_err(|_| "create_shared_memory failed")?;
-                    (h, self.global.platform.shared_memory_token_for(h))
-                }
+                (h, Some(name))
+            } else {
+                let h = self
+                    .global
+                    .platform
+                    .create_shared_memory(aligned)
+                    .map_err(|_| "create_shared_memory failed")?;
+                (h, self.global.platform.shared_memory_token_for(h))
             }
         } else {
             let h = self
@@ -3924,6 +3924,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         name: &str,
         cloexec: bool,
     ) -> Result<usize, Errno> {
+        const AT_FDCWD: i32 = -100;
         // 2026-10-08: this used to build its carrier file under `/dev/shm`, which the chromium
         // rootfs does not contain at all (`diag-snap`: every directory the receiver could reach
         // answered ENOENT, and `/` EACCES), so EVERY `T|` byte-snapshot failed to rebuild with
@@ -3934,7 +3935,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !self.global.platform.env_flag("LITEBOX_FILE_CARRY_FIX_OFF") {
             return self.install_shm_file(name, size, flags, cloexec);
         }
-        const AT_FDCWD: i32 = -100;
         let aligned = size.next_multiple_of(PAGE_SIZE).max(PAGE_SIZE);
         let handle = self
             .global
@@ -4001,7 +4001,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         dir:% = dir, errno:? = e;
                         "diag-snap: snapshot scratch directory unusable"
                     );
-                    continue;
                 }
                 Err(e) => {
                     litebox_util_log::warn!(
@@ -4980,6 +4979,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Ok(n) = res
             && let (Some(path), Some(pos)) = (&publish_target, publish_offset)
         {
+            // The guest pid is a positive `i32`; the publish table stores it as the `u32` owner.
+            #[allow(clippy::cast_sign_loss)]
             let published = self.global.shared_file_publish.publish_at(
                 path.as_bytes(),
                 pos,
@@ -6809,7 +6810,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_stat: returning");
             }
             Err(e) => {
-                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error")
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_stat: error");
             }
         }
         result
@@ -6837,7 +6838,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 litebox_util_log::debug!(tid:% = self.tid.get(), mode:% = mode, rdev:% = rdev; "sys_fstat: returning");
             }
             Err(e) => {
-                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error")
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_fstat: error");
             }
         }
         result
@@ -6896,7 +6897,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
             }
             Err(e) => {
-                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error")
+                litebox_util_log::debug!(tid:% = self.tid.get(), errno:? = e; "sys_newfstatat: error");
             }
         }
         result
@@ -7065,10 +7066,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // here can write to a guest's memfd behind its back, so the protection a seal buys
             // on real Linux (guarding against a malicious peer shrinking a shared buffer) has no
             // corresponding threat in this single-address-space shim.
-            FcntlArg::ADD_SEALS(_) => Ok(0),
             // Report no seals set. Claiming seals we do not enforce would be worse: a caller
             // that checks before trusting a buffer would get a false assurance.
-            FcntlArg::GET_SEALS => Ok(0),
+            FcntlArg::ADD_SEALS(_) | FcntlArg::GET_SEALS => Ok(0),
             FcntlArg::GETFD => Ok(get_file_descriptor_flags(desc, &self.global, &files)?.bits()),
             FcntlArg::SETFD(flags) => {
                 set_file_descriptor_flags(desc, &self.global, &files, flags).map(|()| 0)
@@ -7368,8 +7368,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                                         litebox_common_linux::FlockType::ReadLock
                                     } as i16;
                                     flock.whence = 0;
-                                    flock.start = s as usize;
-                                    flock.len = if e == u64::MAX { 0 } else { (e - s) as isize };
+                                    // litebox runs only on 64-bit hosts, where `usize` is 64 bits wide.
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let start_bytes = s as usize;
+                                    flock.start = start_bytes;
+                                    // Same value as the cast it replaces; only the sign-changing cast is named here.
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    let len_bytes = if e == u64::MAX {
+                                        0
+                                    } else {
+                                        isize::try_from(e - s).unwrap_or(isize::MAX)
+                                    };
+                                    flock.len = len_bytes;
                                     flock.pid = pid;
                                 }
                             }
@@ -7486,16 +7496,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// `len == 0` means "to end of file").
     fn record_lock_range(flock: &litebox_common_linux::Flock) -> Result<(u64, u64), Errno> {
         let start = flock.start as u64;
-        if flock.len == 0 {
-            Ok((start, u64::MAX))
-        } else if flock.len > 0 {
-            Ok((start, start.saturating_add(flock.len as u64)))
-        } else {
-            let len = flock.len.unsigned_abs() as u64;
-            start
-                .checked_sub(len)
-                .map(|s| (s, start))
-                .ok_or(Errno::EINVAL)
+        match flock.len.cmp(&0) {
+            core::cmp::Ordering::Equal => Ok((start, u64::MAX)),
+            core::cmp::Ordering::Greater => {
+                Ok((start, start.saturating_add(flock.len.unsigned_abs() as u64)))
+            }
+            core::cmp::Ordering::Less => {
+                let len = flock.len.unsigned_abs() as u64;
+                start
+                    .checked_sub(len)
+                    .map(|s| (s, start))
+                    .ok_or(Errno::EINVAL)
+            }
         }
     }
 
@@ -8218,7 +8230,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             let wall_now =
                                 self.real_time_as_duration_since_epoch().unwrap_or_default();
                             if value > wall_now {
-                                now.checked_add(value - wall_now)
+                                now.checked_add(value.saturating_sub(wall_now))
                             } else {
                                 Some(now)
                             }
@@ -8436,12 +8448,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
-            // All four are ptmx-master-specific: meaningless (and `ENOTTY` on real Linux) for a
-            // plain stdio fd, unlike `pty_ioctl`'s handling of the same commands on an actual pty.
-            IoctlArg::TIOCGPTN(_)
-            | IoctlArg::TIOCSPTLCK(_)
-            | IoctlArg::TIOCGPTPEER(_)
-            | IoctlArg::TIOCPKT(_) => Err(Errno::ENOTTY),
             IoctlArg::TIOCGPGRP(pgrp_ptr) => {
                 let dt = self.global.litebox.descriptor_table();
                 let pgid = dt
@@ -8479,6 +8485,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // this build's "accept every TCSETS*-family ioctl" stance rather than ENOTTY.
                 Ok(0)
             }
+            // `TIOCGPTN`/`TIOCSPTLCK`/`TIOCGPTPEER`/`TIOCPKT` are ptmx-master-specific: meaningless
+            // (and `ENOTTY` on real Linux) for a plain stdio fd, unlike `pty_ioctl`'s handling of the
+            // same commands on an actual pty. They land here with every other unhandled command.
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -8561,6 +8570,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if !end.is_master() {
                     return Err(Errno::ENOTTY);
                 }
+                // The ioctl carries the open(2) flag word as a C `int`; its bit pattern is the `u32` mask.
+                #[allow(clippy::cast_sign_loss)]
                 let flags = OFlags::from_bits_truncate(*flags as u32);
                 let slave = self.global.pts_open(pair.id())?;
                 let path = alloc::ffi::CString::new(alloc::format!("/dev/pts/{}", pair.id()))
@@ -8913,7 +8924,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         let proxy = self.global.get_proxy(fd)?;
                         Ok(proxy.pending_rx_bytes())
                     },
-                    |_unix| {
+                    |unix| {
                         // Linux's `FIONREAD` (`SIOCINQ`) reports the bytes queued for a receive on
                         // a unix socket too: `unix_ioctl` only refuses it for a *listening* inet
                         // socket. EINVAL here made a guest that polls its Mojo channel for how
@@ -8925,7 +8936,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         {
                             return Err(Errno::EINVAL);
                         }
-                        Ok(_unix.readable_bytes().ok_or(Errno::EINVAL)?)
+                        unix.readable_bytes().ok_or(Errno::EINVAL)
                     },
                 )?;
                 out.write_at_offset::<Platform>(0, i32::try_from(n).unwrap_or(i32::MAX))
@@ -9312,6 +9323,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(u32::try_from(write_len).unwrap_or(0))
             }
             IoctlArg::EvdevGetName { len, arg: ptr } => {
+                const NAME: &[u8] = b"litebox virtual input";
                 files.run_on_raw_fd(
                     desc,
                     |fd| {
@@ -9337,7 +9349,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // NUL-terminate if the name fills the whole buffer; callers size their own
                 // buffer and rely on the returned byte count, so truncate to fit without
                 // requiring a trailing NUL.
-                const NAME: &[u8] = b"litebox virtual input";
                 let write_len = usize::try_from(len).unwrap_or(0).min(NAME.len());
                 ptr.write_slice_at_offset::<Platform>(0, &NAME[..write_len])
                     .ok_or(Errno::EFAULT)?;
@@ -10489,7 +10500,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fd:% = raw, flags:% = flags.bits();
             "diag-fcarry: carried fd installed as a degraded private file"
         );
-        Some(u32::try_from(raw).ok()?)
+        u32::try_from(raw).ok()
     }
 
     /// Whether `path` resolves only inside this process's own writable layer, so that another
@@ -10728,7 +10739,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             s.size,
                             s.node_info.ino,
                             s.node_info.dev,
-                            s.node_info.rdev.map(|r| r.get()).unwrap_or(0),
+                            s.node_info.rdev.map_or(0, core::num::NonZero::get),
                             is_memfd,
                         ))
                     },
@@ -10758,14 +10769,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Which half of the memfd carry failed: the registry lookup (this fd was never
         // `ftruncate`d, so no shared object exists yet) or the name (an object with no name
         // cannot be reopened by another host process).
-        let memfd_state = if !is_memfd {
-            "not-a-memfd"
-        } else {
+        let memfd_state = if is_memfd {
             match self.global.memfds.lock().get(&(dev, ino)) {
                 None => "unregistered",
                 Some(e) if e.name.is_none() => "registered-but-unnamed",
                 Some(_) => "registered-and-named",
             }
+        } else {
+            "not-a-memfd"
         };
         let stage = match self.snapshot_nameless_file_stage(raw_fd) {
             Ok(_) => "snapshot-ok",
@@ -10862,7 +10873,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // gets to see: the byte payload beside it was still genuinely delivered.
             return self
                 .install_inet_carried(carried, cloexec)
-                .map(|raw| raw as usize)
+                .and_then(|raw| usize::try_from(raw).ok())
                 .ok_or(Errno::EBADF);
         }
         let mut parts = spec.splitn(4, '|');
@@ -11030,16 +11041,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Receiving half of a unix socket passed by `SCM_RIGHTS` over a cross-process connection:
     /// `carried` is `<cloexec 0|1>|<fork spec>` as produced by [`Self::raw_fd_unix_carry`].
     fn rebuild_carried_unix(&self, carried: &str, cloexec: bool) -> Result<usize, Errno> {
-        let (sender_cloexec, spec) = carried.split_once('|').ok_or(Errno::EINVAL)?;
-        let socket = match crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec) {
-            Some(socket) => socket,
-            None => {
-                // A spec this process cannot rebuild still carries the sender's counted hold;
-                // without this the shared connection slot stays occupied (see
-                // `UnixSocket::release_unadopted_carry`).
-                crate::syscalls::unix::UnixSocket::release_unadopted_carry(&self.global, spec);
-                return Err(Errno::EINVAL);
-            }
+        let (_sender_cloexec, spec) = carried.split_once('|').ok_or(Errno::EINVAL)?;
+        let Some(socket) = crate::syscalls::unix::UnixSocket::from_fork_spec(self, spec) else {
+            // A spec this process cannot rebuild still carries the sender's counted hold;
+            // without this the shared connection slot stays occupied (see
+            // `UnixSocket::release_unadopted_carry`).
+            crate::syscalls::unix::UnixSocket::release_unadopted_carry(&self.global, spec);
+            return Err(Errno::EINVAL);
         };
         let typed = self
             .global
@@ -11053,7 +11061,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Errno::EMFILE
             })?
         };
-        if cloexec || sender_cloexec == "1" && cloexec {
+        if cloexec {
             let files = self.files.borrow();
             set_file_descriptor_flags(raw, &self.global, &files, FileDescriptorFlags::FD_CLOEXEC)?;
         }
@@ -11146,8 +11154,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn raw_fd_is_cloexec(&self, raw_fd: usize) -> bool {
         let files = self.files.borrow();
         crate::syscalls::file::get_file_descriptor_flags(raw_fd, &self.global, &files)
-            .map(|f| f.contains(FileDescriptorFlags::FD_CLOEXEC))
-            .unwrap_or(false)
+            .is_ok_and(|f| f.contains(FileDescriptorFlags::FD_CLOEXEC))
     }
 
     /// See `FilesState::raw_fd_unix_carry_check` (`net.rs`).
@@ -11248,20 +11255,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // <net spec>`). Every rejection below is LOGGED rather than a bare `?`: the guest-visible
         // symptom is only `EBADF` on one inherited fd, and a silent `None` here is what made the
         // whole carry look like "the child never got an fd" with no evidence in the run's log.
-        let (cloexec, v6, nonblock, net_spec) =
-            match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some(a), Some(b), Some(c), Some(d)) => (a == "1", b == "1", c == "1", d),
-                _ => {
-                    litebox_util_log::warn!(
-                        spec:% = spec;
-                        "carry: malformed inet carry spec; this fd is left missing (EBADF)"
-                    );
-                    return None;
-                }
-            };
+        let (Some(a), Some(b), Some(c), Some(d)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            litebox_util_log::warn!(
+                spec:% = spec;
+                "carry: malformed inet carry spec; this fd is left missing (EBADF)"
+            );
+            return None;
+        };
+        let (cloexec, v6, nonblock, net_spec) = (a == "1", b == "1", c == "1", d);
         let sock_type = match net_spec.as_bytes().first() {
-            Some(b'T') | Some(b'L') => SockType::Stream,
-            Some(b'U') | Some(b'u') => SockType::Datagram,
+            Some(b'T' | b'L') => SockType::Stream,
+            Some(b'U' | b'u') => SockType::Datagram,
             _ => {
                 litebox_util_log::warn!(
                     spec:% = spec;
@@ -11366,7 +11372,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .litebox
             .descriptor_table()
             .entry_handle(&epoll_fd)?;
-        let spec = handle.with_entry(|entry| entry.fork_carry_spec());
+        let spec = handle.with_entry(super::epoll::EpollFile::fork_carry_spec);
         drop(files);
         Some(alloc::format!(
             "{}|{spec}",
@@ -11393,7 +11399,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_common_linux::EpollCreateFlags::empty()
         };
         let raw = i32::try_from(self.sys_epoll_create(flags).ok()?).ok()?;
-        let epfd = if raw != target_fd {
+        let epfd = if raw == target_fd {
+            raw
+        } else {
             let moved = self
                 .sys_dup(raw, Some(target_fd), cloexec.then_some(OFlags::CLOEXEC))
                 .is_ok();
@@ -11402,15 +11410,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return None;
             }
             target_fd
-        } else {
-            raw
         };
         let epfd_u32 = u32::try_from(epfd).ok()?;
         let files = self.files.borrow();
         let epoll_fd = files
             .raw_descriptor_store
             .read()
-            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd as usize)
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd_u32 as usize)
             .ok()?;
         let handle = self
             .global

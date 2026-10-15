@@ -338,10 +338,10 @@ fn skip(why: &str) {
 /// before the guest ever sees an interface, which used to be reported as a test failure on hosts
 /// that simply cannot do TUN at all.
 fn tun_available() -> bool {
+    const CAP_NET_ADMIN: u64 = 1 << 12;
     if !Path::new("/dev/net/tun").exists() {
         return false;
     }
-    const CAP_NET_ADMIN: u64 = 1 << 12;
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -687,6 +687,7 @@ fn test_tun_with_tcp_socket() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tun_and_runner_with_iperf3() {
+    const NUM_CLIENTS: usize = 1;
     if !tun_available() {
         skip("no /dev/net/tun or no CAP_NET_ADMIN on this host");
         return;
@@ -695,7 +696,6 @@ fn test_tun_and_runner_with_iperf3() {
         skip("iperf3 is not installed on this host");
         return;
     };
-    const NUM_CLIENTS: usize = 1;
     let cloned_path = iperf3_path.clone();
     let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let has_started_clone = has_started.clone();
@@ -752,6 +752,8 @@ fn test_tun_with_curl() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
+
     if !tun_available() {
         skip("no /dev/net/tun or no CAP_NET_ADMIN on this host");
         return;
@@ -760,8 +762,6 @@ fn test_tun_with_curl() {
         skip("curl is not installed on this host");
         return;
     };
-
-    const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
 
     // Bind to an OS-assigned port on all interfaces.
     let listener = TcpListener::bind("0.0.0.0:0").expect("Failed to bind HTTP server");

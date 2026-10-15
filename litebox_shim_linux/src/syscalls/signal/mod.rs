@@ -857,7 +857,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             let step = match deadline {
                 Some(d) if waited >= d => return Err(Errno::EAGAIN),
-                Some(d) => slice.min(d - waited),
+                Some(d) => slice.min(d.saturating_sub(waited)),
                 None => slice,
             };
             let _ = self.wait_cx().with_timeout(step).sleep();
@@ -870,10 +870,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_rt_tgsigqueueinfo(
         &self,
         tgid: i32,
-        tid: i32,
+        thread_id: i32,
         sig: i32,
     ) -> Result<usize, Errno> {
-        self.do_kill(Some(tgid), Some(tid), sig)
+        self.do_kill(Some(tgid), Some(thread_id), sig)
     }
 
     pub(crate) fn sys_rt_sigqueueinfo(&self, pid: i32, sig: i32) -> Result<usize, Errno> {

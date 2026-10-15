@@ -103,7 +103,7 @@ fn parse_reference(image_ref: &str) -> anyhow::Result<Reference> {
         _ => ("docker.io".to_owned(), name.to_owned()),
     };
     if registry == "index.docker.io" {
-        registry = "docker.io".to_owned();
+        "docker.io".clone_into(&mut registry);
     }
     if registry == "docker.io" && !repository.contains('/') {
         repository = format!("library/{repository}");
@@ -659,6 +659,10 @@ pub mod cache {
     /// `Cow::Owned(data)` -- the caller still gets correct bytes, just not the memory-cheap path
     /// for this one layer. That failure is exactly what `write_cached_layer` already tolerates
     /// (best-effort, never fails the boot), so this must tolerate it too.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the layer was written to the cache but cannot be re-read and mapped right after.
     pub fn write_and_map_cached_layer(
         layer_digest: &str,
         rewriter_version: u32,
@@ -1076,6 +1080,12 @@ fn pull_layers_in_memory_impl(
         let rewriter_version = litebox_syscall_rewriter::REWRITER_CACHE_VERSION;
         let layer_loop_t0 = std::time::Instant::now();
         for (i, layer_desc) in resolved_layers.iter().enumerate() {
+            enum DecompressedSource {
+                Mmapped { mmap: memmap2::Mmap, tmp_path: PathBuf },
+                #[allow(dead_code, reason = "both branches now mmap; kept for fallback shape")]
+                InMemory(Vec<u8>),
+            }
+
             if !accepted_media_types.contains(&layer_desc.media_type.as_str()) {
                 anyhow::bail!("unsupported layer media type: {}", layer_desc.media_type);
             }
@@ -1160,12 +1170,6 @@ fn pull_layers_in_memory_impl(
             // allocation being unconditionally resident -- see `cache::write_and_map_cached_layer`
             // and `litebox_runner_linux_on_windows_userland::mmapped_file` for the identical
             // established pattern this reuses.
-            enum DecompressedSource {
-                Mmapped { mmap: memmap2::Mmap, tmp_path: PathBuf },
-                #[allow(dead_code, reason = "both branches now mmap; kept for fallback shape")]
-                InMemory(Vec<u8>),
-            }
-
             let source = if is_gzip {
                 let unique = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2019,6 +2023,10 @@ fn link_target_for(
         .map(|t| t.to_string_lossy().replace('\\', "/"))
 }
 
+#[allow(
+    clippy::implicit_hasher,
+    reason = "every caller passes the std default-hasher map"
+)]
 pub fn scan_rootfs(
     rootfs: &Path,
     symlink_map: &HashMap<PathBuf, PathBuf>,
@@ -2261,84 +2269,6 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
     resolve_in_rootfs(&resolved, rootfs, max_depth - 1)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_symlink_in_rootfs_happy_paths() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-        std::fs::write(rootfs.join("usr/lib64/libc.so"), b"fake").unwrap();
-        std::fs::write(rootfs.join("usr/lib64/foo.so"), b"elf").unwrap();
-        std::fs::write(rootfs.join("usr/lib/libfoo.so"), b"elf").unwrap();
-        std::fs::write(rootfs.join("usr/bin/sh"), b"elf").unwrap();
-        std::fs::write(rootfs.join("c"), b"data").unwrap();
-
-        let mut symlink_map = HashMap::new();
-        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
-        symlink_map.insert(PathBuf::from("a"), PathBuf::from("b"));
-        symlink_map.insert(PathBuf::from("b"), PathBuf::from("c"));
-        symlink_map.insert(PathBuf::from("bin/sh"), PathBuf::from("/usr/bin/sh"));
-        symlink_map.insert(
-            PathBuf::from("usr/lib64/libfoo.so"),
-            PathBuf::from("../lib/libfoo.so"),
-        );
-
-        // Direct symlink: lib64 -> usr/lib64
-        let r = resolve_symlink_in_rootfs(Path::new("lib64"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib64")));
-
-        // Chain: a -> b -> c
-        let r = resolve_symlink_in_rootfs(Path::new("a"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("c")));
-
-        // Absolute target: bin/sh -> /usr/bin/sh
-        let r = resolve_symlink_in_rootfs(Path::new("bin/sh"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/bin/sh")));
-
-        // Relative target: usr/lib64/libfoo.so -> ../lib/libfoo.so
-        let r =
-            resolve_symlink_in_rootfs(Path::new("usr/lib64/libfoo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib/libfoo.so")));
-
-        // Ancestor is symlink: lib64/foo.so resolves via lib64 -> usr/lib64
-        let r = resolve_symlink_in_rootfs(Path::new("lib64/foo.so"), rootfs, &symlink_map, 32);
-        assert_eq!(r, Some(rootfs.join("usr/lib64/foo.so")));
-    }
-
-    #[test]
-    fn resolve_symlink_in_rootfs_edge_cases() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path();
-        std::fs::write(rootfs.join("hello.txt"), b"hi").unwrap();
-
-        // Cycle: a -> b -> a
-        let mut cycle_map = HashMap::new();
-        cycle_map.insert(PathBuf::from("a"), PathBuf::from("b"));
-        cycle_map.insert(PathBuf::from("b"), PathBuf::from("a"));
-        assert!(resolve_symlink_in_rootfs(Path::new("a"), rootfs, &cycle_map, 32).is_none());
-
-        let empty_map = HashMap::new();
-
-        // Empty path
-        assert!(resolve_symlink_in_rootfs(Path::new(""), rootfs, &empty_map, 32).is_none());
-
-        // Nonexistent path
-        assert!(
-            resolve_symlink_in_rootfs(Path::new("does/not/exist"), rootfs, &empty_map, 32)
-                .is_none()
-        );
-
-        // Regular file (not a symlink) returns host path directly
-        let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
-        assert_eq!(r, Some(rootfs.join("hello.txt")));
-    }
-}
-
 /// Downloads one layer blob to `path`, surviving a stalled or dropped connection.
 ///
 /// A single `pull_blob` call has no notion of progress: on a slow or flaky link it can trickle
@@ -2415,11 +2345,16 @@ async fn pull_layer_resumable(
                     if verbose && last_report.elapsed() >= std::time::Duration::from_secs(10) {
                         last_report = std::time::Instant::now();
                         let secs = started.elapsed().as_secs_f64().max(0.001);
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            reason = "display-only rate; f64 rounding of a byte count is invisible"
+                        )]
+                        let kib_per_s = offset as f64 / 1024.0 / secs;
                         eprintln!(
                             "  layer download: {} / {} MB ({:.0} KB/s avg)",
                             offset >> 20,
                             total >> 20,
-                            offset as f64 / 1024.0 / secs
+                            kib_per_s
                         );
                     }
                 }
@@ -2471,15 +2406,93 @@ async fn pull_layer_resumable(
             }
             hasher.update(&buf[..n]);
         }
-        let actual: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let actual: String = hasher.finalize().iter().fold(String::new(), |mut hex, b| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+            hex
+        });
         anyhow::ensure!(
             actual == expected,
             "layer digest mismatch after download: expected sha256:{expected}, got sha256:{actual}"
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_symlink_in_rootfs_happy_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        std::fs::create_dir_all(rootfs.join("usr/lib64")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::write(rootfs.join("usr/lib64/libc.so"), b"fake").unwrap();
+        std::fs::write(rootfs.join("usr/lib64/foo.so"), b"elf").unwrap();
+        std::fs::write(rootfs.join("usr/lib/libfoo.so"), b"elf").unwrap();
+        std::fs::write(rootfs.join("usr/bin/sh"), b"elf").unwrap();
+        std::fs::write(rootfs.join("c"), b"data").unwrap();
+
+        let mut symlink_map = HashMap::new();
+        symlink_map.insert(PathBuf::from("lib64"), PathBuf::from("usr/lib64"));
+        symlink_map.insert(PathBuf::from("a"), PathBuf::from("b"));
+        symlink_map.insert(PathBuf::from("b"), PathBuf::from("c"));
+        symlink_map.insert(PathBuf::from("bin/sh"), PathBuf::from("/usr/bin/sh"));
+        symlink_map.insert(
+            PathBuf::from("usr/lib64/libfoo.so"),
+            PathBuf::from("../lib/libfoo.so"),
+        );
+
+        // Direct symlink: lib64 -> usr/lib64
+        let r = resolve_symlink_in_rootfs(Path::new("lib64"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/lib64")));
+
+        // Chain: a -> b -> c
+        let r = resolve_symlink_in_rootfs(Path::new("a"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("c")));
+
+        // Absolute target: bin/sh -> /usr/bin/sh
+        let r = resolve_symlink_in_rootfs(Path::new("bin/sh"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/bin/sh")));
+
+        // Relative target: usr/lib64/libfoo.so -> ../lib/libfoo.so
+        let r =
+            resolve_symlink_in_rootfs(Path::new("usr/lib64/libfoo.so"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/lib/libfoo.so")));
+
+        // Ancestor is symlink: lib64/foo.so resolves via lib64 -> usr/lib64
+        let r = resolve_symlink_in_rootfs(Path::new("lib64/foo.so"), rootfs, &symlink_map, 32);
+        assert_eq!(r, Some(rootfs.join("usr/lib64/foo.so")));
+    }
+
+    #[test]
+    fn resolve_symlink_in_rootfs_edge_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        std::fs::write(rootfs.join("hello.txt"), b"hi").unwrap();
+
+        // Cycle: a -> b -> a
+        let mut cycle_map = HashMap::new();
+        cycle_map.insert(PathBuf::from("a"), PathBuf::from("b"));
+        cycle_map.insert(PathBuf::from("b"), PathBuf::from("a"));
+        assert!(resolve_symlink_in_rootfs(Path::new("a"), rootfs, &cycle_map, 32).is_none());
+
+        let empty_map = HashMap::new();
+
+        // Empty path
+        assert!(resolve_symlink_in_rootfs(Path::new(""), rootfs, &empty_map, 32).is_none());
+
+        // Nonexistent path
+        assert!(
+            resolve_symlink_in_rootfs(Path::new("does/not/exist"), rootfs, &empty_map, 32)
+                .is_none()
+        );
+
+        // Regular file (not a symlink) returns host path directly
+        let r = resolve_symlink_in_rootfs(Path::new("hello.txt"), rootfs, &empty_map, 32);
+        assert_eq!(r, Some(rootfs.join("hello.txt")));
+    }
 }

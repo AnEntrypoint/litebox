@@ -1277,6 +1277,8 @@ pub trait ForkChildVerificationProvider {
     /// sigreturn-recognition logic no longer recognizes as such -- see
     /// `Task::ensure_sigreturn_trampoline`'s x86_64 doc comment for why that page is never meant
     /// to be actually executed, only recognized.
+    // The ten inputs are the fork child's separately-owned inheritance lists; one struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_cross_process_fork_child(
         &'static self,
         relocations: &crate::mm::AddressRelocations,
@@ -1598,10 +1600,17 @@ pub enum ForkPipeRead {
 /// signal a guest gives by closing its last descriptor.
 pub enum ForkPipeBridge {
     /// The child writes; bytes flow child -> parent. See the type's own doc comment.
-    Sink(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>>),
+    Sink(ForkPipeSink),
     /// The child reads; bytes flow parent -> child. See the type's own doc comment.
-    Source(ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>>),
+    Source(ForkPipeSource),
 }
+
+/// The child-writes end of a [`ForkPipeBridge`]: its byte transfer, child -> parent.
+pub type ForkPipeSink = ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&[u8]) -> Option<usize> + Send>>;
+
+/// The child-reads end of a [`ForkPipeBridge`]: its byte transfer, parent -> child.
+pub type ForkPipeSource =
+    ForkPipeEnd<alloc::boxed::Box<dyn FnMut(&mut [u8]) -> ForkPipeRead + Send>>;
 
 impl ForkPipeBridge {
     /// Whether the parent-side pipe has no writer left and nothing buffered, so the only thing any
@@ -1735,12 +1744,15 @@ impl core::fmt::Debug for ForkPipeBridge {
 
 /// One direction of a [`ForkPipeBridge`]: the transfer closure, plus the liveness probe both
 /// variants need.
+/// A peek at buffered bytes without consuming them: fills the slice, returns the count.
+pub type ForkPipePeek = alloc::boxed::Box<dyn Fn(&mut [u8]) -> usize + Send>;
+
 pub struct ForkPipeEnd<F> {
     transfer: F,
     owners: alloc::boxed::Box<dyn Fn() -> usize + Send>,
     at_eof: alloc::boxed::Box<dyn Fn() -> bool + Send>,
     pending: alloc::boxed::Box<dyn Fn() -> usize + Send>,
-    peek: alloc::boxed::Box<dyn Fn(&mut [u8]) -> usize + Send>,
+    peek: ForkPipePeek,
     peer_shutdown: alloc::boxed::Box<dyn Fn() -> bool + Send>,
     buffered_belongs_to_child: bool,
     cloexec: bool,

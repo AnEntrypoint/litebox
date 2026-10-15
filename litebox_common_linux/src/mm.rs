@@ -99,7 +99,7 @@ pub fn do_mmap<
     // the still-unexplained EEXIST regression (passes 213-225 exhausted every other candidate).
     if is_fixed_addr {
         litebox_util_log::debug!(
-            requested:? = suggested_addr.map(|a| a.as_usize()),
+            requested:? = suggested_addr.map(litebox::mm::linux::NonZeroAddress::as_usize),
             actual:? = result.as_ref().ok().map(litebox::platform::RawConstPointer::as_usize),
             is_err:% = result.is_err();
             "DIAG do_mmap: fixed-addr call result"

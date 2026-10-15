@@ -106,6 +106,9 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// per-process `Arc`, never routed through `SharedKernelStateProvider`. Still deliberately
     /// not a blanket `#[derive(Clone)]`: external users outside this trust boundary should keep
     /// constructing a `LiteBox` only via [`Self::new`].
+    // Deliberately not `Clone`, per the doc comment above: a bare `clone` must not be reachable through the trait.
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
     pub fn clone(&self) -> Self {
         Self {
             x: Arc::clone(&self.x),

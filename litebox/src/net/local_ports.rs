@@ -42,6 +42,10 @@ impl LocalPortAllocator {
     const PORT_COUNT: usize = u16::MAX as usize;
 
     /// Sets up a new local port allocator
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the port refcount table is a fixed inline array of PORT_COUNT entries by design"
+    )]
     pub(crate) fn new() -> Self {
         Self {
             refcount: [0; Self::PORT_COUNT],
@@ -156,6 +160,10 @@ impl LocalPortAllocator {
     /// respectively), so this reset only needs to guarantee every NEW allocation after this point
     /// starts from a clean, self-consistent table, not that every pre-existing token's later use
     /// stays fully correct.
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the port refcount table is a fixed inline array of PORT_COUNT entries by design"
+    )]
     pub(crate) fn reset_after_poisoning(&mut self) {
         self.refcount = [0; Self::PORT_COUNT];
     }
