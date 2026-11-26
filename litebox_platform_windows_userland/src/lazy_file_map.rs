@@ -641,7 +641,6 @@ fn sources() -> MutexGuard<'static, Vec<(usize, usize)>> {
     SOURCES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Declares that `data` is source number `index`. The numbering must be the same in every process
@@ -786,7 +785,6 @@ pub fn adopt_from_file(path: &str) {
                         span.len(),
                         PAGE_NOACCESS,
                         &raw mut previous,
-                        &mut previous,
                     );
                 }
             }

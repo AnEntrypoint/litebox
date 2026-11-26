@@ -3226,7 +3226,6 @@ where
             socket_handle.handle,
             socket_handle.slot_gen,
         ) {
-        if !Self::socket_set_contains(&self.socket_set, socket_handle.handle) {
             return None;
         }
         match socket_handle.protocol() {
@@ -3273,7 +3272,6 @@ where
                     "fork_carry_spec:udp",
                 )?;
                 let endpoint = socket.endpoint();
-                let endpoint = self.socket_set.get::<udp::Socket>(socket_handle.handle).endpoint();
                 let remote = socket_handle.udp().remote_endpoint;
                 if endpoint.port == 0 && remote.is_none() {
                     // Never bound, never connected: the child can simply make its own.
@@ -3339,8 +3337,6 @@ where
                 // connection, whose bytes this child would then read and whose buffers it would
                 // release.
                 let slot_gen = self.mint_handle_generation(handle);
-                    (socket.local_endpoint() == Some(local) && socket.remote_endpoint() == Some(remote))
-                        .then_some(handle)
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -3426,12 +3422,6 @@ where
                 }
                 // Added above, so the slot's generation is this child's to stamp.
                 let slot_gen = self.mint_handle_generation(handle);
-                let mut server_socket = TcpServerSpecific {
-                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                    backlog: Some(backlog.max(1)),
-                    socket_set_handles: Vec::new(),
-                };
-                server_socket.refill_to_backlog(&mut self.socket_set, &mut self.buffers);
                 Some(self.new_socket_fd_for(SocketHandle {
                     consider_closed: core::sync::atomic::AtomicBool::new(false),
                     shutdown_wr_pending: false,
@@ -3456,8 +3446,6 @@ where
                     borrowed: true,
                     // ...but the socket itself was added above, for this referent alone.
                     own_slot: true,
-                        server_socket: Some(server_socket),
-                    borrowed: false,
                 }))
             }
             // UDP, bound: found by its bound endpoint (unique per the local-port allocator).

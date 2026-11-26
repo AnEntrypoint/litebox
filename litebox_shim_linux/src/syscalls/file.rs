@@ -11250,14 +11250,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// (`MSG_CMSG_CLOEXEC`) - the sender's bit describes the sender's fd, which this process does
     /// not have. The fork path passes the spec's own bit, where the child's fd is meant to be the
     /// same fd.
-    pub(crate) fn install_inet_carried(&self, spec: &str, _cloexec: bool) -> Option<i32> {
+    pub(crate) fn install_inet_carried(&self, spec: &str, cloexec: bool) -> Option<i32> {
         use litebox_common_linux::{SockFlags, SockType};
         let mut parts = spec.split('|');
-        // Parsed in the order `FilesState::raw_fd_inet_carry` writes it (`<cloexec>|<v6>|<nonblock>|
-        // <net spec>`). Every rejection below is LOGGED rather than a bare `?`: the guest-visible
-        // symptom is only `EBADF` on one inherited fd, and a silent `None` here is what made the
-        // whole carry look like "the child never got an fd" with no evidence in the run's log.
-        let (Some(a), Some(b), Some(c), Some(d)) =
+        let (Some(_carried_cloexec), Some(v6_flag), Some(nonblock_flag), Some(net_spec)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             litebox_util_log::warn!(
@@ -11266,7 +11262,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return None;
         };
-        let (cloexec, v6, nonblock, net_spec) = (a == "1", b == "1", c == "1", d);
+        let (v6, nonblock) = (v6_flag == "1", nonblock_flag == "1");
         let sock_type = match net_spec.as_bytes().first() {
             Some(b'T' | b'L') => SockType::Stream,
             Some(b'U' | b'u') => SockType::Datagram,
@@ -11277,24 +11273,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 return None;
             }
-        let spec = self.files.borrow().raw_fd_inet_carry(&self.global, raw_fd)?;
-    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried (see
-    /// `Task::raw_fd_inet_carry`). The child attaches to the SAME `Network` socket its parent
-    /// holds, located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
-    /// reference, so closing it here cannot tear down the parent's.
-    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
-        let cloexec = parts.next()? == "1";
-        let v6 = parts.next()? == "1";
-        let nonblock = parts.next()? == "1";
-        let net_spec = parts.next()?;
-        let sock_type = match net_spec.as_bytes().first()? {
-            b'T' | b'L' => SockType::Stream,
-            _ => SockType::Datagram,
         };
         let mut flags = SockFlags::empty();
         flags.set(SockFlags::NONBLOCK, nonblock);
         flags.set(SockFlags::CLOEXEC, cloexec);
-
         let Some(socket) = self.global.net_lock().fork_adopt(net_spec) else {
             litebox_util_log::warn!(
                 spec:% = net_spec;
@@ -11303,20 +11285,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return None;
         };
         let proxy = self.global.initialize_socket(&socket, sock_type, flags);
-        // A carried UDP socket that was `connect(2)`ed needs TWO things restored, not one.
-        // `fork_adopt` restores the network-side peer (`UdpSpecific::remote_endpoint`), but the
-        // shim sends through the `NetworkProxy::Datagram` channel `initialize_socket` just built
-        // fresh above -- and that channel carries its OWN peer bit:
-        // `DatagramSocketChannel::send_to` returns `DestinationAddressRequired` whenever
-        // `addr.is_none()` and the channel is not marked connected. A brand-new channel never is,
-        // so a `send()` on a carried CONNECTED datagram socket failed with EDESTADDRREQ while the
-        // socket underneath was correctly connected. `SocketState::Connected` is the public way to
-        // set that bit (`NetworkProxy::set_state`); the actual address still comes from
-        // `remote_endpoint` further down, so nothing is duplicated here.
-        //
-        // `set_local_port` is the same story from the other side: the channel's port is what
-        // `GlobalStateHandle::sendto` checks before it "auto-binds", and an auto-bind on a socket
-        // the PARENT owns would take a second ephemeral port for a socket that already has one.
         if let litebox::net::socket_channel::NetworkProxy::Datagram(channel) = proxy.as_ref() {
             let mut fields = net_spec.split(',');
             let kind = fields.next();
@@ -11333,8 +11301,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             }
         }
-        let socket = self.global.net_lock().fork_adopt(net_spec)?;
-        self.global.initialize_socket(&socket, sock_type, flags);
         if v6 {
             let mut dt = self.global.litebox.descriptor_table_mut();
             let _ = dt.with_metadata_mut(&socket, |o: &mut super::net::SocketOptions| {
@@ -11485,81 +11451,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             epfd:% = epfd, restored:% = restored, lost:% = lost;
             "fork child: rebuilt a carried epoll set"
         );
-        let dup_flags = cloexec.then_some(OFlags::CLOEXEC);
-            let moved = self.sys_dup(raw, Some(target_fd), dup_flags).is_ok();
-        if dup_flags.is_some() {
-            let desc = usize::try_from(target_fd).ok()?;
-            set_file_descriptor_flags(
-                desc,
-                &self.global,
-                &files,
-                FileDescriptorFlags::FD_CLOEXEC,
-            )
-        Some(())
-    }
-
-    /// See `FilesState::raw_fd_inet_carry` (`net.rs`). `None` means this fd is an INET socket
-    /// whose state cannot be named across a process boundary; the caller then DROPS the fd in the
-    /// child instead of refusing the fork (see `try_cross_process_fork`).
-    pub(crate) fn raw_fd_inet_carry(&self, raw_fd: usize) -> Option<alloc::string::String> {
-        let cloexec = self.raw_fd_is_cloexec(raw_fd);
-        let spec = self.files.borrow().raw_fd_inet_carry(&self.global, raw_fd)?;
-        Some(alloc::format!("{}|{spec}", u8::from(cloexec)))
-    }
-
-    /// Rebuilds, at exactly `target_fd`, an INET socket a cross-process fork parent carried (see
-    /// `Task::raw_fd_inet_carry`). The child attaches to the SAME `Network` socket its parent
-    /// holds, located by endpoints -- a carried TCP connection or bound UDP socket is a borrowed
-    /// reference, so closing it here cannot tear down the parent's.
-    pub(crate) fn install_inet_at_fd(&self, target_fd: i32, spec: &str) -> Option<()> {
-        use litebox_common_linux::{SockFlags, SockType};
-        let mut parts = spec.split('|');
-        let cloexec = parts.next()? == "1";
-        let v6 = parts.next()? == "1";
-        let nonblock = parts.next()? == "1";
-        let net_spec = parts.next()?;
-        let sock_type = match net_spec.as_bytes().first()? {
-            b'T' | b'L' => SockType::Stream,
-            _ => SockType::Datagram,
-        };
-        let mut flags = SockFlags::empty();
-        flags.set(SockFlags::NONBLOCK, nonblock);
-        flags.set(SockFlags::CLOEXEC, cloexec);
-
-        let socket = self.global.net_lock().fork_adopt(net_spec)?;
-        self.global.initialize_socket(&socket, sock_type, flags);
-        if v6 {
-            let mut dt = self.global.litebox.descriptor_table_mut();
-            let _ = dt.with_metadata_mut(&socket, |o: &mut super::net::SocketOptions| {
-                o.is_v6 = true;
-            });
-        }
-        let files = self.files.borrow();
-        let raw = files
-            .insert_raw_fd(socket)
-            .map_err(|typed| {
-                let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-            })
-            .ok()?;
-        drop(files);
-        let raw = i32::try_from(raw).ok()?;
-        let dup_flags = cloexec.then_some(OFlags::CLOEXEC);
-        if raw != target_fd {
-            let moved = self.sys_dup(raw, Some(target_fd), dup_flags).is_ok();
-            let _ = self.sys_close(raw);
-            return moved.then_some(());
-        }
-        if dup_flags.is_some() {
-            let files = self.files.borrow();
-            let desc = usize::try_from(target_fd).ok()?;
-            set_file_descriptor_flags(
-                desc,
-                &self.global,
-                &files,
-                FileDescriptorFlags::FD_CLOEXEC,
-            )
-            .ok()?;
-        }
         Some(())
     }
 

@@ -39,10 +39,6 @@ fn cpu_units() -> u64 {
             &raw mut exited,
             &raw mut kernel,
             &raw mut user,
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
         )
     };
     let join =
