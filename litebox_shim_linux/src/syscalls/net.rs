@@ -220,8 +220,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// EXACTLY that order -- `<net spec>` is last because it is the only field whose width varies,
     /// and a fixed-arity prefix read off the front is what the other carry specs do too.
     pub(crate) fn raw_fd_inet_carry(
-    /// The spec is `<net spec>|<v6>|<nonblock>`: the two flags are shim-level descriptor metadata
-    /// along with the network-side description rather than living inside it.
         &self,
         global: &GlobalStateHandle<Platform, FS>,
         raw_fd: usize,
