@@ -24,11 +24,12 @@ const DEFAULT_GUEST_GID: u16 = 1000;
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CliArgs {
-    /// The program and arguments passed to it (e.g., `python3 --version`).
+    /// The program and arguments passed to it (e.g., `python3 --version`). Omitted for an OCI
+    /// image, where the image's own ENTRYPOINT/CMD is used instead.
     ///
     /// By default this is a path on the host filesystem. When --program-from-tar
-    /// is set, it refers to a path inside the tar archive instead.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    /// or --oci-image is set, it refers to a path inside the image instead.
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -58,8 +59,18 @@ pub struct CliArgs {
     pub insert_files: Vec<PathBuf>,
     /// Pre-fill the files in this tar file into the initial file system state
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath,
-          requires = "unstable", help_heading = "Unstable Options")]
+          requires = "unstable", conflicts_with = "oci_image", help_heading = "Unstable Options")]
     pub initial_files: Option<PathBuf>,
+    /// Boot an OCI image's raw layers and its own ENTRYPOINT/CMD/ENV as pid 1.
+    #[arg(
+        long = "oci-image",
+        value_name = "IMAGE_REF",
+        conflicts_with = "initial_files"
+    )]
+    pub oci_image: Option<String>,
+    /// Publish `host_port:guest_port` on `127.0.0.1` (repeatable).
+    #[arg(long = "publish", short = 'p', value_name = "HOST_PORT:GUEST_PORT")]
+    pub publish: Vec<String>,
     /// Apply syscall-rewriter to the ELF file before running it
     ///
     /// This is meant as a convenience feature; real deployments would likely prefer ahead-of-time
@@ -382,13 +393,36 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
     }
 
-    // When loading from tar, the program path is a guest-internal path and must
-    // be absolute — LiteBox does not resolve programs via PATH.
-    if cli_args.program_from_tar && !cli_args.program_and_arguments[0].starts_with('/') {
+    let oci_boot = cli_args.oci_image.is_some();
+    let from_image = cli_args.program_from_tar || oci_boot;
+    if cli_args.program_and_arguments.is_empty() && !oci_boot {
         anyhow::bail!(
-            "--program-from-tar requires an absolute path (e.g., /usr/bin/ls), \
-             got: {}",
-            cli_args.program_and_arguments[0]
+            "a program is required unless --oci-image supplies the image's ENTRYPOINT/CMD"
+        );
+    }
+
+    let (mut oci_layers, image_config) = if let Some(image_ref) = cli_args.oci_image.as_deref() {
+        let image = litebox_packager::oci::pull_raw_image(image_ref, true)
+            .map_err(|e| anyhow!("failed to pull raw OCI image {image_ref}: {e:#}"))?;
+        (Some(image.layers), image.config)
+    } else {
+        (None, litebox_packager::oci::ImageConfig::default())
+    };
+
+    let guest_command: Vec<String> = if cli_args.program_and_arguments.is_empty() {
+        image_config.command()
+    } else {
+        cli_args.program_and_arguments.clone()
+    };
+    if guest_command.is_empty() {
+        anyhow::bail!(
+            "the OCI image declares neither ENTRYPOINT nor CMD; pass a program explicitly"
+        );
+    }
+    if from_image && !guest_command[0].starts_with('/') {
+        anyhow::bail!(
+            "an image program path must be absolute (e.g. /init), got: {}",
+            guest_command[0]
         );
     }
 
@@ -400,10 +434,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let (ancestor_modes_and_users, prog_data): (
         Vec<(litebox::fs::Mode, u32)>,
         Option<alloc::borrow::Cow<'static, [u8]>>,
-    ) = if cli_args.program_from_tar {
+    ) = if from_image {
         (Vec::new(), None)
     } else {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+        let prog = std::path::absolute(Path::new(&guest_command[0])).unwrap();
         if !prog.exists() {
             let mut msg = format!("program not found on host filesystem: {}", prog.display());
             if cli_args.initial_files.is_some() {
@@ -449,6 +483,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
+    if !cli_args.publish.is_empty() {
+        unsafe {
+            std::env::set_var("LITEBOX_PUBLISH", cli_args.publish.join(","));
+        }
+    }
+
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
 
     for file in cow_eligible_regions {
@@ -464,16 +504,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
     let ppid = unsafe { libc::getppid() };
     let task_params = litebox_common_linux::TaskParams {
-        pid: if cli_args.pid1 { 1 } else { tid },
-        ppid: if cli_args.pid1 { 0 } else { ppid },
-        uid: u32::from(cli_args.uid),
-        euid: u32::from(cli_args.uid),
-        gid: u32::from(cli_args.gid),
-        egid: u32::from(cli_args.gid),
+        pid: if cli_args.pid1 || oci_boot { 1 } else { tid },
+        ppid: if cli_args.pid1 || oci_boot { 0 } else { ppid },
+        uid: if oci_boot { 0 } else { u32::from(cli_args.uid) },
+        euid: if oci_boot { 0 } else { u32::from(cli_args.uid) },
+        gid: if oci_boot { 0 } else { u32::from(cli_args.gid) },
+        egid: if oci_boot { 0 } else { u32::from(cli_args.gid) },
     };
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        if cli_args.uid == 0 {
+        if cli_args.uid == 0 || oci_boot {
             initialize_root_in_mem_layer(&mut in_mem);
         }
 
@@ -481,7 +521,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // directories or write the program binary into the in-memory FS -- the program
         // is already in the tar layer.
         if let Some(prog_data) = prog_data {
-            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
+            let prog = std::path::absolute(Path::new(&guest_command[0])).unwrap();
             let ancestors: Vec<_> = prog.ancestors().collect();
             let chown_to_initial_user = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
                                          path: &Path| {
@@ -558,21 +598,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .unwrap_or_else(|e| panic!("failed to import --resume-from archive: {e}"));
         }
 
-        shim_builder.default_fs(in_mem, tar_data.into())
+        if let Some(layers) = oci_layers.take() {
+            shim_builder.default_fs_multi_layer(in_mem, layers).0
+        } else {
+            shim_builder.default_fs(in_mem, tar_data.into())
+        }
     };
 
     // We need to get the file path before enabling seccomp.
-    // For --program-from-tar the path is already validated as absolute above,
+    // For an image program the path is already validated as absolute above,
     // so use it directly instead of resolving against the host CWD.
-    let prog = if cli_args.program_from_tar {
-        PathBuf::from(&cli_args.program_and_arguments[0])
+    let prog = if from_image {
+        PathBuf::from(&guest_command[0])
     } else {
-        std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap()
+        std::path::absolute(Path::new(&guest_command[0])).unwrap()
     };
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
             "Could not convert program path {:?} to a string",
-            cli_args.program_and_arguments[0]
+            guest_command[0]
         )
     })?;
 
@@ -646,15 +690,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // leaves SYN-SENT. So the worker runs on every run, not only with a TUN device.
     let net_worker = {
         let shim = shim.clone();
-        let tun_present = cli_args.tun_device_name.is_some();
-        // Waits for ingress on the TUN device when there is one. Without one there is nothing to
-        // poll, so this sleeps the bounded timeout, which keeps loopback delivery under a millisecond.
         let wait_for_packets = move |timeout: core::time::Duration| {
-            if tun_present {
-                platform.wait_on_tun(Some(timeout));
-            } else {
-                std::thread::sleep(timeout);
-            }
+            platform.wait_on_tun(Some(timeout));
         };
         let shutdown_clone = shutdown.clone();
         let child = litebox_platform_linux_userland::spawn_host_thread(move || {
@@ -687,26 +724,32 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         Some(child)
     };
 
-    let argv = cli_args
-        .program_and_arguments
+    let argv = guest_command
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+    let mut entries: Vec<String> = image_config.environment();
+    entries.extend(cli_args.environment_variables.iter().cloned());
+    if cli_args.forward_environment_variables {
+        entries.extend(std::env::vars().map(|(k, v)| format!("{k}={v}")));
+    }
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        match env_pairs.iter_mut().find(|(known, _)| known == name) {
+            Some(slot) => slot.1 = value.to_owned(),
+            None => env_pairs.push((name.to_owned(), value.to_owned())),
+        }
+    }
+    let envp: Vec<_> = env_pairs
+        .into_iter()
+        .filter_map(|(k, v)| {
+            std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
+                .ok()
+        })
         .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
-                    .unwrap()
-            }))
-            .collect()
-    } else {
-        envp
-    };
 
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
 

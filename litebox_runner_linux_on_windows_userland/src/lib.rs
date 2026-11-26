@@ -73,7 +73,7 @@ pub struct CliArgs {
     /// The program path refers to a path inside the tar archive provided via
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
     /// rewriter.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -99,13 +99,11 @@ pub struct CliArgs {
 
     /// Pull an OCI container image reference directly at boot time and use it as the rootfs,
     /// instead of a pre-built `--initial-files` tar. NO real host directory is ever created for
-    /// the image's rootfs: layers are pulled into memory, merged (OCI whiteout-aware) and
-    /// syscall-rewritten entirely in memory, and mounted straight into the guest's read-only tar
-    /// filesystem backend -- see `litebox::fs::tar_ro::TarRo::from_layers` and
-    /// `litebox_packager::oci::pull_layers_in_memory`. This replaces the ahead-of-time
-    /// `litebox-packager --oci-image` + `--initial-files` two-step pipeline for the common case;
-    /// that pipeline still works unchanged for callers that want a pre-built, reusable tar file.
-    /// Only public (anonymous) registries are currently supported.
+    /// the image's rootfs: raw layers are pulled and cached by digest, kept byte-for-byte, and
+    /// mounted straight into the guest's whiteout-aware layered tar filesystem -- see
+    /// `litebox::fs::tar_ro::TarRo::from_layers` and `litebox_packager::oci::pull_raw_image`.
+    /// The image's own ENTRYPOINT/CMD/ENV is used when no program is given. Only public
+    /// (anonymous) registries are currently supported.
     #[arg(
         long = "oci-image",
         value_name = "IMAGE_REF",
@@ -777,20 +775,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // a pre-built `--initial-files` tar (host-mmapped, unchanged from before), or a live
     // `--oci-image` reference pulled and merged entirely in memory at this exact point, with NO
     // real host directory ever created for its rootfs -- see `litebox_packager::oci`'s
-    // `pull_layers_in_memory`/`rewrite_layer_elfs` and `TarRo::from_layers`. Both paths converge
+    // `pull_raw_image` and `TarRo::from_layers`. Both paths converge
     // on the same `Cow<'static, [u8]>` layer list before the shared `default_fs`-family call
     // below, so everything downstream of rootfs construction (in-mem upper layer, resume-from
     // import, guest boot) is identical regardless of which source was used.
+    let mut oci_image_config = litebox_packager::oci::ImageConfig::default();
     let rootfs_source = if let Some(image_ref) = &cli_args.oci_image {
         eprintln!("Pulling OCI image (runtime, in-memory): {image_ref}");
-        // `pull_layers_in_memory_with_resolved_digests` pulls, decompresses, AND rewrites each
-        // layer's ELFs one layer at a time internally -- never holding more than one layer's
-        // raw+rewritten bytes at once. Rewriting again here would be redundant (and
-        // re-introduce the same all-layers-at-once memory spike this function was changed to
-        // avoid).
-        let (pulled, resolved_layers_json) =
-            litebox_packager::oci::pull_layers_in_memory_with_resolved_digests(image_ref, true)
-                .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e:#}"))?;
+        let image = litebox_packager::oci::pull_raw_image(image_ref, true)
+            .map_err(|e| anyhow!("failed to pull OCI image {image_ref}: {e:#}"))?;
+        oci_image_config = image.config;
         // Carry the REFERENCE across a cross-process `fork()`, the way the `--initial-files` path
         // carries its tar path. A child re-execs with no command line of its own, so without this
         // it arrives with no rootfs source at all and cannot `execve` anything. See
@@ -811,8 +805,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
         }
         RootfsSource::OciLayers {
-            layers: pulled.layers,
-            resolved_layers_json,
+            layers: image.layers,
+            resolved_layers_json: image.resolved_layers_json,
         }
     } else {
         let tar_file = cli_args
@@ -910,7 +904,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // The program path is a Unix-style path inside the merged rootfs. Owned (not a borrow of
     // `cli_args`) so it can cross into the spawned initial-guest-thread closures below (see
     // `INITIAL_GUEST_THREAD_STACK_SIZE`'s doc comment) with a `'static` bound.
-    let prog_path = cli_args.program_and_arguments[0].clone();
+    let guest_command: Vec<String> = if cli_args.program_and_arguments.is_empty() {
+        oci_image_config.command()
+    } else {
+        cli_args.program_and_arguments.clone()
+    };
+    if guest_command.is_empty() {
+        anyhow::bail!(
+            "the OCI image declares neither ENTRYPOINT nor CMD; pass a program explicitly"
+        );
+    }
+    let prog_path = guest_command[0].clone();
 
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -1059,8 +1063,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         {}
     });
 
-    let argv = cli_args
-        .program_and_arguments
+    let argv = guest_command
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
@@ -1088,8 +1091,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         }
     }
-    if let Some(image_ref) = cli_args.oci_image.as_deref() {
-        extend_env(&mut env_pairs, litebox_packager::oci::image_env(image_ref));
+    if cli_args.oci_image.is_some() {
+        extend_env(&mut env_pairs, oci_image_config.environment());
     }
     extend_env(
         &mut env_pairs,
@@ -2545,9 +2548,7 @@ fn diag_process_fork_task_resume_probe(
 
 /// Format version for the on-disk merged-rootfs-index cache this module reads/writes (bump
 /// whenever `litebox::fs::tar_ro::{encode,decode}_merged_live_entries`'s wire format -- or
-/// anything else about what this cache stores -- changes shape; mirrors
-/// `litebox_packager::REWRITER_CACHE_VERSION`'s own bump discipline one cache layer down
-/// the pipeline).
+/// anything else about what this cache stores -- changes shape).
 ///
 /// # Why this cache exists
 ///
@@ -2593,8 +2594,7 @@ fn merged_rootfs_index_cache_key(resolved_layers_json: &str) -> String {
 
 fn merged_rootfs_index_cache_path(cache_key: &str) -> std::path::PathBuf {
     std::path::Path::new(".litebox-cache").join(format!(
-        "mergedidx_{cache_key}_v{MERGED_ROOTFS_INDEX_CACHE_VERSION}_r{}.bin",
-        litebox_packager::REWRITER_CACHE_VERSION
+        "mergedidx_{cache_key}_v{MERGED_ROOTFS_INDEX_CACHE_VERSION}.bin"
     ))
 }
 
