@@ -3249,7 +3249,6 @@ where
                     }),
                     "fork_carry_spec:tcp",
                 )?;
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
                 // A bound-but-unconnected, non-listening TCP socket has no endpoint smoltcp knows,
                 // so there is nothing a child could match it on -- and nothing to share yet either.
                 let (local, remote) = (socket.local_endpoint()?, socket.remote_endpoint()?);
@@ -3771,12 +3770,6 @@ where
                 // armed sockets once the last one goes -- never this process dropping an inherited
                 // copy (`Network::release_listen_queue`).
                 self.release_listen_queue(server_socket.ip_listen_endpoint.port);
-                for handle in server_socket.socket_set_handles {
-                    if Self::socket_set_contains(&self.socket_set, handle) {
-                        let _ =
-                            Self::remove_socket(&mut self.socket_set, &mut self.buffers, handle);
-                    }
-                }
             }
             if let Some(proxy) = proxy {
                 proxy.set_state(socket_channel::SocketState::Closed);
