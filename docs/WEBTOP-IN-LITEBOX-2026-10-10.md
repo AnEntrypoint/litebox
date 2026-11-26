@@ -1,3 +1,5 @@
+> **HISTORICAL (2026-11-26).** This document describes the retired rewritten-rootfs harness. It is not an active goal or instruction. The current contract is `README.md` and `AGENTS.md`: unmodified, digest-pinned Webtop OCI image as-is under LiteBox userspace. See `docs/HISTORICAL.md`.
+
 # Webtop INSIDE litebox — target re-pointed 2026-10-10 18:15
 
 ## The target, verbatim from the user

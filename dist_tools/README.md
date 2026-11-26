@@ -1,147 +1,47 @@
-# litebox-windows-alpine bundle
+# LiteBox Windows release
 
-Contents:
+A release contains one binary and one digest-pinned image reference. The image stays unmodified:
+there is no rootfs tarball, no packaged OS, no packager step and no image mutation.
 
-- `litebox_runner_linux_on_windows_userland.exe` — the LiteBox runner; runs
-  unmodified Linux ELF binaries on Windows.
-- `alpine-rootfs.tar` — the rootfs of the pinned webtop image
-  `docker.io/linuxserver/webtop:debian-xfce`, pulled (not built) and
-  pre-rewritten with the LiteBox syscall rewriter via
-  `litebox-packager --oci-image`.
-- `run-alpine.cmd` / `run-alpine.ps1` — launcher scripts.
+## Contents
+
+- `litebox_runner_linux_on_windows_userland.exe` — the thin LiteBox runner. Pulls raw OCI layers
+  by digest, caches them in `.litebox-cache/`, mounts them with whiteout merging and boots the
+  image's own ENTRYPOINT/CMD/ENV and `/init` as pid 1. Guest syscalls are intercepted in memory.
+- `webtop-image.ref` — the pinned OCI index digest for `linuxserver/webtop`.
+- `run-webtop.ps1` / `run-webtop.cmd` — launchers; `--publish` maps the guest's HTTP/HTTPS
+  ports onto `127.0.0.1` on the host.
 
 ## Usage
 
-```
-run-alpine.cmd busybox ls /       # run a single busybox applet
-run-alpine.cmd /bin/busybox ls /  # an already-absolute path is used as-is
-```
-
-Or directly:
-
-```
-litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar /bin/busybox ls /
+```powershell
+.\run-webtop.ps1
+.\run-webtop.ps1 -Publish 8080:3000
 ```
 
-A bare command name (e.g. `busybox`) passed to the launcher scripts is
-resolved to `/bin/busybox` automatically; an already-absolute path is left
-unchanged.
+Directly:
 
-Interactive shells and subprocesses (`/bin/sh`, `sh -c "cmd1; cmd2"`, etc.)
-work normally.
-
-## Language runtimes
-
-`node`, `npm`, `python3`, and `pip3` are preinstalled and ready to run agent
-workloads out of the box. `build-base` (gcc, make, and friends) is included
-so native npm/pip packages that need a compiler can build without any extra
-setup, and `python3-dev` is included alongside it -- Alpine splits Python's
-own C headers (`Python.h`) into a separate package from the interpreter, so
-without it `pip install <anything with a C extension>` fails immediately
-with `Python.h: No such file or directory` even with `build-base` present.
-This bites harder on Alpine than on glibc-based images, since most PyPI
-wheels are `manylinux`-tagged rather than `musllinux`, so `pip` falls back
-to a source build (and therefore needs `Python.h`) far more often here.
-`git`, `bash`, `curl`, and `openssh-client` are also preinstalled,
-covering the common day-one needs of an agent workload (cloning a repo,
-running `#!/bin/bash` scripts shipped by npm packages, fetching a file) so
-that no extra `apk add` round-trip is needed just to get started. `tzdata`
-is included too -- Alpine/musl doesn't ship timezone data by default, which
-otherwise silently breaks Python's `zoneinfo` module (and any date/time
-library built on it) for any timezone other than UTC. Nothing about the
-base image blocks installing further tooling at runtime — see
-Networking below for `apk add`/`npm install`/`pip install`.
+```powershell
+$ref = Get-Content webtop-image.ref
+.\litebox_runner_linux_on_windows_userland.exe --oci-image $ref --publish 3000:3000 --publish 3001:3001
+```
 
 ## Networking
 
-Real TCP/UDP networking (DNS, HTTP, HTTPS, `apk add <package>`, ...) works
-out of the box, with **no Administrator privileges and no driver
-installation required**. This is implemented as an in-process userspace NAT
-gateway: guest TCP/UDP flows are proxied to real, unprivileged Windows
-sockets rather than requiring a virtual network adapter (unlike a TUN driver
-or WinDivert, both of which need elevation on Windows). See
-`litebox_platform_windows_userland::net` in the source tree for details.
+`--publish H:G` binds an ordinary `127.0.0.1:H` listener and injects each accepted connection
+into the guest's own smoltcp stack at port G. This is the shared rootless userspace gateway
+(`litebox_userspace_net`), the same one the Linux runner uses. No Administrator privileges,
+driver, TUN device or host container runtime are needed. Guest-initiated outbound TCP/UDP is
+proxied through the same gateway.
 
-## Persistent, resumable state
+## Readiness and efficiency
 
-By default, everything the guest writes (installed packages, generated
-files, `.npm`/`.pip` caches, ...) lives only in memory and is lost when the
-runner exits. Two flags make a session's on-disk state durable and
-resumable:
+Readiness is a real HTTP/Selkies 200 plus the first real encoded frame, never a fixed sleep.
+The source tree's `tools/webtop/readiness.sh` is the Linux-host benchmark; measured results and
+the gap to the under-5-second target are in `docs/BENCHMARK.md`.
 
-```
-litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar ^
-  --export-writable-layer session.tar /bin/sh -c "npm install -g some-tool"
+## Security boundary
 
-litebox_runner_linux_on_windows_userland.exe --initial-files alpine-rootfs.tar ^
-  --resume-from session.tar /bin/sh -c "some-tool --version"
-```
-
-`--export-writable-layer <path>` walks every file the guest created or
-modified this run and writes it to a tar archive after the program exits.
-`--resume-from <path>` seeds the writable layer from a previously exported
-archive before the guest program starts. The exported archive is a delta
-against the base rootfs, not a full snapshot, so it stays small regardless
-of how large `alpine-rootfs.tar` is.
-
-## Security boundary — read this before using LiteBox as an agent sandbox
-
-**This is a Linux-on-Windows compatibility/porting layer, not a security
-sandbox.** If you're running untrusted or semi-trusted agent-generated code
-(e.g. an LLM agent's Node.js/Python workload) and relying on this to contain
-it, understand exactly what isolation does and does not exist:
-
-- **No process isolation between guests.** Every guest "process" started by
-  a single runner invocation is, under the hood, an ordinary Windows thread
-  inside that one host process — there is no OS-level process boundary
-  between them. Two guest programs run by the same `--initial-files`
-  invocation can observe and interfere with each other's host-process-global
-  state.
-- **No memory isolation.** All guest threads share the host process's
-  address space. There is no per-guest memory protection beyond what the
-  syscall rewriter and shim happen to enforce in software.
-- **The syscall rewriter is a compatibility shim, not a policy-enforcement
-  layer.** It patches `syscall` instructions in the guest ELF with a
-  trampoline so LiteBox can intercept and emulate them — it does not
-  implement a seccomp-style allow/deny policy. Every syscall the shim
-  implements is serviced; there is no mechanism to deny a guest syscall on
-  security grounds.
-- **No privilege drop.** "No Administrator privileges required" describes
-  what LiteBox avoids needing (a TUN driver, raw sockets) — it is not an
-  added sandboxing token. The guest runs at exactly the host process's own
-  Windows privilege level. There is no AppContainer, restricted token, or
-  Job Object confinement.
-- **No resource limits enforced by the host.** Only `RLIMIT_NOFILE` and
-  `RLIMIT_SIGPENDING` are tracked (as in-process bookkeeping, not
-  OS-enforced caps). There is no CPU or memory limit — a guest process can
-  consume the full, unbounded resource budget of the host Windows process.
-- **The guest filesystem is virtual and does not expose the host
-  filesystem** — the rootfs is entirely in-memory/tar-backed, with no
-  passthrough to arbitrary host paths. This part *is* a real boundary.
-
-**Practical implication:** treat every guest program run by the same runner
-invocation as fully mutually trusted, and treat the runner process itself as
-having exactly the privileges of whatever account launched it. Do not run
-code you don't trust at that privilege level under the expectation that
-LiteBox will contain a deliberately malicious payload — it is built to run
-*unmodified* Linux programs correctly, not to defend against one that is
-actively trying to escape.
-
-## Known limitations
-
-**PTY-based CPython workloads may crash intermittently (upstream bug, not a
-LiteBox defect).** Programs that combine `fork()` with CPython's `pty`
-module (e.g. `pty.spawn(...)`, `pty.fork()`) can hit a use-after-free inside
-CPython 3.14.7's fork-child cleanup path (`threading._after_fork()`
-resizing a dict while musl 1.2.6's `mallocng` allocator is in a
-post-`fork()` state), causing a segfault in the guest. This was
-root-caused across an extensive investigation (see the project's git
-history and `FINDINGS.txt` for the full characterization) to be a genuine
-bug in upstream CPython/musl, reproducible independent of LiteBox, with no
-newer CPython or musl version available in Alpine to fix it and no known
-mitigation (including `PYTHONMALLOC=malloc`). It is tracked as a known,
-currently-unfixable-from-LiteBox's-side limitation. All other functionality
-in this bundle, including `apk add`, general `fork`+`exec`, and the rest of
-this smoke-tested surface, is unaffected.
-
-All files must stay in the same directory.
+LiteBox is a syscall-compatibility layer, not a security sandbox. Treat the runner process as
+having exactly the privileges of the account that launched it, and run only mutually trusted
+guest workloads. The guest filesystem is virtual and does not expose arbitrary host paths.

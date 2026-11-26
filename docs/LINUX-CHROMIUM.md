@@ -1,3 +1,5 @@
+> **HISTORICAL (2026-11-26).** This document describes the retired rewritten-rootfs harness. It is not an active goal or instruction. The current contract is `README.md` and `AGENTS.md`: unmodified, digest-pinned Webtop OCI image as-is under LiteBox userspace. See `docs/HISTORICAL.md`.
+
 # Chromium under litebox on THIS Linux container (2026-10-09)
 
 Active goal, verbatim: **"make it work perfectly in our current linux environment, the goal is

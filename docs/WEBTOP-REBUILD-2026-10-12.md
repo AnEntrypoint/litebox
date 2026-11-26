@@ -1,3 +1,5 @@
+> **HISTORICAL (2026-11-26).** This document describes the retired rewritten-rootfs harness. It is not an active goal or instruction. The current contract is `README.md` and `AGENTS.md`: unmodified, digest-pinned Webtop OCI image as-is under LiteBox userspace. See `docs/HISTORICAL.md`.
+
 # Webtop guest rebuilt from host packages; rungs 1-4 status (2026-10-12)
 
 The container was recreated on 2026-10-11 and `/tmp/lbx` (rootfs tarballs, harness, runner copy) was
