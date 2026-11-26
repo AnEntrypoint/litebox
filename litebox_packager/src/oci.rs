@@ -467,7 +467,6 @@ async fn pull_layer_resumable(
         .await
         .with_context(|| format!("failed to create {}", path.display()))?;
     let mut offset: u64 = 0;
-    let started = std::time::Instant::now();
     let mut last_report = std::time::Instant::now();
     let mut complete = false;
 
