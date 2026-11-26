@@ -52,7 +52,7 @@ require 'peak|rss|VmRSS' tools/webtop/readiness.sh
 require 'CACHED' scripts/gate-window.sh
 require 'GATE_TREE' scripts/gate-window.sh
 require 'GATE_RERUN_REASON' scripts/gate-window.sh
-require 'GATE-AUDIT' docs/GATE-AUDIT.md
+require 'litebox-smoke.*34001d81' docs/GATE-AUDIT.md
 python3 -I - <<'PY'
 import yaml
 from pathlib import Path

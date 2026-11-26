@@ -6,9 +6,9 @@ result_file=${3:?result file required}
 wait_seconds=${4:-570}
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 pid_file="$result_file.pid"
-gate_scratch=${GATE_SCRATCH:-/config/workspace/tmp/gate}
+gate_scratch=${GATE_SCRATCH:-${HYPERAGENT_SCRATCH:-/config/workspace/tmp}/gate}
 gate_history=${GATE_HISTORY:-$gate_scratch/history.jsonl}
-gate_cmd=${GATE_CMD:-node /config/workspace/hyperagent/scripts/gate-ticket.cjs}
+gate_cmd=${GATE_CMD:-node ${HYPERAGENT_ROOT:-/config/workspace/hyperagent}/scripts/gate-ticket.cjs}
 export GATE_SCRATCH GATE_HISTORY
 export GATE_TREE=${GATE_TREE:-$(git -C "$repo" rev-parse --short HEAD)}
 part=$(printf '%s' "${label#litebox-}" | tr '[:lower:]-' '[:upper:]_')
