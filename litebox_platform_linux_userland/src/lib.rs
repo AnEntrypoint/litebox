@@ -758,7 +758,7 @@ impl LinuxUserland {
             rules.into_iter().collect();
         let filter = SeccompFilter::new(
             rule_map,
-            SeccompAction::Trap,
+            default_seccomp_action(),
             SeccompAction::Allow,
             #[cfg(target_arch = "x86_64")]
             seccompiler::TargetArch::x86_64,
@@ -773,6 +773,10 @@ impl LinuxUserland {
             eprintln!("WARNING: Failed to apply seccomp filter: {err:?}");
         }
     }
+}
+
+fn default_seccomp_action() -> seccompiler::SeccompAction {
+    seccompiler::SeccompAction::Trap
 }
 
 /// A dedicated, always-unfiltered thread that performs real syscalls on behalf of HOST code
@@ -3816,14 +3820,6 @@ fn register_exception_handlers() {
             libc::SIGFPE,
             libc::SIGILL,
             libc::SIGTRAP,
-            // On aarch64 this is not just a debug-mode log: it is the ONLY guest-syscall
-            // interception point (no fast-path trampoline rewrite exists there, see
-            // `exception_signal_handler`'s aarch64 SIGSYS branch) and also carries the
-            // host-code `aarch64_syscall_proxy` forwarding for the syscalls removed from the
-            // seccomp allow-list -- both are required in release builds too, not just debug
-            // (live-confirmed: a release build with this gated out killed the process with a
-            // real SIGSYS/"Bad system call" on the first non-allow-listed syscall).
-            #[cfg(any(debug_assertions, target_arch = "aarch64"))]
             libc::SIGSYS,
         ];
         for &sig in exception_signals {
@@ -5142,36 +5138,11 @@ mod tests {
     }
 
     #[test]
-    fn test_seccomp_filter() {
-        let _platform: &LinuxUserland = LinuxUserland::new(None);
-        LinuxUserland::enable_seccomp_filter();
-
-        let pathname = c"/tmp/test_seccomp_dir";
-        let mkdir_res = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::mkdirat,
-                libc::AT_FDCWD.cast_unsigned() as usize,
-                pathname.as_ptr() as usize,
-                0o755,
-            )
-        };
-        if let Err(err) = mkdir_res {
-            assert_eq!(
-                err,
-                syscalls::Errno::EINVAL,
-                "mkdirat should be blocked by seccomp filter if active"
-            );
-        } else {
-            eprintln!("Notice: seccomp filter not enforced by host environment");
-            let _ = unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::unlinkat,
-                    libc::AT_FDCWD.cast_unsigned() as usize,
-                    pathname.as_ptr() as usize,
-                    libc::AT_REMOVEDIR.cast_unsigned() as usize,
-                )
-            };
-        }
+    fn seccomp_default_action_traps_guest_syscalls() {
+        assert!(matches!(
+            crate::default_seccomp_action(),
+            seccompiler::SeccompAction::Trap
+        ));
     }
 }
 

@@ -232,10 +232,8 @@ pub mod cache {
         verbose: bool,
     ) -> anyhow::Result<Cow<'static, [u8]>> {
         let final_path = layer_path(digest);
-        if std::fs::rename(tmp_path, &final_path).is_err() {
-            if !final_path.exists() {
-                bail!("failed to publish cached layer for {digest}");
-            }
+        if std::fs::rename(tmp_path, &final_path).is_err() && !final_path.exists() {
+            bail!("failed to publish cached layer for {digest}");
         }
         let file = std::fs::File::open(&final_path)
             .with_context(|| format!("failed to open {}", final_path.display()))?;
