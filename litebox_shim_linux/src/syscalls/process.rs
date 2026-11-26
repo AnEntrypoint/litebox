@@ -4022,7 +4022,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the fd instead hands it `EBADF` on its first `epoll_wait`.
         let mut epoll_to_carry: alloc::vec::Vec<(usize, alloc::string::String)> =
             alloc::vec::Vec::new();
-        let mut dropped_process_local = 0usize;
         for raw_fd in &beyond_stdio_fds {
             if self.raw_fd_is_inotify(*raw_fd) {
                 continue;

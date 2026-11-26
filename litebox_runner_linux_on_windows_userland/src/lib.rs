@@ -794,6 +794,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // Also carry the ALREADY-RESOLVED layer digest list, so every fork child can skip its
         // own manifest fetch entirely -- see `FORK_CHILD_OCI_LAYER_DIGESTS_ENV_VAR`'s doc comment
         // for the measured cost (2.2-3.1s per fork) this removes.
+        let resolved_layers_json = image.resolved_layers_json.clone();
         unsafe {
             std::env::set_var(
                 litebox_platform_windows_userland::process_fork::FORK_CHILD_OCI_IMAGE_ENV_VAR,
@@ -806,7 +807,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         RootfsSource::OciLayers {
             layers: image.layers,
-            resolved_layers_json: image.resolved_layers_json,
+            resolved_layers_json,
         }
     } else {
         let tar_file = cli_args
