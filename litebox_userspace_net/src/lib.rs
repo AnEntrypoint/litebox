@@ -757,11 +757,11 @@ fn diag_pump(
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
-    if n >= 400 && !n.is_multiple_of(64) {
+    if !n.is_multiple_of(512) {
         return;
     }
     let state = format!("{:?}", socket.state());
-    litebox_util_log::warn!(
+    litebox_util_log::debug!(
         port = port,
         state:% = state.as_str(),
         recv_queue = socket.recv_queue(),

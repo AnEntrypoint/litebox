@@ -104,6 +104,8 @@ gap_s=$(awk -v r="$readiness_s" 'BEGIN { if (r == "NOT_REACHED") print "NOT_REAC
   echo "  peak_rss_mb=$peak_rss_mb rootfs_bytes=$rootfs_bytes layer_count=$layer_count host_procs=$sampled_procs guest_threads=$sampled_threads"
   echo "  last_http_code=$last_http_code frame_evidence=${frame_evidence:-NONE} runner_rc=$runner_rc"
   echo "  target_gap=under-5-seconds-target ${gap_s}"
+  echo "EVIDENCE exceptions:"
+  grep -aE 'diag-guest-exception|fatal signal|panicked' "$log" 2>/dev/null | tail -n 5 || true
   echo "EVIDENCE log_tail:"
   tail -n 20 "$log" 2>/dev/null || true
 } | tee "$result"
