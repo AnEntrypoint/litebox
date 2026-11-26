@@ -4,6 +4,19 @@ Phase A records each change with the witness that proves it and the red check th
 the change is wrong. Phase B runs every witness once on the final tree, fixes failures, and
 pushes once.
 
+## Phase B results (tree `46b79af8`)
+
+- `scripts/check-goal-docs.sh`: PASS, including YAML parsing of all three release/pin workflows.
+- `litebox-final` gate window (`BUILD_DONE 0`, `TEST_DONE 0`, `CROSS_DONE 0`, `SMOKE_DONE 0`,
+  `FINAL_DONE 0`): release build, `cargo fmt --all -- --check`, clippy with `-D warnings`,
+  nextest 8/8, x86_64 and Windows cross checks, raw OCI smoke, cache provenance and rootless
+  published port `200`.
+- `litebox-live` exclusive gate window (`LIVE_DONE 0`): readiness measurement complete,
+  `status=NOT_READY`; exact numbers and the boot exception are in `docs/BENCHMARK.md`. The gap to
+  the under-5-second target is named, not hidden.
+- Gate history: 14 litebox windows, 677 s total run, longest 150 s.
+
+
 | # | Change | Witness | Red check |
 | --- | --- | --- | --- |
 | 1 | Goal clarification: `README.md`, `AGENTS.md`, `dist_tools/README*.md`, `docs/HISTORICAL.md`, historical banners, `scripts/check-goal-docs.sh` | `bash scripts/check-goal-docs.sh` | A stale active goal, a Docker-as-engine launcher, a moving image tag or an unmarked historical goal doc fails. |
