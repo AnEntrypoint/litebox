@@ -27,7 +27,7 @@ require 'digest' README.md
 require 'receive_ip_packet|published|publish' AGENTS.md
 
 for doc in docs/LINUX-CHROMIUM.md docs/WEBTOP-IN-LITEBOX-2026-10-10.md docs/WEBTOP-REBUILD-2026-10-12.md docs/HARNESS-LESSONS.md; do
-  require '^\> \*\*HISTORICAL' "$doc"
+  require '^> \*\*HISTORICAL' "$doc"
 done
 require 'AGENTS_ARCHIVE' docs/HISTORICAL.md
 
@@ -44,7 +44,7 @@ for file in $ACTIVE_CODE; do
 done
 require 'webtop-image.ref|@sha256:' .github/workflows/release-linux.yml
 require 'webtop-image.ref|@sha256:' .github/workflows/release-windows.yml
-require '@sha256:[0-9a-f]{64}' .github/workflows/webtop-base-image.yml
+require 'webtop-image.ref|@sha256:[0-9a-f]{64}' .github/workflows/webtop-base-image.yml
 require '\-\-oci-image' tools/webtop/readiness.sh
 require '200' tools/webtop/readiness.sh
 require 'EncFPS|frame' tools/webtop/readiness.sh
