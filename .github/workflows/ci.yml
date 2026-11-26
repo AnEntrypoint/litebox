@@ -343,8 +343,9 @@ jobs:
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
-          # - `litebox_packager` is allowed to have `std` access since it is a
-          #   userland CLI tool that packages ELF programs for LiteBox.
+          # - `litebox_packager` and `litebox_userspace_net` are allowed to have `std` access:
+          #   the former is the host-side raw OCI pull/cache library, the latter the host-side
+          #   rootless TCP gateway. Neither is linked into the guest shim.
           #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
@@ -376,6 +377,7 @@ jobs:
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
+            -not -path './litebox_userspace_net/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
             -not -path './litebox_session_daemon/Cargo.toml' \
             -not -path './litebox_termemu/Cargo.toml' \
