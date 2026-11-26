@@ -50,8 +50,9 @@ rootfs_bytes_before=$(find "$repo/.litebox-cache" -maxdepth 1 -name 'raw_*.tar' 
 
 : > "$log"
 t0=$(now_s)
-"$runner" --oci-image "$image_ref" --publish "$host_port:$guest_port" > "$log" 2>&1 &
+LITEBOX_LOG=warn "$runner" --oci-image "$image_ref" --publish "$host_port:$guest_port" > "$log" 2>&1 &
 runner_pid=$!
+runner_rc=alive
 echo "BENCH_START image_ref=$image_ref runner=$runner host_port=$host_port deadline_s=$deadline_s cached_layers_before=$cached_layers_before"
 
 http_200_s=""
@@ -81,7 +82,8 @@ while :; do
     break
   fi
   if ! kill -0 "$runner_pid" 2>/dev/null; then
-    echo "EVIDENCE runner_exited_before_readiness elapsed_s=$(elapsed_s "$t0")"
+    wait "$runner_pid" 2>/dev/null || runner_rc=$?
+    echo "EVIDENCE runner_exited_before_readiness elapsed_s=$(elapsed_s "$t0") rc=$runner_rc"
     break
   fi
   sleep 0.25
@@ -100,7 +102,7 @@ gap_s=$(awk -v r="$readiness_s" 'BEGIN { if (r == "NOT_REACHED") print "NOT_REAC
   echo "  cold_or_warm_cached_layers_before=$cached_layers_before rootfs_bytes_before=$rootfs_bytes_before"
   echo "  wall_s=$end_s http_200_s=${http_200_s:-NOT_REACHED} first_frame_s=${first_frame_s:-NOT_REACHED} readiness_s=$readiness_s gap_to_target_s=$gap_s"
   echo "  peak_rss_mb=$peak_rss_mb rootfs_bytes=$rootfs_bytes layer_count=$layer_count host_procs=$sampled_procs guest_threads=$sampled_threads"
-  echo "  last_http_code=$last_http_code frame_evidence=${frame_evidence:-NONE}"
+  echo "  last_http_code=$last_http_code frame_evidence=${frame_evidence:-NONE} runner_rc=$runner_rc"
   echo "  target_gap=under-5-seconds-target ${gap_s}"
   echo "EVIDENCE log_tail:"
   tail -n 20 "$log" 2>/dev/null || true
