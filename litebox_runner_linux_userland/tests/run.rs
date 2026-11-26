@@ -126,7 +126,7 @@ impl Runner {
     }
 
     #[must_use]
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    #[allow(dead_code)]
     fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
     }

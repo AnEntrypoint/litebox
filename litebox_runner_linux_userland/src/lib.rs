@@ -739,7 +739,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             continue;
         };
         match env_pairs.iter_mut().find(|(known, _)| known == name) {
-            Some(slot) => slot.1 = value.to_owned(),
+            Some(slot) => value.clone_into(&mut slot.1),
             None => env_pairs.push((name.to_owned(), value.to_owned())),
         }
     }
