@@ -108,6 +108,8 @@ macro_rules! saved_tls {
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
+    net_gateway: std::sync::OnceLock<litebox_userspace_net::NatGateway>,
+    userspace_gateway: bool,
     /// Host mappings that are not available for guest programs to use, read from
     /// `/proc/self/maps`.
     ///
@@ -319,8 +321,14 @@ impl LinuxUserland {
                 .map(|r| &*Box::leak(Box::new(r)))
                 .collect(),
         );
+        let userspace_gateway = std::env::var("LITEBOX_PUBLISH")
+            .is_ok_and(|value| !value.trim().is_empty())
+            || std::env::var("LITEBOX_USERSPACE_NET")
+                .is_ok_and(|value| !value.is_empty() && value != "0");
         let platform = Self {
             tun_socket_fd,
+            net_gateway: std::sync::OnceLock::new(),
+            userspace_gateway,
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
@@ -330,7 +338,11 @@ impl LinuxUserland {
                 std::io::stderr().is_terminal(),
             ],
         };
-        Box::leak(Box::new(platform))
+        let platform: &'static Self = Box::leak(Box::new(platform));
+        if userspace_gateway {
+            litebox_userspace_net::init_gateway(&platform.net_gateway);
+        }
+        platform
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -482,9 +494,17 @@ impl LinuxUserland {
     ///
     /// Panics if the TUN device is not initialized.
     pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        if self.userspace_gateway {
+            litebox_userspace_net::wait_on_tun(&self.net_gateway, timeout, true);
+            return;
+        }
         let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
+            std::thread::sleep(timeout.unwrap_or(Duration::from_millis(1)));
+            return;
+        };
         let mut pfd = libc::pollfd {
-            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
+            fd: tun_socket_fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -738,21 +758,7 @@ impl LinuxUserland {
             rules.into_iter().collect();
         let filter = SeccompFilter::new(
             rule_map,
-            // In debug builds, log violations instead of silently returning an error so that
-            // it won't fail silently during development (which may be hard to debug). On
-            // aarch64 `Trap` is required unconditionally, not just for debug logging: unlike
-            // x86_64 (which intercepts every guest syscall via the ELF-patched fast-path
-            // trampoline before it ever reaches the kernel/seccomp), aarch64 has no such
-            // trampoline, so the SIGSYS trap IS the guest-syscall dispatch mechanism and the
-            // aarch64_syscall_proxy host-syscall forwarding path -- an `Errno` default action
-            // here would silently fail every such syscall in release builds instead of
-            // reaching either (live-confirmed: release build's `openat` on the guest's own ELF
-            // returned EINVAL directly from seccomp, never reaching the handler at all).
-            if cfg!(debug_assertions) || cfg!(target_arch = "aarch64") {
-                SeccompAction::Trap
-            } else {
-                SeccompAction::Errno(libc::EINVAL.cast_unsigned())
-            },
+            SeccompAction::Trap,
             SeccompAction::Allow,
             #[cfg(target_arch = "x86_64")]
             seccompiler::TargetArch::x86_64,
@@ -2576,6 +2582,9 @@ impl litebox::platform::RawMutex for RawMutex {
 
 impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
+        if self.userspace_gateway {
+            return litebox_userspace_net::send_ip_packet(&self.net_gateway, packet);
+        }
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             // Without a TUN device there is no route off the host. Loopback traffic never reaches
@@ -2607,6 +2616,9 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
+        if self.userspace_gateway {
+            return litebox_userspace_net::receive_ip_packet(&self.net_gateway, packet);
+        }
         let tun_fd = self.tun_socket_fd.read().unwrap();
         let Some(tun_socket_fd) = tun_fd.as_ref() else {
             // Without a TUN device nothing arrives from outside; loopback packets are queued by the
@@ -4458,6 +4470,15 @@ unsafe extern "C" fn exception_signal_handler(
             rbp = next;
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    if signum == libc::SIGSYS
+        && let Some(regs) = signal_handler_exit_guest(context, false)
+    {
+        copy_signal_context(unsafe { &mut *regs }, context);
+        let _ = run_thread_arch as *const () as usize;
+        set_signal_return(context, syscall_trap_callback, 0, 0, 0, 0);
+        return;
+    }
     // On aarch64 there is no fast-path syscall-rewriting trampoline (unlike x86_64's patched
     // `syscall`->`call` rewrite): every guest `svc #0` is unpatched and always reaches the
     // kernel directly, so this SIGSYS handler is the ONLY guest-syscall interception point on
@@ -4552,9 +4573,16 @@ unsafe extern "C" fn exception_signal_handler(
     // gated out in release; without this, a release build's aarch64 SIGSYS Trap (now
     // unconditional, see the seccomp filter setup) would return to the caller with the
     // register state unset -- the debug block cannot be relied on to run.
-    #[cfg(all(not(debug_assertions), target_arch = "aarch64"))]
+    #[cfg(not(debug_assertions))]
     if signum == libc::SIGSYS {
-        context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.uc_mcontext.gregs[libc::REG_RAX as usize] = i64::from(-libc::EINVAL);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+        }
         return;
     }
     // Return an error code for the syscall and log it in debug mode.
