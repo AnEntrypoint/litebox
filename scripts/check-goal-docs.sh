@@ -49,6 +49,10 @@ require '\-\-oci-image' tools/webtop/readiness.sh
 require '200' tools/webtop/readiness.sh
 require 'EncFPS|frame' tools/webtop/readiness.sh
 require 'peak|rss|VmRSS' tools/webtop/readiness.sh
+require 'CACHED' scripts/gate-window.sh
+require 'GATE_TREE' scripts/gate-window.sh
+require 'GATE_RERUN_REASON' scripts/gate-window.sh
+require 'GATE-AUDIT' docs/GATE-AUDIT.md
 python3 -I - <<'PY'
 import yaml
 from pathlib import Path

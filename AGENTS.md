@@ -50,10 +50,15 @@ mutates, flattens, prunes, rewrites or wraps image content before pid 1 starts i
 - No comments in code. Say it in names and structure; what cannot be said that way goes into this
   file once checked true.
 - Simplest code that does the job: delete, deduplicate, share modules, drive behaviour from data.
-- Heavy windows (compile, many tests, timing measurement) start detached through the gate:
-  `GATE_TREE=$(git rev-parse --short HEAD) setsid nohup node /config/workspace/hyperagent/scripts/gate-ticket.cjs run litebox-<part> -- <command> > <result file> 2>&1 < /dev/null &`;
-  the result file's last line is `<PART>_DONE <exit code>`. A timing witness needs
-  `GATE_EXCLUSIVE=1`. A label that already passed on its `GATE_TREE` prints CACHED.
+- Heavy windows (compile, many tests, timing measurement) start detached through
+  `bash scripts/gate-window.sh litebox-<part> <window-script> <result-file> [wait-seconds]`.
+  It resolves `GATE_TREE`, prints `CACHED <label> on <tree>` without queueing when that label and
+  tree already have a passing history row, blocks an unexplained rerun of a failed label/tree,
+  requires `GATE_FORCE=1` plus `GATE_RERUN_REASON` (recorded in the result file) for any rerun,
+  and otherwise queues `gate-ticket.cjs` detached with `<PART>_DONE <exit code>` as the result
+  file's last line. A timing witness needs `GATE_EXCLUSIVE=1`. Never queue a gate ticket with a
+  scratch launcher: `scripts/check-gate-guard.sh` is the witness, and `docs/GATE-AUDIT.md` records
+  why the one historical rerun was needed.
 - Scratch goes in `/config/workspace/tmp/litebox`; remove it and stop every process you started
   by PID when done. Never use a name pattern to kill processes.
 - Browser work goes through playwriter where available; an HTTP status question uses curl first.
