@@ -1,8 +1,7 @@
-name: Release Linux Alpine Bundle
+name: Release Linux runner
 
 permissions:
   contents: write
-  packages: write
 
 on:
   push:
@@ -20,16 +19,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_base_image:
-    name: Webtop base image (pulled, not built)
-    uses: ./.github/workflows/webtop-base-image.yml
-    permissions:
-      contents: read
-      packages: write
-    secrets: inherit
-
-  build_linux_runner:
-    name: Build Linux runner
+  build:
+    name: Build thin runner and smoke test raw OCI
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: -Dwarnings
@@ -44,123 +35,31 @@ jobs:
           key: release-linux-runner
       - name: Build litebox_runner_linux_userland (release)
         run: cargo build --locked --release -p litebox_runner_linux_userland
-      - name: Upload runner binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-runner-bin
-          path: target/release/litebox_runner_linux_userland
-          if-no-files-found: error
-
-  build_alpine_rootfs:
-    name: Build Alpine rootfs tar
-    needs: [build_base_image]
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Dwarnings
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - name: Set up Rust
+      - name: Raw OCI smoke (unmodified layers, no rewriting)
         run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-litebox-packager
-      - name: Build litebox_packager (release)
-        run: cargo build --locked --release -p litebox_packager
-      - name: Package Alpine rootfs (BusyBox + nodejs + python)
+          smoke_ref=$(cat dist_tools/smoke-image.ref)
+          output=$(timeout 300 ./target/release/litebox_runner_linux_userland --oci-image "$smoke_ref" /bin/echo raw-oci-smoke-ok)
+          echo "$output"
+          test "${output#*raw-oci-smoke-ok}" != "$output"
+      - name: Verify the image reference is digest-pinned
+        run: grep -Eq '^docker\.io/linuxserver/webtop@sha256:[0-9a-f]{64}$' dist_tools/webtop-image.ref
+      - name: Assemble thin bundle
         run: |
-          # docker.io drops a webtop blob fetch now and then ("failed to pull layer 17"); retry the
-          # whole pull rather than failing the bundle on one transient request.
-          for attempt in 1 2 3; do
-            ./target/release/litebox_packager --oci-image ${{ needs.build_base_image.outputs.image }} -o alpine-rootfs.tar --verbose && break
-            if [ "$attempt" = 3 ]; then exit 1; fi
-            echo "packager attempt $attempt failed; retrying in 30s"; sleep 30
-          done
-      - name: Upload rootfs tar
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-alpine-rootfs-tar
-          path: alpine-rootfs.tar
-          if-no-files-found: error
-
-  smoke_test:
-    name: Smoke test runner against rootfs
-    needs: [build_linux_runner, build_alpine_rootfs]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download runner binary
-        uses: actions/download-artifact@v6
-        with:
-          name: linux-runner-bin
-          path: smoke
-      - name: Download rootfs tar
-        uses: actions/download-artifact@v6
-        with:
-          name: linux-alpine-rootfs-tar
-          path: smoke
-      - name: Make runner executable
-        working-directory: smoke
-        run: chmod +x litebox_runner_linux_userland
-      - name: Run /bin/true against the rootfs
-        working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/true
-      - name: Run busybox echo against the rootfs
-        working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/echo smoke-test-ok
-      # No TUN/networking step here (that needs root and a real TUN device --
-      # see litebox_platform_linux_userland/scripts/tun-setup.sh) -- networking
-      # is opt-in at the API level, not required for basic guest execution, and
-      # is already exercised by the main CI workflow's own test suite.
-      - name: Verify baked-in agent-sandbox tooling (git, bash, curl, ssh) needs no apk add
-        working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/bash -c 'set -e; git --version; curl --version; ssh -V'
-      - name: Verify tzdata is baked in (Python zoneinfo needs no apk add)
-        working-directory: smoke
-        run: ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /bin/sh -c 'test -f /usr/share/zoneinfo/America/New_York && echo tzdata-ok'
-      - name: Run node and python inside the guest
-        working-directory: smoke
-        run: |
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar /usr/bin/python3 -c "print('python-smoke-ok')"
-      - name: Resume from an exported writable layer
-        working-directory: smoke
-        run: |
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar --export-writable-layer session.tar /bin/sh -c "echo instance-ok > /tmp/marker; cat /tmp/marker"
-          ./litebox_runner_linux_userland --unstable --initial-files alpine-rootfs.tar --program-from-tar --resume-from session.tar /bin/sh -c 'cat /tmp/marker'
-
-  bundle:
-    name: Bundle release tarball
-    needs: [build_linux_runner, build_alpine_rootfs, smoke_test]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - name: Download runner binary
-        uses: actions/download-artifact@v6
-        with:
-          name: linux-runner-bin
-          path: bundle
-      - name: Download rootfs tar
-        uses: actions/download-artifact@v6
-        with:
-          name: linux-alpine-rootfs-tar
-          path: bundle
-      - name: Assemble bundle
-        run: |
-          chmod +x bundle/litebox_runner_linux_userland
-          cp dist_tools/run-alpine.sh bundle/
-          chmod +x bundle/run-alpine.sh
+          mkdir -p bundle
+          cp target/release/litebox_runner_linux_userland bundle/
+          cp dist_tools/webtop-image.ref dist_tools/smoke-image.ref dist_tools/run-webtop.sh bundle/
           cp dist_tools/README-linux.md bundle/README.md
-          tar -C bundle -czf litebox-linux-alpine.tar.gz .
+          chmod +x bundle/litebox_runner_linux_userland bundle/run-webtop.sh
+          tar -C bundle -czf litebox-linux-webtop.tar.gz .
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: litebox-linux-alpine
-          path: litebox-linux-alpine.tar.gz
+          name: litebox-linux-webtop
+          path: litebox-linux-webtop.tar.gz
           if-no-files-found: error
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: litebox-linux-alpine.tar.gz
+          files: litebox-linux-webtop.tar.gz
           generate_release_notes: true

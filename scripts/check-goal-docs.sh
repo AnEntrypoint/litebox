@@ -36,14 +36,14 @@ test -f "$REF_FILE" || fail "missing $REF_FILE"
 require '^docker\.io/linuxserver/webtop@sha256:[0-9a-f]{64}$' "$REF_FILE"
 test "$(wc -l < "$REF_FILE")" -eq 1 || fail "image ref must be one line"
 
-ACTIVE_CODE=".github/workflows/release-linux.yml .github/workflows/release-windows-alpine.yml .github/workflows/webtop-base-image.yml dist_tools/run-webtop.sh dist_tools/run-webtop.ps1 dist_tools/run-webtop.cmd tools/webtop/runwt.sh docs/tools/webtop-wt.sh tools/webtop/readiness.sh"
+ACTIVE_CODE=".github/workflows/release-linux.yml .github/workflows/release-windows.yml .github/workflows/webtop-base-image.yml dist_tools/run-webtop.sh dist_tools/run-webtop.ps1 dist_tools/run-webtop.cmd tools/webtop/runwt.sh docs/tools/webtop-wt.sh tools/webtop/readiness.sh"
 FORBIDDEN='alpine-rootfs\.tar|config_and_run\.sh|--rewrite-syscalls|--initial-files|--program-from-tar|litebox_packager --oci-image|docker (run|build|compose|pull)|dockerd|--tun-device-name|run-alpine|rootfs\.tar|custom-services\.d|x7\.tar|monkey-patch|sleep (60|90|120|180)'
 for file in $ACTIVE_CODE; do
   test -f "$file" || fail "missing active path $file"
   deny "$FORBIDDEN" "$file"
 done
 require 'webtop-image.ref|@sha256:' .github/workflows/release-linux.yml
-require 'webtop-image.ref|@sha256:' .github/workflows/release-windows-alpine.yml
+require 'webtop-image.ref|@sha256:' .github/workflows/release-windows.yml
 require '@sha256:[0-9a-f]{64}' .github/workflows/webtop-base-image.yml
 require '\-\-oci-image' tools/webtop/readiness.sh
 require '200' tools/webtop/readiness.sh
@@ -52,7 +52,7 @@ require 'peak|rss|VmRSS' tools/webtop/readiness.sh
 python3 -I - <<'PY'
 import yaml
 from pathlib import Path
-files = ['.github/workflows/release-linux.yml', '.github/workflows/release-windows-alpine.yml', '.github/workflows/webtop-base-image.yml']
+files = ['.github/workflows/release-linux.yml', '.github/workflows/release-windows.yml', '.github/workflows/webtop-base-image.yml']
 forbidden = ('litebox_packager', 'alpine-rootfs.tar', '--rewrite-syscalls', 'config_and_run.sh', 'docker run', 'dockerd', 'run-alpine')
 for name in files:
     data = yaml.safe_load(Path(name).read_text())

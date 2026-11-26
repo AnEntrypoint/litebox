@@ -1,22 +1,32 @@
-name: Webtop base image (reusable)
+name: Webtop image pin
 
-# Nothing is built here. The release bundles package their rootfs straight from the
-# pinned webtop image, so this workflow only publishes that image reference.
+permissions:
+  contents: read
 
 on:
-  workflow_call:
-    outputs:
-      image:
-        description: The webtop image ref the rootfs is packaged from (pulled, not built)
-        value: ${{ jobs.build_base_image.outputs.image }}
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build_base_image:
-    name: Webtop base image (pulled, not built)
+  verify_pin:
+    name: Digest pin resolves for both host architectures
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.image_ref.outputs.image }}
     steps:
-      - name: Image ref
-        id: image_ref
-        run: echo "image=docker.io/linuxserver/webtop:debian-xfce" >> "$GITHUB_OUTPUT"
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Verify the pinned OCI index
+        run: |
+          ref=$(cat dist_tools/webtop-image.ref)
+          test "${ref#*@sha256:}" != "$ref"
+          digest=${ref#*@}
+          token=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:linuxserver/webtop:pull" | jq -r .token)
+          curl -fsSL -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://registry-1.docker.io/v2/linuxserver/webtop/manifests/$digest" > index.json
+          for arch in amd64 arm64; do
+            jq -e --arg arch "$arch" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)' index.json > /dev/null
+            echo "pinned index carries linux/$arch"
+          done

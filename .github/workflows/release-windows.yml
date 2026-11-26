@@ -1,0 +1,70 @@
+name: Release Windows runner
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build thin runner and smoke test raw OCI
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-runner
+      - name: Build litebox_runner_linux_on_windows_userland (release)
+        run: cargo build --locked --release -p litebox_runner_linux_on_windows_userland
+      - name: Raw OCI smoke (unmodified layers, no rewriting)
+        shell: pwsh
+        run: |
+          $smokeRef = Get-Content dist_tools\smoke-image.ref
+          $output = & .\target\release\litebox_runner_linux_on_windows_userland.exe --oci-image $smokeRef /bin/echo raw-oci-smoke-ok
+          if ($LASTEXITCODE -ne 0) { throw "raw OCI smoke exited with $LASTEXITCODE" }
+          if (-not ($output -match 'raw-oci-smoke-ok')) { throw "raw OCI smoke produced no marker: $output" }
+          Write-Host $output
+      - name: Verify the image reference is digest-pinned
+        shell: pwsh
+        run: |
+          $ref = Get-Content dist_tools\webtop-image.ref
+          if ($ref -notmatch '^docker\.io/linuxserver/webtop@sha256:[0-9a-f]{64}$') { throw "moving image tag: $ref" }
+      - name: Assemble thin bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item target\release\litebox_runner_linux_on_windows_userland.exe bundle\
+          Copy-Item dist_tools\webtop-image.ref, dist_tools\smoke-image.ref, dist_tools\run-webtop.ps1, dist_tools\run-webtop.cmd bundle\
+          Copy-Item dist_tools\README.md bundle\README.md
+          Compress-Archive -Path bundle\* -DestinationPath litebox-windows-webtop.zip
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: litebox-windows-webtop
+          path: litebox-windows-webtop.zip
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: litebox-windows-webtop.zip
+          generate_release_notes: true
