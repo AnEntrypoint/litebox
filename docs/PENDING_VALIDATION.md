@@ -4,6 +4,21 @@ Phase A records each change with the witness that proves it and the red check th
 the change is wrong. Phase B runs every witness once on the final tree, fixes failures, and
 pushes once.
 
+## Phase B results (gate audit, tree `8669f4be` + witness fixes)
+
+- `bash -n` on `scripts/gate-window.sh`, `scripts/check-gate-guard.sh`,
+  `scripts/check-goal-docs.sh`: PASS.
+- `bash scripts/check-goal-docs.sh`: PASS (`DOCS_RC=0`), including the new `CACHED`,
+  `GATE_TREE`, `GATE_RERUN_REASON` and `litebox-smoke.*34001d81` requires.
+- `bash scripts/check-gate-guard.sh`: PASS 6/6 — cached pass row prints CACHED and queues
+  nothing; failed-only row blocks with exit 2; forced rerun records its reason and runs once;
+  the same label/tree after that run prints CACHED; the audited `litebox-smoke`/`34001d81` pair
+  prints CACHED without invoking a gate; the real gate prints CACHED without creating a ticket.
+- Real gate ledger unchanged (14 rows, `litebox-smoke`/`34001d81` still `(12, 79)` and `(0, 6)`),
+  no live gate tickets, no leftover processes.
+- Rows 3-10 were verified on `46b79af8`; the two gate-audit commits change only shell scripts and
+  docs, none of which those windows read, so they were not repeated.
+
 ## Phase B results (tree `46b79af8`)
 
 - `scripts/check-goal-docs.sh`: PASS, including YAML parsing of all three release/pin workflows.
