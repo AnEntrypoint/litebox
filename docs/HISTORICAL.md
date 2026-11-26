@@ -15,7 +15,7 @@ architecture of this tree and none of it is an instruction for the current goal.
 | `docs/WEBTOP-REBUILD-2026-10-12.md` | Historical rootfs rebuild from host packages. |
 | `docs/WEBTOP-BOOT-2026-10-10.md`, `docs/webtop-debian-xfce-2026-09-08.md` | Historical boot measurements of the mutated image. |
 | `docs/CHROMIUM-*`, `docs/MOJO-*`, `docs/mojo-*`, `docs/fork-*`, `docs/track-b-*` | Historical subsystem investigations. |
-| `advisor/`, `tools/webtop/custom-services.d/`, `tools/webtop/*.py`, `tools/webtop/*.mjs`, `x7.tar` | Historical probes, overlays, injected services and patches; not invoked by anything active. |
+| `advisor/`, `tools/webtop/act.mjs`, `shot.mjs`, `stall.py`, `xwd2png.py` | Historical probes and patches; not invoked by anything active. The injected s6 services, TUN helper, symlink repair helpers, legacy `run-alpine` launchers and `x7.tar` were deleted. |
 | `.wfgy/` (ignored) | Historical Windows launch scripts and logs. |
 
 The current contract is `README.md` and `AGENTS.md`: raw, digest-pinned, unmodified OCI layers;
